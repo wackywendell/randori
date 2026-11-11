@@ -94,6 +94,7 @@ struct FakeApp {
     root: PathBuf,
     on_close: Option<Box<dyn FnOnce() -> Result<()>>>,
     fail_close: bool,
+    fail_after_close: bool,
     leave_live: bool,
     spawn_child: bool,
 }
@@ -111,6 +112,7 @@ impl FakeApp {
             root: repo.root.clone(),
             on_close: None,
             fail_close: false,
+            fail_after_close: false,
             leave_live: false,
             spawn_child: false,
         }
@@ -144,6 +146,9 @@ impl App for FakeApp {
                 }
                 self.inv.spaces.retain(|s| !s.tabs.is_empty());
             }
+        }
+        if self.fail_after_close {
+            bail!("fixture close reply lost");
         }
         Ok(())
     }
@@ -645,7 +650,7 @@ fn unrelated_home_folder_spaces_do_not_block_removal_planning() {
     app.inv
         .spaces
         .push(space("home-space", Path::new(""), "outside"));
-    assert!(plan_removal(&repo.root, &scope(), &mut app, None).is_ok());
+    plan_removal(&repo.root, &scope(), &mut app, None).unwrap();
 }
 
 #[test]
@@ -728,6 +733,194 @@ fn unknown_external_git_registration_data_is_never_silently_discarded() {
     assert!(app.events.is_empty());
 }
 
+fn stage_only_git_content(root: &Path) -> Result<()> {
+    fs::write(root.join("file"), "index-only content")?;
+    command(
+        "git",
+        &["-c", "core.fsmonitor=false", "add", "--", "file"],
+        root,
+    )?;
+    fs::write(root.join("file"), "before")?;
+    Ok(())
+}
+
+#[test]
+fn staged_git_index_is_refused_before_planning_or_closing() {
+    let f = Fixture::new();
+    let repo = f.workspace();
+    let mut app = FakeApp::new(&repo);
+    let plan = plan_removal(&repo.root, &scope(), &mut app, None).unwrap();
+    stage_only_git_content(&repo.root).unwrap();
+    let error = plan_removal(&repo.root, &scope(), &mut app, None).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("Git index"), "{message}");
+    let error = remove(
+        &repo.root,
+        &scope(),
+        options(&plan.approval, false),
+        &mut app,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RemovalFailure>().unwrap().stage,
+        "preflight"
+    );
+    assert!(app.events.is_empty());
+    assert_eq!(
+        command("git", &["show", ":file"], &repo.root).unwrap().0,
+        "index-only content"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("file")).unwrap(),
+        "before"
+    );
+    assert!(list(&f.main).unwrap().iter().any(|w| w.name == "topic"));
+}
+
+#[test]
+fn git_index_changed_during_close_stops_before_snapshot() {
+    let f = Fixture::new();
+    let repo = f.workspace();
+    let mut app = FakeApp::new(&repo);
+    let plan = plan_removal(&repo.root, &scope(), &mut app, None).unwrap();
+    let root = repo.root.clone();
+    app.on_close = Some(Box::new(move || stage_only_git_content(&root)));
+    let error = remove(
+        &repo.root,
+        &scope(),
+        options(&plan.approval, false),
+        &mut app,
+    )
+    .unwrap_err();
+    let failure = error.downcast_ref::<RemovalFailure>().unwrap();
+    assert_eq!(failure.stage, "snapshot");
+    assert!(!failure.completed.contains(&"final snapshot"));
+    assert!(failure.error.contains("Git index"));
+    assert_eq!(
+        command("git", &["show", ":file"], &repo.root).unwrap().0,
+        "index-only content"
+    );
+    assert_eq!(
+        command(
+            "jj",
+            &["--ignore-working-copy", "file", "show", "file"],
+            &repo.root
+        )
+        .unwrap()
+        .0,
+        "before"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("file")).unwrap(),
+        "final writer edit"
+    );
+    assert!(list(&f.main).unwrap().iter().any(|w| w.name == "topic"));
+}
+
+#[test]
+fn unmerged_git_index_is_refused_before_close() {
+    let f = Fixture::new();
+    let repo = f.workspace();
+    let revisions: Vec<String> = ["base", "left", "right"]
+        .into_iter()
+        .map(|content| {
+            fs::write(repo.root.join("file"), content).unwrap();
+            inspect(&repo.root, true).unwrap();
+            command(
+                "jj",
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "-r",
+                    "@",
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
+                &repo.root,
+            )
+            .unwrap()
+            .0
+        })
+        .collect();
+    fs::write(repo.root.join("file"), "left").unwrap();
+    command(
+        "git",
+        &["-c", "core.fsmonitor=false", "read-tree", &revisions[1]],
+        &repo.root,
+    )
+    .unwrap();
+    command(
+        "git",
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "read-tree",
+            "-m",
+            "-i",
+            &revisions[0],
+            &revisions[1],
+            &revisions[2],
+        ],
+        &repo.root,
+    )
+    .unwrap();
+    assert!(
+        !command(
+            "git",
+            &["-c", "core.fsmonitor=false", "ls-files", "--unmerged"],
+            &repo.root
+        )
+        .unwrap()
+        .0
+        .is_empty()
+    );
+    let mut app = FakeApp::new(&repo);
+    let error = plan_removal(&repo.root, &scope(), &mut app, None).unwrap_err();
+    assert!(format!("{error:#}").contains("Git index"));
+    assert!(app.events.is_empty());
+    assert!(repo.root.exists());
+}
+
+#[test]
+fn unreadable_git_index_is_refused_before_close() {
+    let f = Fixture::new();
+    let repo = f.workspace();
+    fs::write(f.main.join(".git/worktrees/topic/index"), "invalid index").unwrap();
+    let mut app = FakeApp::new(&repo);
+    let error = plan_removal(&repo.root, &scope(), &mut app, None).unwrap_err();
+    assert!(format!("{error:#}").contains("Git index"));
+    assert!(app.events.is_empty());
+    assert!(repo.root.exists());
+}
+
+#[test]
+fn failed_close_can_have_effects_without_a_confirmed_completed_stage() {
+    let f = Fixture::new();
+    let repo = f.workspace();
+    let mut app = FakeApp::new(&repo);
+    let plan = plan_removal(&repo.root, &scope(), &mut app, None).unwrap();
+    app.fail_after_close = true;
+    let error = remove(
+        &repo.root,
+        &scope(),
+        options(&plan.approval, false),
+        &mut app,
+    )
+    .unwrap_err();
+    let failure = error.downcast_ref::<RemovalFailure>().unwrap();
+    assert_eq!(failure.stage, "close");
+    assert!(failure.completed.is_empty());
+    assert!(
+        failure
+            .error
+            .contains("may have partial or unknown effects")
+    );
+    assert!(app.inv.spaces.is_empty());
+    assert!(repo.root.exists());
+    assert!(list(&f.main).unwrap().iter().any(|w| w.name == "topic"));
+}
+
 #[test]
 fn default_git_head_reflog_is_metadata_but_unknown_siblings_are_not() {
     let f = Fixture::new();
@@ -758,6 +951,7 @@ fn default_git_head_reflog_is_metadata_but_unknown_siblings_are_not() {
         &repo.root,
     )
     .unwrap();
+    command("git", &["read-tree", "HEAD"], &repo.root).unwrap();
     let logs = f.main.join(".git/worktrees/topic/logs");
     assert!(logs.join("HEAD").is_file());
     let mut app = FakeApp::new(&repo);

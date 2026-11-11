@@ -35,9 +35,11 @@ fn output(mut reader: impl Read) -> Result<Vec<u8>> {
 }
 
 pub fn command(program: &str, args: &[&str], cwd: &Path) -> Result<(String, String)> {
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+    run_command(Command::new(program).args(args).current_dir(cwd), program)
+}
+
+fn run_command(command: &mut Command, program: &str) -> Result<(String, String)> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -718,6 +720,24 @@ fn validate_git_pointer(repo: &Repo) -> Result<()> {
             );
         }
     }
+    // The index can hold content absent from the working files and final jj
+    // snapshot. Pin inspection to this registration, not inherited Git paths.
+    run_command(
+        Command::new("git")
+            .args([
+                "--git-dir", text(&gitdir)?, "--work-tree", text(&repo.root)?,
+                "-c", "core.fsmonitor=false", "diff", "--cached", "--quiet",
+                "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--",
+            ])
+            .env("GIT_INDEX_FILE", gitdir.join("index"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_NAMESPACE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .current_dir(&repo.root),
+        "git",
+    ).context("Git index must match HEAD before removal; resolve staged/conflicted state or fix Git inspection (Git CLI required)")?;
     Ok(())
 }
 
@@ -1035,6 +1055,7 @@ pub fn remove(
                 && identity(&plan.repo.root)? == plan.identity,
             "Workspace identity changed before snapshot"
         );
+        validate_git_pointer(&plan.repo)?;
         jj(&plan.repo.root, &["util", "snapshot"])?;
         completed.push("final snapshot");
         stage = "verify snapshot";
@@ -1067,6 +1088,7 @@ pub fn remove(
             "Workspace registration changed; checkout retained"
         );
         mounts::check(&plan.repo.root)?;
+        validate_git_pointer(&plan.repo)?;
         jj(
             &plan.repo.main,
             &[
@@ -1094,9 +1116,9 @@ pub fn remove(
     result.map_err(|cause: anyhow::Error| {
         RemovalFailure {
             error: format!(
-                "Stopped at {stage}. Completed: {}. {cause:#}",
+                "Stopped at {stage}. Confirmed completed stages: {}. A failing mutating stage may have partial or unknown effects; inspect the layout, registration and remaining checkout before retry or manual cleanup. {cause:#}",
                 if completed.is_empty() {
-                    "nothing".into()
+                    "none".into()
                 } else {
                     completed.join(", ")
                 }

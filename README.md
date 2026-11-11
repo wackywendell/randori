@@ -20,7 +20,7 @@ just bench
 
 `scripts/app-trial.js` is a manual native lifecycle fixture. It creates a separate temporary HOME, app home, XDG directories and core session. Its commands address only that owned environment. It must never be pointed at an existing app home or user checkout. A disposable native trial verified tab closure, final writer-edit preservation, checkout deletion and preservation of another tab. Visual states and full view-destruction/notification-lifetime behavior remain unverified because the background window kept its initial capture.
 
-The tested command surface is jj 0.47.1 and Herdr 0.1.14. Removal supports macOS and Linux; Linux and remote execution remain unverified. Generated types, build output and local review/trial records stay out of source control.
+The tested command surface is jj 0.47.1 and Herdr 0.1.14. Colocated checkout removal also requires the Git CLI on PATH for read-only index checks. Removal supports macOS and Linux; Linux and remote execution remain unverified. Generated types, build output and local review/trial records stay out of source control.
 
 ## Workspace manager
 
@@ -32,7 +32,7 @@ Open Workspaces… from the sidebar header, a space's context menu or the tab ba
 4. Create and Open require a destination. Choose a new tab in a named existing organizational space, or an explicitly named new space. A space-menu launch offers that space as the visible destination; it does not pick its repository.
 5. Remove requires a separate tab/space selection. The final confirmation names the checkout, closure scope, terminal IDs and files outside the current snapshot.
 
-Open creates a new tab, even if the checkout already has another tab. Removal refuses other known users of the checkout; ordinary Close remains non-destructive. Choosing an entire space closes all its tabs, including tabs using other repositories. Choose a single tab when the other tabs should remain open.
+Open creates a new tab, even if the checkout already has another tab. Removal refuses other known users of the checkout; ordinary Close remains non-destructive. Choosing an entire space closes all its tabs, including tabs using other repositories. Only the selected checkout receives a final snapshot. Other checkout files remain on disk, but closing their processes can lose unsaved in-memory work. Choose a single tab when the other tabs should remain open.
 
 This manager is jj-only. Non-jj selections show an error; existing Git tools remain separate. No Git worktree action is inferred from a thematic space.
 
@@ -54,7 +54,7 @@ herdr-jj open feature/topic --cwd /path/to/project
 
 Creation uses `../workspaces/<name>` beside the main checkout. Slashes become hyphens. An existing path must belong to the same repository and registered workspace; the old `<main>/workspaces/<name>` location is also recognised. Existing destinations and tracked configuration are preserved. A failed add or setup leaves its partial destination for inspection.
 
-An explicit revision selects the new working copy's parent. Otherwise the helper looks for a local bookmark, then origin and upstream, before using jj's default workspace-add behaviour. Shared agent/tool configuration is linked when absent; local agent notes are generated. Approve direnv or mise configuration separately if needed.
+An explicit revision selects the new working copy's parent. Otherwise the helper looks for a local bookmark, then origin and upstream, before using jj's default workspace-add behaviour. Absent agent configuration (`.claude`, `CLAUDE.md`, `AGENTS.md`) and tool configuration (`.tool-versions`, `Justfile`, `.envrc`, `mise.toml`, `mise.local.toml`) is linked from the main checkout. `CLAUDE.local.md` and `AGENTS.local.md` are created when absent with workspace/root instructions and any existing main-checkout local notes. Execution approvals for direnv or mise remain manual.
 
 The CLI `open` command resolves an owned workspace and returns its path. The app manager lists registered workspaces and revalidates a selected checkout's physical root and repository before opening its tab.
 
@@ -76,13 +76,19 @@ hc exec --cwd /path/to/project --timeout 600 herdr-jj remove \
 
 Use `--space SPACE_ID` instead only to close that whole space. Add `--discard-excluded` after reviewing files outside the current snapshot, including ignored files, untracked files and local configuration notes. The app presents this approval as one final confirmation with a scrollable file list.
 
-Removal validates identity and ownership, closes the selected scope, stops its surviving terminals, verifies writers have finished, then takes the final snapshot. It rejects new or changed excluded content, rechecks the registered workspace name/root, forgets the workspace and deletes its checkout.
+Removal validates identity and ownership, closes the selected scope, stops its surviving terminals and verifies that those core terminals have finished. This covers supervised foreground jobs. Stop background or detached writers before removal; they can survive terminal closure and escape the helper's checks. The final snapshot covers the selected checkout. It rejects new or changed excluded content, rechecks the registered workspace name/root, forgets the workspace and deletes its checkout.
 
-Substantive snapshotted work remains in jj's shared repository. Landing work and recovery bookmarks are not required. Files still excluded from the final snapshot are deleted without a jj recovery copy.
+Substantive snapshotted work remains in jj's shared repository. Landing work and recovery bookmarks are not required. From the main checkout, `jj --ignore-working-copy log -r 'heads(all())'` can help find retained anonymous heads. `jj --ignore-working-copy file show -r CHANGE PATH` reads a file from a selected change. Files still excluded from the final snapshot are deleted without a jj recovery copy.
 
-The helper refuses the main checkout, other known users, conflicting ownership, new descendants, nested repositories, special files and mounted trees. It refuses unknown data inside .jj and external Git worktree-registration metadata. Only the observed jj 0.47 local-state layout and standard Git registration files, including logs/HEAD, are recognised. Non-full sparse checkouts are refused because tracked files outside the sparse set may escape snapshots. Directory symlinks are removed without following their targets. Input aliases identify the canonical physical checkout; approval pins its repository and root identity.
+The helper refuses the main checkout, other known users, conflicting ownership, new descendants, nested repositories, special files and mounted trees. It refuses unknown data inside .jj and external Git worktree-registration metadata. Only the observed jj 0.47 local-state layout and standard Git registration files, including logs/HEAD, are recognised. Git's index must be readable and match HEAD; staged or conflicted state blocks removal even when the working files look clean. Review and preserve or resolve that state with Git before retrying. The helper does not unstage or discard it. Non-full sparse checkouts are refused because tracked files outside the sparse set may escape snapshots. Directory symlinks are removed without following their targets. Input aliases identify the canonical physical checkout; approval pins its repository and root identity.
 
-Every failure stops later stages. Errors include `stage` and `completed`. Operations are not atomic. Unknown writers, mount changes and simultaneous clients are not globally locked. A timeout, app quit or interruption requires inspection before retrying; a notification may be missed after app quit. Closing the dialog during creation does not roll back an already-started helper.
+Every failure stops later stages. Errors include `stage` and `completed`, which records confirmed stage successes. A failing mutating stage can have partial or unknown effects, including when `completed` is empty. Operations are not atomic. Unknown writers, mount changes and simultaneous clients are not globally locked. A notification may be missed after app quit. Closing the dialog during creation does not roll back an already-started helper.
+
+### After a removal failure
+
+1. Inspect the selected scope with `herdr-app ls` and the remaining terminals with `hc ls --json`. Stop surviving background or detached writers.
+2. From the main checkout, run `jj --ignore-working-copy workspace list` to check registration. Inspect the remaining checkout files before deciding on recovery or cleanup.
+3. Obtain and review a fresh plan before retrying. A closed scope or forgotten workspace can prevent a normal retry. A forgotten but retained directory requires deliberate manual recovery or cleanup after any needed files are preserved and writers have stopped.
 
 ## Installation
 
@@ -120,6 +126,6 @@ Remote discovery/create/open can run through `hc exec --on MACHINE` with the hel
 
 `list` returns `{name, root: string|null, current, main}[]`. `create` adds `created`, nullable `start` and `note` to a repository value. `open` returns a repository value.
 
-`remove-plan` adds `workspace`, `scope`, `terminals`, `excluded`, `approval`, `identity`. Each excluded entry has a relative `path` and SHA-256 `digest` covering its entry kind and content. `remove` returns `root` and `completed`.
+`remove-plan` adds `workspace`, `scope`, `terminals`, `excluded`, `approval`, `identity`. Each excluded entry has a relative `path` and SHA-256 `digest` covering its entry kind and content. `remove` returns `root` and `completed` confirmed stage names.
 
 All errors contain `error`, `stage` and `completed`; `stage` is null outside removal's staged execution. Install the 0.1.0 helper and mods together.
