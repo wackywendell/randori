@@ -1,0 +1,6 @@
+{
+  "name": "herdr-jj-workspaces",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" }
+}

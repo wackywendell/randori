@@ -1,0 +1,11 @@
+.tmp/
+.local/
+target/
+.direnv/
+mods/**/jsconfig.json
+mods/**/*.d.ts
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+.DS_Store
