@@ -153,25 +153,37 @@ test('Remove requires separate checkout, scope and final confirmation selections
   assert.ok(words(h.render()).some(w => w.includes('Tab “Task” in “Theme s1”')));
 });
 
-test('removal task survives view closure, uses the selected tab and unwraps partial errors', async () => {
+for (const succeeds of [true, false]) test(`removal retains its busy dialog until ${succeeds ? 'success' : 'failure'} is reported`, async () => {
+  let finish;
   const h = manager('remove', { exec: async (_cmd, args) => {
     if (args[0] === 'probe') return result(args.at(-1) === linked.root ? linked : repo);
     if (args[0] === 'list') return result(workspaces);
     if (args[0] === 'remove-plan') return result(plan());
-    return { code: 1, stderr: '{"error":"Stopped at snapshot. Completed: closed layout scope"}', stdout: '' };
+    return new Promise(resolve => { finish = resolve; });
   } });
   await chooseLinked(h);
   h.view.chooseScope(h.view.scopes()[0], h.cx);
   await h.drain();
   h.view.go(h.cx);
-  assert.equal(h.tasks.at(-1).opts.owner, null);
-  h.view.close();
-  await h.drain();
+  const running = h.drain();
+  assert.equal(h.view.busy, true);
+  assert.equal(h.overlays.length, 0);
+  assert.equal(h.notifications.length, 0);
+  assert.equal(byId(h.render(), 'jj-cancel').handlers.on_click, undefined);
+  h.render().handlers.on_key_down({ key: 'escape' }, h.cx);
+  h.view.go(h.cx);
+  assert.equal(h.overlays.length, 0);
+  assert.equal(h.calls.filter(c => c.args[0] === 'remove').length, 1);
   assert.equal(h.calls.at(-1).opts.cwd, '/repo');
   assert.equal(h.calls.at(-1).args[1], '--tab');
   assert.equal(h.calls.at(-1).args[2], 's1-tab');
   assert.equal(h.calls.at(-1).args.at(-1), linked.root);
-  assert.equal(h.notifications.at(-1).body, 'Stopped at snapshot. Completed: closed layout scope');
+  finish(succeeds ? result({ root: linked.root })
+    : { code: 1, stderr: '{"error":"Stopped at snapshot. Confirmed completed stages: closed layout scope"}', stdout: '' });
+  await running;
+  assert.equal(h.notifications.at(-1).title, succeeds ? 'Workspace removed' : 'Workspace removal stopped');
+  assert.equal(h.notifications.at(-1).body, succeeds ? linked.root : 'Stopped at snapshot. Confirmed completed stages: closed layout scope');
+  assert.equal(h.overlays.at(-1).close, 'overlay');
 });
 
 test('whole-space removal names its broader scope and every excluded path', async () => {

@@ -124,8 +124,9 @@ export default class Workspace extends View {
       const args = ['remove', `--${plan.scope.kind}`, plan.scope.id, '--yes', '--approval', plan.approval, '--cwd', plan.root,
         ...(plan.excluded.length ? ['--discard-excluded'] : [])];
       const cwd = this.repo.main;
-      // This task must survive destruction of both the overlay and its scope.
-      // Capture only values needed by the helper and report without the view.
+      const overlay = props().overlay;
+      // Closing a mod copy cancels even owner-null tasks. Keep the dialog
+      // alive through scope closure, then report before releasing its task.
       cx.spawn(async () => {
         try {
           const result = await exec('herdr-jj', args, { cwd, timeout: 600_000 });
@@ -134,8 +135,9 @@ export default class Workspace extends View {
         } catch (error) {
           notify({ title: 'Workspace removal stopped', body: String(error.message ?? error), level: 'error', timeout: 0 });
         }
-      }, { owner: null });
-      closeOverlay(props().overlay);
+        closeOverlay(overlay);
+      });
+      cx.notify();
     } else if (this.step === 'create' && this.destinationReady() && this.name.value().trim()) {
       const name = this.name.value().trim();
       this.start(cx, async () => {

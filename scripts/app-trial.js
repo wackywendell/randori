@@ -26,6 +26,12 @@ if (command === 'prepare') {
   layout.toast = 'trial-toast';
   await fs.writeFile(path.join(app, 'layouts/trial.json'), JSON.stringify(layout));
   const fixtureMods = {
+    'trial-launcher': `import { View, div } from 'gpui-kit';
+import { openOverlay, closeOverlay, props } from 'herdr';
+export default class TrialLauncher extends View {
+ init(){const own=props()?.overlay; if(!own)return; openOverlay({mod:'trial-workspace',kind:'dialog',modal:true,width:720,height:680}); closeOverlay(own);}
+ render(){return div();}
+}`,
     'trial-workspace': `import Workspace from './workspace.js';
 import { appHome, readTextFile, writeTextFile } from 'herdr';
 export default class TrialWorkspace extends Workspace {
@@ -34,7 +40,6 @@ export default class TrialWorkspace extends Workspace {
   cx.spawn(async cx=>{
    const request=JSON.parse(await readTextFile(appHome()+'/request.json'));
    this.action=request.action;
-   this.trialConfirm=Boolean(request.confirm);
    try {
     this.repo=await this.ask(['probe'],request.root);
      this.workspace={name:request.name,root:request.root};
@@ -46,13 +51,13 @@ export default class TrialWorkspace extends Workspace {
    } catch(error) { await writeTextFile(appHome()+'/trial-error.txt',String(error),null); }
   });
  }
- async close(cx) { super.close(); if(this.trialConfirm)await writeTextFile(appHome()+'/view-closed.json',JSON.stringify({at:Date.now()}),null); }
+ async close(cx) { super.close(); await writeTextFile(appHome()+'/view-closed.json',JSON.stringify({at:Date.now(),removing:this.busy&&this.step==='confirm'}),null); }
 }`,
     'trial-toast': `import { View, div } from 'gpui-kit';
 import { props, appHome, writeTextFile } from 'herdr';
 export default class TrialToast extends View {
- init(_p,cx){const value=props(); cx.spawn(async()=>{if(value.title.startsWith('Workspace '))await writeTextFile(appHome()+'/result.json',JSON.stringify(value),null);});}
- render(){return div().bg('#183028').text_color('#ffffff').p(12).child(props().title).child(props().body);}
+ init(_p,cx){const value=props()??{}; cx.spawn(async()=>{if(value.title?.startsWith('Workspace '))await writeTextFile(appHome()+'/result.json',JSON.stringify(value),null);});}
+ render(){const value=props()??{}; return div().bg('#183028').text_color('#ffffff').p(12).child(value.title??'').child(value.body??'');}
 }`,
   };
   for (const [name, source] of Object.entries(fixtureMods)) {
@@ -105,11 +110,11 @@ if (command === 'run') {
   const resources = JSON.parse(await fs.readFile(path.join(root, 'resources.json'), 'utf8'));
   const request = { action: 'remove', root: resources.linked, name: 'topic',
     destination: resources.theme.space, tab: resources.writer.tab, label: 'Tab “Disposable writer” in “Owned jj trial theme”' };
-  for (const name of ['confirmation.json', 'trial-error.txt', 'result.json']) await fs.rm(path.join(app, name), { force: true });
+  for (const name of ['confirmation.json', 'trial-error.txt', 'result.json', 'view-closed.json']) await fs.rm(path.join(app, name), { force: true });
   await fs.writeFile(path.join(app, 'request.json'), JSON.stringify(request));
   const status = JSON.parse(execute(config.binary, ['status']));
-  if (status.overlays.includes('trial-workspace')) appCommand('mod.open', { name: 'trial-workspace' });
-  console.log(appCommand('mod.open', { name: 'trial-workspace' }));
+  assert.equal(status.overlays.includes('trial-workspace'), false, 'Close the existing trial dialog before starting another request');
+  console.log(appCommand('mod.open', { name: 'trial-launcher' }));
 } else if (command === 'confirm') {
   const request = JSON.parse(await fs.readFile(path.join(app, 'request.json'), 'utf8'));
   assert.equal(request.action, 'remove');
@@ -127,7 +132,8 @@ if (command === 'run') {
   const optional = async file => { try { return JSON.parse(await fs.readFile(path.join(app, file), 'utf8')); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
   const toast = await optional('result.json');
   const closed = await optional('view-closed.json');
-  if (toast) assert.equal(toast.title, 'Workspace removed');
+  assert.equal(toast?.title, 'Workspace removed', 'Removal completion notification must be recorded');
+  assert.equal(closed?.removing, true, 'The removing dialog must finish its native close hook');
   await assert.rejects(fs.stat(resources.linked), { code: 'ENOENT' });
   const tabs = JSON.parse(execute(config.binary, ['ls'])).spaces.flatMap(s => s.tabs);
   assert.ok(tabs.some(t => t.id === resources.theme.tab));
@@ -138,7 +144,7 @@ if (command === 'run') {
   assert.equal(status.overlays.includes('trial-workspace'), false);
   const evidence = { helperWorkflow: 'passed', initiatingOverlayRemovedFromModel: true, otherTabStillOpen: true, linkedDeleted: true, final,
     notificationRecorded: Boolean(toast), viewCloseHookRecorded: Boolean(closed),
-    limitation: 'The background window capture remains its initial welcome frame. View destruction/notification rendering and interactive visual states are not verified.' };
+    limitation: 'This verifies the removal lifecycle and notification delivery, not visual appearance. Capture and inspect the visible confirmation and result separately; interactive Create/Open and remote behavior remain unverified.' };
   await fs.writeFile(path.resolve('.tmp/native-trial-result.json'), JSON.stringify(evidence, null, 2));
   console.log(JSON.stringify(evidence, null, 2));
 } else if (command === 'quit') {

@@ -18,9 +18,9 @@ just bench
 
 `just verify` runs Rust lifecycle tests, JavaScript behavior tests, native checks for all six mods, formatting and Clippy. Native checks use disposable app homes and mod copies. Rust lifecycle tests use disposable jj repositories and fake Herdr resources.
 
-`scripts/app-trial.js` is a manual native lifecycle fixture. It creates a separate temporary HOME, app home, XDG directories and core session. Its commands address only that owned environment. It must never be pointed at an existing app home or user checkout. A disposable native trial verified tab closure, final writer-edit preservation, checkout deletion and preservation of another tab. Visual states and full view-destruction/notification-lifetime behavior remain unverified because the background window kept its initial capture.
+`scripts/app-trial.js` is a manual native lifecycle fixture. It creates a separate temporary HOME, app home, XDG directories and core session. Its commands address only that owned environment. It must never be pointed at an existing app home or user checkout. A visible disposable native trial verified tab closure, final writer-edit preservation, checkout deletion, preservation of another tab, completion notification delivery and the dialog's close hook. The confirmation and result were captured and inspected. Interactive Create/Open flows remain covered by the JavaScript harness.
 
-The tested command surface is jj 0.47.1 and Herdr 0.1.14. Colocated checkout removal also requires the Git CLI on PATH for read-only index checks. Removal supports macOS and Linux; Linux and remote execution remain unverified. Generated types, build output and local review/trial records stay out of source control.
+The tested command surface is jj 0.47.1 and Herdr 0.1.15. Colocated checkout removal also requires the Git CLI on PATH for read-only index checks. Removal supports macOS and Linux; Linux and remote execution remain unverified. Generated types, build output and local review/trial records stay out of source control.
 
 ## Workspace manager
 
@@ -33,6 +33,8 @@ Open Workspaces… from the sidebar header, a space's context menu or the tab ba
 5. Remove requires a separate tab/space selection. The final confirmation names the checkout, closure scope, terminal IDs and files outside the current snapshot.
 
 Open creates a new tab, even if the checkout already has another tab. Removal refuses other known users of the checkout; ordinary Close remains non-destructive. Choosing an entire space closes all its tabs, including tabs using other repositories. Only the selected checkout receives a final snapshot. Other checkout files remain on disk, but closing their processes can lose unsaved in-memory work. Choose a single tab when the other tabs should remain open.
+
+After removal confirmation, the dialog stays busy until the helper returns. It then reports success or failure through a notification and closes. Keep the dialog and app open until completion. Forcibly closing or reloading the dialog, or quitting the app, can interrupt reporting while the helper continues. Inspect the operation's effects before retrying.
 
 This manager is jj-only. Non-jj selections show an error; existing Git tools remain separate. No Git worktree action is inferred from a thematic space.
 
@@ -82,7 +84,7 @@ Substantive snapshotted work remains in jj's shared repository. Landing work and
 
 The helper refuses the main checkout, other known users, conflicting ownership, new descendants, nested repositories, special files and mounted trees. It refuses unknown data inside .jj and external Git worktree-registration metadata. Only the observed jj 0.47 local-state layout and standard Git registration files, including logs/HEAD, are recognised. Git's index must be readable and match HEAD; staged or conflicted state blocks removal even when the working files look clean. Review and preserve or resolve that state with Git before retrying. The helper does not unstage or discard it. Non-full sparse checkouts are refused because tracked files outside the sparse set may escape snapshots. Directory symlinks are removed without following their targets. Input aliases identify the canonical physical checkout; approval pins its repository and root identity.
 
-Every failure stops later stages. Errors include `stage` and `completed`, which records confirmed stage successes. A failing mutating stage can have partial or unknown effects, including when `completed` is empty. Operations are not atomic. Unknown writers, mount changes and simultaneous clients are not globally locked. A notification may be missed after app quit. Closing the dialog during creation does not roll back an already-started helper.
+Every failure stops later stages. Errors include `stage` and `completed`, which records confirmed stage successes. A failing mutating stage can have partial or unknown effects, including when `completed` is empty. Operations are not atomic. Unknown writers, mount changes and simultaneous clients are not globally locked. Closing the dialog during creation does not roll back an already-started helper.
 
 ### After a removal failure
 

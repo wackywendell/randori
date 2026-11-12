@@ -66,7 +66,7 @@ Every failure stops later stages and reports the failing stage and confirmed com
 
 Repeated checks narrow races involving known resources. Unregistered writers, mount changes and simultaneous clients are outside a global lock. Any failure in a mutating stage requires inspecting the layout, terminal state, registration and remaining checkout. A normal retry may be impossible after the scope closes or the workspace is forgotten. A forgotten but retained directory needs deliberate manual recovery or cleanup. Review a fresh plan for any retry the manager still supports.
 
-The app launches removal with a view-independent task and captured helper arguments. Completion uses app notifications, so the task does not need to update the closed dialog. Full view-destruction and notification-lifetime behavior still needs visible native verification.
+The app keeps the busy removal dialog open until the helper returns, then sends a result notification and closes it. The dialog remains available after the selected tab or space closes. Herdr cancels tasks when their mod copy unloads, including tasks with no view owner. Keeping the dialog alive preserves result delivery during the normal workflow. Force-closing or reloading that copy, or quitting the app, can interrupt reporting after the helper has already changed state; inspect those effects before retrying.
 
 ## Performance and future scope
 
