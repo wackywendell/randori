@@ -62,7 +62,9 @@ export function load(name, data = {}) {
       inputs.push(input);
       return input;
     } },
-    Input: { new: element }, ScrollHandle: { new: () => ({ scroll_to_item() {} }) }, Scrollbar: { vertical: element },
+    Input: { new: element }, ScrollHandle: { new: () => ({ scroll_to_item() {} }) }, Scrollbar: { vertical: element }, Checkbox: { new: id => element().id(id) },
+    // Every row of a virtual list, as if all were on screen.
+    v_virtual_list: (id, count, height, key, rows) => element().id(id).children(rows({ start: 0, end: count })),
     agents: () => state.agents, terminals: () => state.terminals, spaces: () => state.spaces,
     panes: () => state.panes, machines: () => state.machines, props: () => state.props,
     focused: () => state.focused, layout: () => state.layout, window: () => ({ active: state.active, platform: 'macos' }),

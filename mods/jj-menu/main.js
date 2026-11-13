@@ -5,6 +5,7 @@
 //
 // A copy of Herdr's `menu`. A jj space gets New and Open workspace, which
 // open `jj-workspace`, where the shipped menu shows its worktree entries.
+// Finish workspace shows when a terminal of the space is in a linked workspace.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
@@ -17,6 +18,14 @@ function place(s) {
   return panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }
 
+// Whether any terminal of the space works in a linked jj workspace.
+async function linked(s) {
+  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
+  const folders = new Set(panes().filter((p) => tabs.has(p.tab) && p.terminal && p.cwd).map((p) => p.cwd));
+  const ids = await Promise.all([...folders].map((f) => identity(f, s.machine, { exec, readTextFile })));
+  return ids.some((id) => id.linked);
+}
+
 // A space's checkout: "main" (a repo's own), "linked" (a worktree), or null.
 async function checkout(folder, on) {
   const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: folder, on });
@@ -26,8 +35,9 @@ async function checkout(folder, on) {
 }
 
 // `git`: the shipped checkout() answer. `jj`: the space's first terminal
-// folder when it is in a jj repository, else null.
-function items(p, git, jj) {
+// folder when it is in a jj repository, else null. `linked`: a terminal of
+// the space is in a linked jj workspace.
+function items(p, git, jj, linked) {
   p = p ?? {};
   const tg = p.target ?? {};
   switch (p.tab) {
@@ -70,6 +80,7 @@ function items(p, git, jj) {
       return [
         ["Rename", "space.rename", { id: tg.id }],
         ...(jj ? [["New workspace", "jj-workspace", { space: tg.id, folder: jj, action: "new" }], ["Open workspace", "jj-workspace", { space: tg.id, folder: jj, action: "open" }]] : []),
+        ...(jj && linked ? [["Finish workspace", "jj-workspace", { space: tg.id, folder: jj, action: "finish" }]] : []),
         ...(git && !jj ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" && !jj ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
         ["Close", "space.close", { id: tg.id }],
@@ -104,6 +115,7 @@ export default class Menu extends View {
     this.at = 0;
     this.git = null;
     this.jj = null;
+    this.linked = false;
     this.handle = cx.focus_handle();
     this.handle.focus();
     const p = props();
@@ -115,23 +127,25 @@ export default class Menu extends View {
         const id = await identity(folder, space.machine, { exec, readTextFile });
         if (id.error) console.log(`jj-menu: ${folder}: ${id.message}`);
         if (id.jj) this.jj = folder;
+        if (id.jj) this.linked = await linked(space);
         else if (!id.error) this.git = await checkout(folder, space.machine).catch(() => null);
         cx.notify();
       });
   }
 
   choose(i, cx) {
-    const it = items(props(), this.git, this.jj)[i];
+    const it = items(props(), this.git, this.jj, this.linked)[i];
     if (!it) return;
     closeOverlay(props()?.overlay);
-    if (it[1] === "jj-workspace") openOverlay({ mod: "jj-workspace", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
+    if (it[1] === "jj-workspace" && it[2].action === "finish") openOverlay({ mod: "jj-workspace", kind: "window", width: 520, height: 360, props: it[2] });
+    else if (it[1] === "jj-workspace") openOverlay({ mod: "jj-workspace", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
   }
 
   render(cx) {
     const t = theme();
-    const list = items(props(), this.git, this.jj);
+    const list = items(props(), this.git, this.jj, this.linked);
     return v_flex()
       .id("menu")
       .track_focus(this.handle)

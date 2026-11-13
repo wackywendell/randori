@@ -1,13 +1,16 @@
-// Workspace dialog: { space, folder, action: "new" | "open" }; optional { tab, argv }.
+// Workspace dialog: { space, folder, action: "new" | "open" | "finish" };
+// optional { tab, argv }.
 //
 // A copy of Herdr's `worktree` dialog for jj. New workspace runs
 // `jj workspace add`, links the configured local files from the main checkout,
 // trusts linked mise files and opens a space on the checkout. Open workspace
 // lists the repository's workspaces and selects or opens a space on one.
+// Finish workspace ends the terminals in the checked linked workspaces and
+// runs `jj workspace remove` on each.
 
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Scrollbar } from "gpui-base";
-import { run, props, closeOverlay, theme, spaces, panes, exec, home, readTextFile, layout, notify } from "herdr";
+import { v_flex, h_flex, InputState, Input, Scrollbar, Checkbox } from "gpui-base";
+import { run, props, closeOverlay, theme, spaces, panes, terminals, exec, home, readTextFile, layout, notify } from "herdr";
 import { identity } from "./jj.js";
 
 const IO = { exec, readTextFile };
@@ -77,6 +80,8 @@ export default class Workspace extends View {
     this.on = this.space()?.machine;
     this.userHome = this.on ? null : home();
     this.opening = props()?.action === "open";
+    this.finishing = props()?.action === "finish";
+    this.rows = []; // finish: { name, root, checked, removed, error }
     this.text = "";
     this.list = undefined; // open: the workspaces, once read
     this.names = new Set(); // new: the local bookmarks
@@ -89,7 +94,7 @@ export default class Workspace extends View {
     this.input.on("blur", (_e, cx) => { this.inputFocused = false; cx.notify(); });
     this.handle = cx.focus_handle();
     this.handle.focus(); // the root is mounted from the first frame: keep the keyboard here while loading
-    this.input.focus();
+    if (!this.finishing) this.input.focus();
     this.busy = false;
     this.error = "";
     this.repo = undefined; // undefined: looking, null: not in jj
@@ -101,6 +106,10 @@ export default class Workspace extends View {
           this.userHome = result.stdout.trim();
         }
         this.folder = props()?.folder || place(this.space()) || this.userHome;
+        if (this.finishing) {
+          this.repo = await this.prepare();
+          return cx.notify();
+        }
         const id = await identity(this.folder, this.on, IO);
         if (id.error) throw new Error(id.message);
         const repo = id.jj ? { ...id, name: base(id.main) } : null;
@@ -187,6 +196,106 @@ export default class Workspace extends View {
     return "";
   }
 
+  // Finish: the linked workspaces the space's terminals work in, in tab
+  // order. The first is checked, so the first terminal's workspace is
+  // checked when it is linked.
+  async prepare() {
+    const s = this.space();
+    if (!s?.id) throw new Error("The space is gone.");
+    this.spaceId = s.id;
+    const all = panes();
+    const folders = (s.tabs ?? []).flatMap((c) => all.filter((p) => p.tab === c.id && p.terminal && p.cwd).map((p) => p.cwd));
+    let main = null;
+    for (const folder of new Set(folders)) {
+      const id = await identity(folder, this.on, IO);
+      if (id.error) throw new Error(id.message);
+      if (!id.jj || !id.linked || this.rows.some((r) => r.root === id.root)) continue;
+      if (main && id.main !== main) throw new Error("This space's terminals work in more than one jj repository.");
+      main = id.main;
+      this.rows.push({ root: id.root, checked: false, removed: false, error: "" });
+    }
+    if (!main) throw new Error("No terminal of this space works in a linked jj workspace.");
+    const list = await workspaces({ root: main, main }, this.on);
+    for (const r of this.rows) {
+      r.name = list.find((w) => w.path === r.root)?.name;
+      if (!r.name) throw new Error(`jj lists no workspace at ${tilde(r.root, this.userHome)}.`);
+    }
+    this.rows[0].checked = true;
+    return { main, name: base(main) };
+  }
+
+  // Other spaces with a terminal in a checkout, whose terminals end too.
+  sharing(root) {
+    const all = panes();
+    return spaces()
+      .filter((s) => s.id !== this.spaceId && (s.machine ?? null) === (this.on ?? null))
+      .filter((s) => (s.tabs ?? []).some((c) => all.some((p) => p.tab === c.id && p.terminal && p.cwd && inside(p.cwd, root))))
+      .map((s) => s.name);
+  }
+
+  // Check, end terminals, remove. The first failure stops the run and shows
+  // beside its workspace; Enter starts again with the names not yet removed.
+  async finish(cx) {
+    const todo = this.rows.filter((r) => r.checked && !r.removed);
+    if (this.busy || !this.repo || !todo.length) return;
+    this.busy = true;
+    for (const r of this.rows) r.error = "";
+    cx.notify();
+    let at = todo[0];
+    try {
+      const list = await workspaces({ root: this.repo.main, main: this.repo.main }, this.on);
+      for (const r of todo) {
+        at = r;
+        if (!list.some((w) => w.name === r.name && w.path === r.root)) throw new Error(`jj no longer lists ${r.name}. Its folder ${tilde(r.root, this.userHome)} remains.`);
+      }
+      for (const r of todo) {
+        at = r;
+        // jj waits for a held lock without limit, so this one is bounded.
+        const st = await jj(r.root, ["status"], this.on, 10_000);
+        if (!st.ok) throw new Error(st.err || "jj status did not finish within 10 seconds.");
+      }
+      await this.endTerminals(todo, cx);
+      for (const r of todo) {
+        at = r;
+        const rm = await jj(this.repo.main, ["workspace", "remove", r.name], this.on, 600_000);
+        if (!rm.ok) throw new Error(rm.err || "jj workspace remove failed.");
+        r.removed = true;
+        cx.notify();
+      }
+    } catch (error) {
+      at = error?.row ?? at;
+      at.error = String(error?.message ?? error);
+      console.log(`jj-workspace: ${at.name}: ${at.error}`);
+    }
+    this.busy = false;
+    if (!this.rows.some((r) => r.error)) this.close();
+    cx.notify();
+  }
+
+  // Kills every terminal in the checked checkouts and waits up to 10 seconds
+  // for them to go. Closes the space when none of its terminals are left,
+  // else the panes that showed them. A terminal that stays names its row.
+  async endTerminals(todo, cx) {
+    const mine = (t) => (this.on ? t.address.startsWith(`${this.on}/`) : !t.address.includes("/"));
+    const rowOf = (t) => todo.find((r) => t.cwd && inside(t.cwd, r.root));
+    const ends = new Set(terminals().filter((t) => mine(t) && rowOf(t)).map((t) => t.address));
+    for (const terminal of ends) run("terminal.kill", { terminal });
+    for (let waited = 0; ; waited += 200) {
+      const left = terminals().find((t) => ends.has(t.address));
+      if (!left) break;
+      if (waited >= 10_000) {
+        throw Object.assign(new Error(`Terminal ${left.name || left.address} in ${tilde(left.cwd, this.userHome)} did not stop.`), { row: rowOf(left) });
+      }
+      await new Promise((resolve) => cx.timer.after(200, resolve));
+    }
+    const s = spaces().find((c) => c.id === this.spaceId);
+    const tabs = new Set((s?.tabs ?? []).map((c) => c.id));
+    const all = panes();
+    const closing = Boolean(s) && !all.some((p) => tabs.has(p.tab) && p.terminal && !ends.has(p.terminal));
+    if (closing) run("space.close", { id: s.id, confirmed: true });
+    for (const p of all) if (p.terminal && ends.has(p.terminal) && !(closing && tabs.has(p.tab))) run("pane.close", { pane: p.pane });
+  }
+
   shown() {
     const f = this.text.trim().toLowerCase();
     return (this.list ?? []).filter((c) => !f || `${c.name} ${c.path}`.toLowerCase().includes(f));
@@ -202,6 +311,15 @@ export default class Workspace extends View {
 
   key(e, cx) {
     if (e.key === "escape") return this.close();
+    if (this.finishing) {
+      const n = this.rows.length;
+      if (e.key === "enter") cx.spawn(async (cx) => this.finish(cx));
+      else if ((e.key === "space" || e.key === " ") && n && !this.busy) this.toggle(this.rows[this.at]);
+      else if ((e.key === "down" || e.key === "up") && n) this.at = (this.at + (e.key === "down" ? 1 : n - 1)) % n;
+      else return;
+      cx.stop_propagation();
+      return cx.notify();
+    }
     if (this.opening) {
       const n = this.shown().length;
       if (e.key === "enter") this.open(this.shown()[this.at]);
@@ -279,8 +397,90 @@ export default class Workspace extends View {
       .child(h_flex().justify_end().text_size(11).text_color(t.dim).child("\u2191\u2193 choose \u00b7 \u21b5 open \u00b7 esc close"));
   }
 
+  toggle(r) {
+    if (r && !r.removed) r.checked = !r.checked;
+  }
+
+  renderFinish(t) {
+    const r = this.repo;
+    const row = (w, i) => {
+      const others = w.checked && !w.removed ? this.sharing(w.root) : [];
+      return h_flex()
+        .id(`finish-${i}`)
+        .flex_none()
+        .px(10)
+        .py(6)
+        .gap(10)
+        .items_start()
+        .rounded(7)
+        .when(i === this.at, (el) => el.bg(t.selected))
+        .child(
+          Checkbox.new(`finish-check-${i}`)
+            .checked(w.checked)
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_change((_checked, cx) => { if (!this.busy) this.toggle(w); this.at = i; cx.notify(); })
+            .flex_none()
+            .mt(2)
+            .size(14)
+            .rounded(3)
+            .border(1)
+            .border_color(w.checked ? t.accent : t.border)
+            .when(w.checked, (el) => el.bg(t.accent))
+            .items_center()
+            .justify_center()
+            .text_size(10)
+            .text_color(t.background)
+            .child(w.checked ? "\u2713" : ""),
+        )
+        .child(
+          v_flex()
+            .flex_1()
+            .min_w(0)
+            .child(h_flex().gap(8).child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(w.name)).when(w.removed, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("removed"))))
+            .child(div().truncate().text_size(11.5).text_color(t.dim).child(tilde(w.root, this.userHome)))
+            .when(others.length > 0, (el) => el.child(div().text_size(11.5).text_color(t.muted).child(`Its terminals in ${others.join(", ")} end too.`)))
+            .when(Boolean(w.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(w.error))),
+        );
+    };
+    return v_flex()
+      .id("worktree")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => this.key(e, cx))
+      .size_full()
+      .p(16)
+      .gap(10)
+      .bg(t.popover)
+      .text_size(13)
+      .child(div().font_semibold().text_color(t.foreground).child(`Finish workspace${r ? ` of ${r.name}` : ""}`))
+      .when(r === undefined && !this.error, (el) => el.child(div().text_color(t.muted).child("\u2026")))
+      .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
+      .when(Boolean(r), (el) =>
+        el
+          .child(div().text_color(t.muted).child("Ends the terminals working in the checked folders and deletes the folders. Edits jj tracks stay in the repository. Files jj does not track, including ignored files, are deleted."))
+          .child(
+            div()
+              .relative()
+              .flex_1()
+              .min_h(0)
+              .child(v_flex().id("finish-list").size_full().overflow_y_scroll().children(this.rows.map(row)))
+              .child(Scrollbar.vertical("finish-list").absolute().inset_0()),
+          ),
+      )
+      .when(!r, (el) => el.child(div().flex_1()))
+      .child(
+        h_flex()
+          .justify_end()
+          .text_size(11)
+          .text_color(t.dim)
+          .gap(6)
+          .when(this.busy, (el) => el.child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
+          .child(this.busy ? "working…" : r ? "space check \u00b7 \u21b5 finish \u00b7 esc cancel" : "esc close"),
+      );
+  }
+
   render(cx) {
     const t = theme();
+    if (this.finishing) return this.renderFinish(t);
     if (this.opening) return this.renderOpen(t);
     const r = this.repo;
     const plan = r && this.planned();

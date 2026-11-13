@@ -44,4 +44,21 @@ export async function identity(folder, on, { exec, readTextFile }) {
   const main = joinPath(repo, "../..");
   return { jj: true, root, repo, main, linked: root !== main };
 }
+// Whether a layout shows `mod`: no block above it is hidden and every stack
+// above it has the child holding it active. A layout that does not mention
+// the mod (an overlay, a window) counts as shown.
+export function visible(root, mod) {
+  let found = false;
+  const walk = (node, ok) => {
+    if (!node || typeof node !== "object") return false;
+    ok = ok && !node.hidden;
+    if (node.content?.mod === mod) {
+      found = true;
+      return ok;
+    }
+    return (node.children ?? []).some((c) => walk(c, ok && (node.type !== "stack" || node.active === c.id)));
+  };
+  const shown = walk(root, true);
+  return shown || !found;
+}
 // shared:end

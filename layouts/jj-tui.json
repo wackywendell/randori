@@ -158,6 +158,13 @@
                       "content": {
                         "mod": "files"
                       }
+                    },
+                    {
+                      "id": "changes",
+                      "type": "block",
+                      "content": {
+                        "mod": "jj-changes"
+                      }
                     }
                   ]
                 }

@@ -1,0 +1,5 @@
+# Loaded after the user's jj config by the tests and the bench, so jj never
+# asks the user's signing agent and fixtures need no repo config, which jj
+# keeps in the user's config folder.
+signing.behavior = "drop"
+revset-aliases."trunk()" = "master"

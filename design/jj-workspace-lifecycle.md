@@ -158,7 +158,7 @@ Each mod starts as a `mod.clone` of the shipped mod it replaces, so it keeps Her
 
 This repository's `jj-tui` layout mounts Herdr's own `agents` mod in the sidebar. From Stage 2 it puts `jj-changes` in the right panel stack's `changes` entry, which the tab bar's Changes button opens. The shipped `changes` mod is never mounted, so its Git poller never runs in jj checkouts.
 
-Colors come from Herdr's theme. Status text and secondary labels use `dim` and `muted`. Lines added use `ansi2` and lines removed use `ansi1`, the colors the shipped sidebar uses for commits ahead and behind and the shipped Changes panel uses for diff lines. Errors use `blocked`. Controls use the component library's lists, `Scrollbar`, `Input`, `Checkbox` and `Button`.
+Colors come from Herdr's theme. Status text and secondary labels use `dim` and `muted`. The status line's changed file count is bold in `working`, Herdr's color for agents at work, so edits in `@` stand out. Lines added use `ansi2` and lines removed use `ansi1`, the colors the shipped sidebar uses for commits ahead and behind and the shipped Changes panel uses for diff lines. Errors use `blocked`. Controls use the component library's lists, `Scrollbar`, `Input`, `Checkbox` and `Button`.
 
 Every command passes the space's machine to `exec`. `watchFolder` works only on this machine, so a remote space's status line refreshes on agent turns, folder changes and a 30-second interval while visible.
 
@@ -257,11 +257,13 @@ The dialog lists every linked workspace in which a terminal of the space works, 
 
 When it opens, the dialog runs `jj --ignore-working-copy workspace list` from the main checkout and records each listed workspace's name, matched by folder, the main checkout, the machine and the space's ID. Enter runs three steps on the checked workspaces.
 
-1. Check. Run `jj --ignore-working-copy workspace list` from the main checkout and confirm each checked name still has its recorded folder. Then run `jj status` in each checked checkout, which snapshots it and fails on a held lock, a stale workspace or a missing checkout.
+1. Check. Run `jj --ignore-working-copy workspace list` from the main checkout and confirm each checked name still has its recorded folder. Then run `jj status` in each checked checkout, which snapshots it and fails on a stale workspace or a missing checkout. jj waits on a held lock without limit, so `jj status` is stopped after 10 seconds.
 2. End terminals. Run `terminal.kill` for every terminal in `terminals()` whose folder is inside a checked checkout, which covers panes, parked terminals and workers. Wait up to 10 seconds for `terminals()` to stop listing them. When the recorded space has no terminals left, close it with `space.close {id, confirmed: true}`. Close any other pane still showing an ended terminal with `pane.close`.
 3. Remove. Run `jj workspace remove <name>` from the main checkout for one checked workspace at a time, with the ten-minute timeout Herdr's worktree mod gives `git worktree remove`. The dialog marks each name as it is removed.
 
 The first failure stops Finish and shows its message beside the workspace's name. Failures include jj's errors from the check, "Terminal <name> in <folder> did not stop." from step 2, and jj's error from step 3. Enter then starts again from step 1 with the names not yet removed. A name jj no longer lists stops step 1 with "jj no longer lists <name>. Its folder <folder> remains.", and Finish takes no further action on it. The dialog is a window overlay, so it stays open after its space closes.
+
+In the native trial, Herdr closed each killed terminal's pane, and the space once it had no panes, about half a second after `terminal.kill` and before `terminals()` stopped listing the terminal. The `space.close` and `pane.close` calls in step 2 then find nothing to close, and cover a pane that stays. A held lock ended Finish with the timeout error from `exec` beside the workspace, and every space stayed open.
 
 In a disposable repository, `jj workspace remove` on jj 0.47.1 snapshotted the checkout's edits into a commit, removed the colocated Git worktree, and deleted the checkout, including an ignored file, in 0.62 seconds. A symbolic link in the checkout pointing outside it was removed without touching its target. jj refuses to remove the main workspace.
 
@@ -284,7 +286,7 @@ This repository's `jj-tui` layout uses these defaults. Installing copies it into
 
 ### Stages
 
-Stage 1 delivers `jj-spaces` with nesting and status lines, the New and Open workspace dialogs, the settings, and the menu entries. Stage 1 also removes this repository's `herdr-jj` Rust helper and its Workspaces manager dialog, so the repository holds only mods, layouts, scripts and tests. Until Stage 2 lands, you remove a workspace by running `jj workspace remove` yourself.
+Stage 1 delivers `jj-spaces` with nesting and status lines, the New and Open workspace dialogs, the settings, and the menu entries. Stage 1 also removes this repository's `herdr-jj` Rust helper and its Workspaces manager dialog, so the repository holds only mods, layouts, scripts and tests.
 
 Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
@@ -292,13 +294,13 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
 | Work                                           | Budget | Measured basis           |
 | ---------------------------------------------- | ------ | ------------------------ |
-| One status line                                | 40 ms  | 37 to 51 ms median       |
-| Status lines of 20 workspaces after one jj run | 1 s    | 839 ms median            |
-| Changes panel snapshot and read, 100,000 files | 400 ms | 348 ms snapshot and stat |
-| Stack read, 100 changes                        | 400 ms | not yet measured         |
-| One file diff, 5,000 lines                     | 200 ms | not yet measured         |
+| One status line                                | 200 ms | 22 to 42 ms median       |
+| Status lines of 20 workspaces after one jj run | 1 s    | 363 to 839 ms median     |
+| Changes panel snapshot and read, 100,000 files | 400 ms | 219 ms median            |
+| Stack read, 100 changes                        | 400 ms | 83 ms median             |
+| One file diff, 5,000 lines                     | 200 ms | 25 ms median             |
 
-`just bench` measures the first two rows on 3, 10,000 and 100,000 file fixtures and a 20-workspace repository, with the user's jj config, and writes `.tmp/bench.json`. Stage 2 adds the other rows. The 10,000 file read measured 51 ms, over its budget. The read after an agent turn snapshots first and measured 253 to 257 ms at every size, most of it jj's Watchman query.
+`just bench` measures every row with the user's jj config followed by `tests/jj-test.toml` and writes `.tmp/bench.json`. It uses 3, 10,000 and 100,000 file fixtures with `trunk()` at their bookmark and three edited files in `@`, a 20-workspace repository, a stack of 100 one-line changes and a change adding a 5,000-line file. The ranges cover separate runs. The stack's line totals read every file each change touches, so a change of 10,000 added files adds about 5 seconds to each stack read while it is in the stack. The read after an agent turn snapshots first and measured 253 to 257 ms at every size, most of it jj's Watchman query.
 
 ## Alternatives Considered
 
@@ -342,7 +344,7 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
 - Pros. It avoids jj's start-up for each read.
 - Cons. Start-up is about 16 ms of the 33 ms a status read takes. The library ties the code to jj's storage formats, and a service adds a process to install and keep running.
-- Reason for rejection. Rejected by author. The measured cost of one `jj` process per read fits within the 40 ms budget.
+- Reason for rejection. Rejected by author. The measured cost of one `jj` process per read fits within the 200 ms budget.
 
 ### Herdr's Spaces sidebar and Changes panel unchanged
 
@@ -439,7 +441,6 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 ## Risks and Limits
 
 - Caps. The status line looks back 64 changes for a bookmark, the stack shows 100 changes, a diff shows 5,000 lines or 1 MiB, and `exec` returns at most 8 MiB. Each cap shows as a visible note or an empty bookmark, never as wrong numbers.
-- Unmeasured cases. The 20-workspace refresh, the 100-change stack and the file diff have budgets with no measurement yet. `just bench` measures them in the stage that builds them.
 - Trust. A linked `mise` file runs commands when trusted. Only files linked from the main checkout are trusted, and the setting turns trust off.
 - Links. Linked files point into the main checkout, so edits through a link change the main checkout's copy. Finish removes the link and leaves its target alone.
 - Terminals that ignore an end request. Finish stops with the terminal's name after 10 seconds and deletes nothing.
@@ -494,14 +495,14 @@ The copy's folder then replaces the repository's mod folder of the same name, an
 - Type. Mod, fresh copy of `spaces`.
 - Change. Probe every terminal's folder with `identity()` from its own `jj.js`, once per folder, keyed by `JSON.stringify([machine, folder])` as the shipped sidebar keys its cache. Use the shipped Git check only for folders `identity()` reports as not jj.
 - Change. Nest spaces by `repo`, with the main checkout's space as parent, through the shipped `space.move` ordering.
-- Change. Replace `gitTail()` for spaces with one jj repository by the status elements, drawn on the same row, with the bookmark and file count in `dim`, `+N` in `ansi2`, `-N` in `ansi1`, and a dim `stale`, `divergent` or `error` word with jj's message as a tooltip.
+- Change. Replace `gitTail()` for spaces with one jj repository by the status elements, drawn on the same row, with the bookmark in `dim`, the file count bold in `working`, `+N` in `ansi2`, `-N` in `ansi1`, and a dim `stale`, `divergent` or `error` word with jj's message as a tooltip.
 - Change. Keep one `watchFolder(<repo>/op_heads/heads)` per local repository while visible. A batch marks that repository's spaces pending with `snapshot: false`. The shipped busy-to-idle edge in `due()` marks only its own space pending with `snapshot: true`, without the shipped `sameRepo` spread. A folder change marks its space pending with `snapshot: false`.
 - Change. One refresh loop runs pending reads one at a time, `snapshot: true` first, with `{running, pending, generation}` per space. It starts nothing while the sidebar is hidden or narrow by the Refresh rules. A rejected watch, and every remote repository, switch to a 30-second interval while visible.
 - Change. Right-click on a space row opens `jj-menu`. The shipped copy opens `menu`, which `mod.clone` leaves unchanged.
 
 #### 5. `mods/jj-spaces/jj.js` (Create)
 
-- Type. Module imported by `main.js`. Every function takes `exec` and `readTextFile` as arguments, so Node tests and the benchmark pass real ones. This file holds the source of `identity()` and `joinPath()`. Herdr mods import only from their own folder, so `jj-workspace`, `jj-menu`, `jj-new-menu` and, in Stage 2, `jj-changes` each keep a `jj.js` with identical copies, and `scripts/check-mods.js` fails when a copy differs.
+- Type. Module imported by `main.js`. Every function takes `exec` and `readTextFile` as arguments, so Node tests and the benchmark pass real ones. This file holds the source of `identity()`, `joinPath()` and `visible()`. Herdr mods import only from their own folder, so `jj-workspace`, `jj-menu`, `jj-new-menu` and, in Stage 2, `jj-changes` each keep a `jj.js` with identical copies, and `scripts/check-mods.js` fails when a copy differs.
 - Change. `identity(folder, on, io)` runs `jj --ignore-working-copy workspace root` in `folder`. jj's "There is no jj repo" returns `{jj: false, final: true}`, which the mod keeps. An `exec` rejection for a missing `jj` returns `{jj: false}`, which the mod asks again on the next change to the folder. Any other failure returns `{error, message}`. It then reads `<root>/.jj/repo` with `readTextFile`, treating rejection as absent. Text means a linked workspace, and `repo` is that text, trimmed, joined to `<root>/.jj/` and normalized. Otherwise, when `<root>/.jj/repo/store/type` reads as text, `repo` is `<root>/.jj/repo`. `main` is the folder two levels above `repo`. Returns `{jj: true, root, repo, main, linked: root !== main}`. A small pure `joinPath()` normalizes `.` and `..`.
 - Change. `STATUS_TEMPLATE` is the following, one JSON line per change.
 
@@ -577,7 +578,7 @@ if(current_working_copy,
 
 - Type. Task configuration.
 - Change. Remove `build` and the Cargo steps. `test` runs `node --test tests/*.test.js`. `verify` runs `test`, `check-mods` and `node --check` on every script and mod file. `bench` runs `node scripts/bench.js`. Add `install`, copying `mods/jj-*` and `layouts/jj-tui.*` into `${HERDR_APP_HOME:-~/.config/herdr-app}`.
-- Change. `scripts/check-mods.js` also fails when the `identity()` and `joinPath()` source in any mod's `jj.js` differs from `mods/jj-spaces/jj.js`.
+- Change. `scripts/check-mods.js` also fails when the `identity()`, `joinPath()` and `visible()` source in any mod's `jj.js` differs from `mods/jj-spaces/jj.js`.
 
 #### 17. `.tool-versions`, `.envrc`, `.gitignore` (Modify)
 
@@ -601,13 +602,13 @@ if(current_working_copy,
 
 - Type. Mod, fresh copy of `changes`.
 - Change. On init and on each folder change, run `identity()` from its own `jj.js` on the shipped `location()` folder. Until it answers, render nothing and start nothing. For `{jj: false}`, run the shipped Git code. For an error, show it in the header.
-- Change. For jj, keep one refresh loop with `{running, pending, generation}`. Becoming visible and Refresh run `jj util snapshot` with a ten-second timeout, then `readStack()`. A `watchFolder(<repo>/op_heads/heads)` batch, kept while visible, runs `readStack()` alone. The shipped ten-second timer and Git watch never start for jj.
+- Change. For jj, keep one refresh loop with `{running, pending, generation}`. Becoming visible and Refresh run `jj util snapshot` with a ten-second timeout, then `readStack()`. A `watchFolder(<repo>/op_heads/heads)` batch runs `readStack()` alone while the panel is visible and nothing while it is hidden. The shipped ten-second timer and Git watch never start for jj.
 - Change. Render the header, stack and file list described in the Changes panel section with the shipped virtual list and diff rows, mapping `status` to the shipped row's `status`, `added` to `add` and `removed` to `del`. Click replaces the selection, and Shift-click adds a second commit ID. A refresh drops a selected ID that is no longer in the stack and shows "Selected change was rewritten".
-- Change. `load(path)` runs `jj --ignore-working-copy diff --git -r <commit> -- 'root-file:"<path>"'`, or `--from <older> --to <newer>` with the same pattern, and stops parsing at 5,000 lines or 1 MiB with a "diff cut short" row.
+- Change. Selecting a file runs `readDiff()` and shows a "diff cut short" row when it reports a cut.
 
 #### 21. `mods/jj-changes/jj.js` (Create)
 
-- Type. Module imported by `main.js`, with `identity()` copied from `mods/jj-spaces/jj.js` and the same `exec` and `readTextFile` arguments.
+- Type. Module imported by `main.js`, with the shared section copied from `mods/jj-spaces/jj.js` and the same `exec` and `readTextFile` arguments.
 - Change. `CHANGE_TEMPLATE` is the following, one JSON line per change. `files` is a list of JSON strings, each parsed again.
 
 ```text
@@ -624,6 +625,8 @@ json({"commit" => commit_id, "change" => change_id.short(),
 - Change. `readStack(root, on, io)` runs `jj --ignore-working-copy log --no-graph --limit 100 -r '@ | (trunk().. & first_ancestors(@))' -T STACK_TEMPLATE`.
 - Change. `readChange(root, on, commit, io)` runs `jj --ignore-working-copy log --no-graph -r <commit> -T CHANGE_TEMPLATE` and returns its files.
 - Change. `readPair(root, on, from, to, io)` runs `jj --ignore-working-copy diff --from <from> --to <to> -T 'json({"path" => path, "status" => status_char}) ++ "\n"'`.
+- Change. `snapshot(root, on, io)` runs `jj util snapshot` with a ten-second timeout.
+- Change. `readDiff(root, on, range, path, io)` runs `jj --ignore-working-copy diff --git -r <commit> -- 'root-file:"<path>"'`, or `--from <older> --to <newer>` with the same pattern, and returns the lines from the first hunk, stopping at 5,000 lines or 1 MiB with `cut` set.
 
 #### 22. `mods/jj-workspace/main.js` (Modify)
 
@@ -656,18 +659,18 @@ json({"commit" => commit_id, "change" => change_id.short(),
 #### 27. `scripts/app-trial.js` (Modify)
 
 - Type. Native trial.
-- Change. Cover CUJs 3, 4, 5 and 6. Open the panel and select a pair. Finish a single-workspace space and record that it closes and `jj log` keeps the change. Finish one workspace of a two-workspace space and record which tabs remain. Hold jj's lock during Finish and record the error, the open spaces and the retry. Record that the dialog stays open after its space closes and whether a pane closes when its terminal is killed.
+- Change. Cover CUJs 3, 4, 5 and 6. Open the panel and select a pair through a `trial-changes` subclass that the trial's layout copy mounts, and record what the panel shows after an outside `jj describe`. Seed `frame.welcomed` so the first-run welcome stays closed. Finish a single-workspace space and record that it closes and `jj log` keeps the change. Finish one workspace of a two-workspace space and record which tabs remain. Hold jj's lock during Finish and record the error, the open spaces and the retry. Record that the dialog stays open after its space closes and whether a pane closes when its terminal is killed.
 
 #### 28. `README.md` (Modify)
 
 - Type. Usage documentation.
-- Change. Add Changes panel and Finish workspace sections, and point Remove a workspace at Finish.
+- Change. Add Changes panel and Finish workspace sections, with Finish workspace in place of Remove a workspace.
 
 ## Verification Plan
 
 - Build. None. The mods run as source.
 - Unit and behavior tests. `just test` runs `tests/mods.test.js` against the harness and `tests/jj.test.js` against real jj in `/tmp` repositories.
-- Static checks. `just check-mods` runs `herdr-app check` on every mod in an isolated app home. `just verify` adds `node --check` on every script and mod file, and the check that every copy of `identity()` matches.
+- Static checks. `just check-mods` runs `herdr-app check` on every mod in an isolated app home. `just verify` adds `node --check` on every script and mod file, and the check that every copy of the shared section matches.
 - Coverage. Every command each mod runs appears in at least one test asserting its arguments. CUJs 1, 2, 4 and 7 have harness tests, and CUJs 3, 5 and 6 have harness tests and real-jj tests.
 - Performance. `just bench` meets every row of the Performance budget.
 - Native. `node scripts/app-trial.js` in an isolated app home and core session covers CUJs 1 and 2 in Stage 1, and CUJs 3, 4, 5 and 6 in Stage 2. Remote machines, Linux and visual review in the personal app remain unverified until run by hand.

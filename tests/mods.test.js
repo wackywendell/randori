@@ -11,8 +11,8 @@ const isLog = c => c.cmd === 'jj' && c.args.includes('log');
 
 // Two jj repositories: /r/main with a linked workspace /r/w1, and /o.
 // /g is in no jj repository.
-const ROOTS = { '/r/main': '/r/main', '/r/main/sub': '/r/main', '/r/w1': '/r/w1', '/o': '/o' };
-const FILES = { '/r/main/.jj/repo/store/type': 'git', '/o/.jj/repo/store/type': 'git', '/r/w1/.jj/repo': '../../main/.jj/repo' };
+const ROOTS = { '/r/main': '/r/main', '/r/main/sub': '/r/main', '/r/w1': '/r/w1', '/r/w1/src': '/r/w1', '/r/w2': '/r/w2', '/o': '/o' };
+const FILES = { '/r/main/.jj/repo/store/type': 'git', '/o/.jj/repo/store/type': 'git', '/r/w1/.jj/repo': '../../main/.jj/repo', '/r/w2/.jj/repo': '../../main/.jj/repo' };
 const STACK = [
   { commit: 'a', at: true, bookmarks: [], empty: false, files: 3, added: 120, removed: 8 },
   { commit: 'b', at: false, bookmarks: [] }, { commit: 'c', at: false, bookmarks: [] }, { commit: 'd', at: false, bookmarks: [] },
@@ -124,6 +124,17 @@ test('an operation in the repository rereads every space on it, without snapshot
   const logs = h.calls.filter(isLog);
   assert.deepEqual(logs.map(c => c.cwd).sort(), ['/r/main', '/r/w1']);
   assert.ok(logs.every(c => c.args[0] === '--ignore-working-copy'));
+});
+
+test('an operation after a space closes reads nothing for the closed space’s checkout', async () => {
+  const h = spacesWith([['s1', '/r/main'], ['s2', '/r/w1']]);
+  await settle(h);
+  h.state.spaces = h.state.spaces.filter(s => s.id !== 's2');
+  h.state.panes = h.state.panes.filter(p => p.tab !== 's2-tab');
+  await settle(h);
+  h.calls.length = 0;
+  await h.fire('/r/main/.jj/repo/op_heads/heads');
+  assert.deepEqual(h.calls.filter(isLog).map(c => c.cwd), ['/r/main']);
 });
 
 test('with a working watch no timer starts jj', async () => {
@@ -333,6 +344,140 @@ test('a folder outside jj says so', async () => {
   assert.ok(words(h.render()).some(x => x.includes('/g is not in a jj repository.')));
 });
 
+// Finish: space s1 has a tab in w1 and a tab in w2, space s2 a terminal in
+// w1, t4 is a parked terminal in w1 and t5 works in the main checkout.
+const WS = [{ name: 'default', root: '/r/main' }, { name: 'w1', root: '/r/w1' }, { name: 'w2', root: '/r/w2' }];
+const listed = (ws = WS) => ok(ws.map(x => JSON.stringify(x)).join('\n'));
+function finishing(over = () => undefined) {
+  const h = dialog('finish', (cmd, args, opts) => over(cmd, args, opts) ?? (args.includes('list') ? listed() : args[0] === 'status' || args.includes('remove') ? ok('') : undefined), {
+    spaces: [{ id: 's1', name: 'review', machine: null, folder: '/r/w1', tabs: [{ id: 'k1' }, { id: 'k2' }] }, { id: 's2', name: 'nesting', machine: null, folder: '/r/w1', tabs: [{ id: 'k3' }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1/src' }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w2' }, { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/r/w1' }],
+    terminals: [{ address: 't1', cwd: '/r/w1/src' }, { address: 't2', cwd: '/r/w2' }, { address: 't3', cwd: '/r/w1' }, { address: 't4', cwd: '/r/w1' }, { address: 't5', cwd: '/r/main' }],
+    props: { space: 's1', folder: '/r/w1/src', action: 'finish', overlay: 'o1' },
+  });
+  return h;
+}
+const key = (h, k) => byId(h.render(), 'worktree').handlers.on_key_down({ key: k }, h.cx);
+// Ends the killed terminals, as the core would, and lets Finish see it.
+async function ended(h) {
+  const killed = new Set(h.actions.filter(a => a.name === 'terminal.kill').map(a => a.args.terminal));
+  h.state.terminals = h.state.terminals.filter(t => !killed.has(t.address));
+  h.state.panes = h.state.panes.filter(p => !killed.has(p.terminal));
+  await h.advance(200);
+}
+const runs = (h, name) => plain(h.actions.filter(a => a.name === name).map(a => a.args));
+const jjLines = h => h.calls.filter(c => c.cmd === 'jj' && !c.args.includes('root')).map(c => `${c.cwd}: ${c.args.join(' ')}`);
+
+test('Finish lists the space\u2019s linked workspaces in tab order, checks the first and names other spaces that end', async () => {
+  const h = finishing();
+  await h.drain();
+  const text = words(h.render());
+  assert.ok(text.indexOf('w1') < text.indexOf('w2'));
+  assert.equal(byId(h.render(), 'finish-check-0').calls.checked[0], true);
+  assert.equal(byId(h.render(), 'finish-check-1').calls.checked[0], false);
+  assert.ok(text.includes('Its terminals in nesting end too.'));
+  assert.ok(text.some(x => x.includes('Files jj does not track, including ignored files, are deleted.')));
+  key(h, 'down'); key(h, 'space');
+  assert.equal(byId(h.render(), 'finish-check-1').calls.checked[0], true);
+  assert.deepEqual(h.actions, []);
+});
+
+test('Finish stops before ending anything when jj status fails', async () => {
+  const h = finishing((cmd, args) => args[0] === 'status' ? fail('Error: The working copy is locked') : undefined);
+  await h.drain();
+  key(h, 'enter');
+  await h.drain();
+  assert.ok(words(h.render()).includes('Error: The working copy is locked'));
+  assert.deepEqual(h.actions, []);
+  assert.equal(jjLines(h).some(l => l.includes('remove')), false);
+  assert.deepEqual(h.overlays, []);
+});
+
+test('Finish kills every terminal in a checked folder, closes their other panes and removes the workspace', async () => {
+  const h = finishing();
+  await h.drain();
+  key(h, 'enter');
+  await h.drain();
+  assert.deepEqual(runs(h, 'terminal.kill'), [{ terminal: 't1' }, { terminal: 't3' }, { terminal: 't4' }]);
+  assert.equal(jjLines(h).some(l => l.includes('remove')), false);
+  await ended(h);
+  assert.deepEqual(runs(h, 'space.close'), []);
+  assert.deepEqual(runs(h, 'pane.close'), []);
+  assert.deepEqual(jjLines(h), ['/r/main: --ignore-working-copy workspace list -T json({"name" => name, "root" => root}) ++ "\\n"',
+    '/r/main: --ignore-working-copy workspace list -T json({"name" => name, "root" => root}) ++ "\\n"', '/r/w1: status', '/r/main: workspace remove w1']);
+  assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
+});
+
+test('Finish closes panes still showing an ended terminal', async () => {
+  const h = finishing();
+  await h.drain();
+  key(h, 'enter');
+  await h.drain();
+  h.state.terminals = h.state.terminals.filter(t => !['t1', 't3', 't4'].includes(t.address));
+  await h.advance(200);
+  assert.deepEqual(runs(h, 'pane.close'), [{ pane: 'p1' }, { pane: 'p3' }]);
+  assert.deepEqual(runs(h, 'space.close'), []);
+});
+
+test('Finish closes the space once none of its terminals are left and removes one name at a time', async () => {
+  let release;
+  const h = finishing((cmd, args) => args.includes('remove') && args.includes('w1') ? new Promise(r => { release = () => r(ok('')); }) : undefined);
+  await h.drain();
+  key(h, 'down'); key(h, 'space'); key(h, 'enter');
+  await h.drain();
+  assert.deepEqual(runs(h, 'terminal.kill'), [{ terminal: 't1' }, { terminal: 't2' }, { terminal: 't3' }, { terminal: 't4' }]);
+  h.state.terminals = h.state.terminals.filter(t => t.address === 't5');
+  h.state.panes = h.state.panes.filter(p => p.pane === 'p3');
+  await h.advance(200);
+  assert.deepEqual(runs(h, 'space.close'), [{ id: 's1', confirmed: true }]);
+  assert.deepEqual(runs(h, 'pane.close'), [{ pane: 'p3' }]);
+  assert.equal(jjLines(h).some(l => l.endsWith('remove w2')), false);
+  release();
+  await h.drain();
+  assert.deepEqual(jjLines(h).filter(l => l.includes('remove')), ['/r/main: workspace remove w1', '/r/main: workspace remove w2']);
+});
+
+test('Finish stops when a terminal is still listed after 10 seconds', async () => {
+  const h = finishing();
+  await h.drain();
+  key(h, 'enter');
+  await h.drain();
+  for (let i = 0; i < 50; i++) await h.advance(200);
+  assert.ok(words(h.render()).includes('Terminal t1 in /r/w1/src did not stop.'));
+  assert.equal(jjLines(h).some(l => l.includes('remove')), false);
+  assert.deepEqual(runs(h, 'space.close'), []);
+});
+
+test('Enter after a failure retries only the names not yet removed', async () => {
+  let gone = false, refuse = true;
+  const h = finishing((cmd, args) => {
+    if (args.includes('list')) return listed(gone ? WS.filter(w => w.name !== 'w1') : WS);
+    if (args.includes('remove') && args.includes('w1')) { gone = true; return ok(''); }
+    if (args.includes('remove') && refuse) { refuse = false; return fail('Error: lock held'); }
+  });
+  await h.drain();
+  key(h, 'down'); key(h, 'space'); key(h, 'enter');
+  await h.drain();
+  await ended(h);
+  assert.ok(words(h.render()).includes('Error: lock held'));
+  assert.ok(words(h.render()).includes('removed'));
+  h.calls.length = 0;
+  key(h, 'enter');
+  await h.drain();
+  assert.deepEqual(jjLines(h).filter(l => !l.includes('list')), ['/r/w2: status', '/r/main: workspace remove w2']);
+  assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
+});
+
+test('Finish stops when jj no longer lists a checked workspace', async () => {
+  let n = 0;
+  const h = finishing((cmd, args) => args.includes('list') ? listed(n++ ? WS.filter(w => w.name !== 'w1') : WS) : undefined);
+  await h.drain();
+  key(h, 'enter');
+  await h.drain();
+  assert.ok(words(h.render()).includes('jj no longer lists w1. Its folder /r/w1 remains.'));
+  assert.deepEqual(h.actions, []);
+});
+
 // Menus
 
 test('a jj space\u2019s menu offers New and Open workspace in place of worktrees', async () => {
@@ -344,6 +489,27 @@ test('a jj space\u2019s menu offers New and Open workspace in place of worktrees
   assert.ok(text.includes('New workspace') && text.includes('Open workspace'));
   assert.equal(text.includes('New worktree'), false);
   assert.equal(w.calls.some(c => c.cmd === 'git'), false);
+});
+
+test('a space with a terminal in a linked workspace offers Finish workspace in a window', async () => {
+  const w = world();
+  const h = load('jj-menu', { spaces: [{ ...space('s1', '/r/main'), tabs: [{ id: 's1-tab' }, { id: 'k2' }] }],
+    panes: [pane('s1', '/r/main'), { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' }], props: { tab: 'space', target: { id: 's1' }, overlay: 'm1' },
+    exec: w.exec, readTextFile: w.readTextFile });
+  await h.drain();
+  const list = words(h.render());
+  assert.ok(list.includes('Finish workspace'));
+  h.view.choose(list.filter(x => ['Rename', 'New workspace', 'Open workspace', 'Finish workspace', 'Close'].includes(x)).indexOf('Finish workspace'), h.cx);
+  assert.equal(h.overlays.at(-1).kind, 'window');
+  assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1', folder: '/r/main', action: 'finish' });
+});
+
+test('a space only in the main checkout offers no Finish workspace', async () => {
+  const w = world();
+  const h = load('jj-menu', { spaces: [space('s1', '/r/main')], panes: [pane('s1', '/r/main')], props: { tab: 'space', target: { id: 's1' } },
+    exec: w.exec, readTextFile: w.readTextFile });
+  await h.drain();
+  assert.equal(words(h.render()).includes('Finish workspace'), false);
 });
 
 test('a space outside jj keeps the shipped menu', async () => {
@@ -374,11 +540,168 @@ test('the layout mounts Herdr\u2019s agents list and no Git poller, with setting
   const walk = node => { if (node.content?.mod) blocks.push(node.content); (node.children ?? []).forEach(walk); };
   walk(layout);
   const mods = blocks.map(b => b.mod);
-  for (const m of ['jj-spaces', 'agents', 'jj-tabs']) assert.ok(mods.includes(m), m);
+  for (const m of ['jj-spaces', 'agents', 'jj-tabs', 'jj-changes']) assert.ok(mods.includes(m), m);
   assert.equal(mods.includes('changes'), false);
   assert.deepEqual(blocks.find(b => b.mod === 'jj-spaces').props, { directory: '~/.herdr/worktrees/{repo}/{name}', links: [], miseTrust: true });
 });
 
-test('jj-tabs offers only the Files panel', () => {
-  assert.match(readFileSync(new URL('../mods/jj-tabs/main.js', import.meta.url), 'utf8'), /const enabled = \["files"\];/);
+test('jj-tabs offers the Files and Changes panels', () => {
+  assert.match(readFileSync(new URL('../mods/jj-tabs/main.js', import.meta.url), 'utf8'), /const enabled = shared\("workspace.panels"\) \?\? \["files", "changes"\];/);
+});
+
+// The changes panel, shown in the panel stack beside Files.
+const panelLayout = (hidden = false, active = 'changes') => ({ type: 'row', children: [{ id: 'panel', type: 'column', hidden, children: [
+  { id: 'panel-body', type: 'stack', active, children: [{ id: 'files', type: 'block', content: { mod: 'files' } }, { id: 'changes', type: 'block', content: { mod: 'jj-changes' } }] }] }] });
+const PANEL_STACK = [
+  { commit: 'c1', change: 'aaaaaaaaaaaa', description: '', empty: false, conflict: false, at: true, added: 2, removed: 1,
+    files: [{ path: 'src/a.js', status: 'M', added: 2, removed: 1 }] },
+  { commit: 'c2', change: 'bbbbbbbbbbbb', description: 'two', empty: false, conflict: false, at: false, added: 1, removed: 0 },
+  { commit: 'c3', change: 'cccccccccccc', description: 'one', empty: false, conflict: true, at: false, added: 4, removed: 0 },
+];
+const isSnap = c => c.cmd === 'jj' && c.args.join(' ') === 'util snapshot';
+const isStack = c => isLog(c) && c.args.includes('@ | (trunk().. & first_ancestors(@))');
+const isDiff = c => c.cmd === 'jj' && c.args.includes('--git');
+
+// A panel focused on `cwd`. `answers(cmd, args)` answers first.
+function panel(cwd = '/r/main', answers = () => undefined, data = {}) {
+  let stack = PANEL_STACK;
+  const w = world((cmd, args, opts) => {
+    const answer = answers(cmd, args, opts);
+    if (answer) return answer;
+    if (cmd !== 'jj') return undefined;
+    if (args.join(' ') === 'util snapshot') return ok('');
+    if (args.includes('@ | (trunk().. & first_ancestors(@))')) return ok(stack.map(c => JSON.stringify({ ...c, files: c.files?.map(f => JSON.stringify(f)) })).join('\n') + '\n');
+    if (args.includes('log')) return ok(JSON.stringify({ ...PANEL_STACK[1], files: [JSON.stringify({ path: 'b.txt', status: 'A', added: 1, removed: 0 })] }) + '\n');
+    if (args.includes('--git')) return ok('diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n');
+    if (args.includes('diff')) return ok('{"path":"p.txt","status":"M"}\n');
+    return undefined;
+  });
+  const h = load('jj-changes', { layout: panelLayout(), spaces: [{ id: 's1', active: true, folder: cwd, machine: null, tabs: [] }],
+    panes: [{ pane: 'p1', cwd }], focused: { space: 's1', pane: 'p1' }, exec: w.exec, readTextFile: w.readTextFile, ...data });
+  h.calls = w.calls;
+  h.setStack = s => { stack = s; };
+  return h;
+}
+async function shown(h) { h.render(); await h.drain(); h.render(); await h.drain(); }
+const click = (h, id, shift = false) => byId(h.render(), id).handlers.on_click({ modifiers: { shift } }, h.cx);
+
+test('the panel shows nothing and runs no Git while its probe is pending', async () => {
+  const h = panel('/r/main', (cmd, args) => args.includes('root') ? new Promise(() => {}) : undefined);
+  await shown(h);
+  assert.deepEqual(words(h.render()), []);
+  assert.deepEqual(plain(h.calls.map(c => c.cmd)), ['jj']);
+});
+
+test('the panel runs the shipped Git code in a Git-only folder', async () => {
+  const h = panel('/g', (cmd, args) => cmd === 'git' ? (args.includes('--show-toplevel') ? ok('/g\n') : ok('')) : undefined);
+  await shown(h);
+  assert.ok(h.calls.some(c => c.cmd === 'git' && c.args.includes('status')));
+  assert.equal(h.calls.some(isSnap), false);
+  assert.ok(words(h.render()).includes('Commit'));
+  assert.ok(h.timers.some(t => t.every === 10000));
+});
+
+test('showing the panel snapshots, reads the stack and opens the first file of @', async () => {
+  const h = panel();
+  await shown(h);
+  const jjCalls = h.calls.filter(c => c.cmd === 'jj').map(c => c.args.slice(0, 2).join(' '));
+  assert.deepEqual(plain(jjCalls), ['--ignore-working-copy workspace', 'util snapshot', '--ignore-working-copy log', '--ignore-working-copy diff']);
+  assert.deepEqual(plain(h.calls.find(isDiff).args), ['--ignore-working-copy', 'diff', '--git', '-r', 'c1', '--', 'root-file:"src/a.js"']);
+  assert.equal(h.calls.some(c => c.cmd === 'git'), false);
+  assert.equal(h.timers.some(t => t.every === 10000), false);
+  const text = words(h.render());
+  for (const w of ['main', '@ aaaaaaaa', 'two', 'conflict', 'a.js', 'new', 'Refresh']) assert.ok(text.includes(w), `${w} in ${text}`);
+  assert.ok(text.some(w => w.startsWith('updated ')));
+});
+
+test('Refresh snapshots and an operation rereads the stack without one', async () => {
+  const h = panel();
+  await shown(h);
+  h.calls.length = 0;
+  click(h, 'changes-refresh');
+  await h.drain();
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'jj').map(c => c.args[0] === 'util' ? 'snapshot' : c.args[1])), ['snapshot', 'log', 'diff']);
+  h.calls.length = 0;
+  await h.fire('/r/main/.jj/repo/op_heads/heads');
+  assert.equal(h.calls.some(isSnap), false);
+  assert.equal(h.calls.filter(isStack).length, 1);
+});
+
+test('a hidden panel starts nothing and snapshots once when shown again', async () => {
+  const h = panel('/r/main', () => undefined, { layout: panelLayout(false, 'files') });
+  await shown(h);
+  assert.equal(h.calls.some(c => isSnap(c) || isStack(c)), false);
+  await h.fire('/r/main/.jj/repo/op_heads/heads');
+  assert.equal(h.calls.some(c => isSnap(c) || isStack(c)), false);
+  h.state.layout = panelLayout();
+  await h.advance(1000);
+  assert.equal(h.calls.filter(isSnap).length, 1);
+  assert.equal(h.calls.filter(isStack).length, 1);
+  h.state.layout = panelLayout(true);
+  await h.advance(1000);
+  h.state.layout = panelLayout();
+  await h.advance(1000);
+  assert.equal(h.calls.filter(isSnap).length, 2);
+});
+
+test('click selects one change and Shift-click adds a second for a FROM and TO pair', async () => {
+  const h = panel();
+  await shown(h);
+  click(h, 'stack-c2');
+  await h.drain();
+  assert.deepEqual(plain(h.calls.filter(isLog).at(-1).args.slice(0, 5)), ['--ignore-working-copy', 'log', '--no-graph', '-r', 'c2']);
+  assert.ok(words(h.render()).includes('b.txt'));
+  click(h, 'stack-c3', true);
+  await h.drain();
+  const pair = h.calls.filter(c => c.cmd === 'jj' && c.args.includes('diff') && !c.args.includes('--git')).at(-1);
+  assert.deepEqual(plain(pair.args.slice(0, 6)), ['--ignore-working-copy', 'diff', '--from', 'c3', '--to', 'c2']);
+  assert.deepEqual(plain(h.calls.filter(isDiff).at(-1).args.slice(3, 7)), ['--from', 'c3', '--to', 'c2']);
+  assert.deepEqual(words(byId(h.render(), 'stack-c3')).slice(0, 1), ['FROM']);
+  assert.deepEqual(words(byId(h.render(), 'stack-c2')).slice(0, 1), ['TO']);
+  click(h, 'stack-c1');
+  await h.drain();
+  assert.equal(words(h.render()).includes('FROM'), false);
+});
+
+test('a refresh that finds a selected change rewritten says so and selects @', async () => {
+  const h = panel();
+  await shown(h);
+  click(h, 'stack-c2');
+  await h.drain();
+  h.setStack([PANEL_STACK[0], { ...PANEL_STACK[1], commit: 'c2b' }, PANEL_STACK[2]]);
+  await h.fire('/r/main/.jj/repo/op_heads/heads');
+  const text = words(h.render());
+  assert.ok(text.includes('Selected change was rewritten'));
+  assert.ok(text.includes('a.js'));
+  assert.equal(h.calls.filter(isDiff).at(-1).args[4], 'c1');
+});
+
+test('@ stays selected as snapshots rewrite it', async () => {
+  const h = panel();
+  await shown(h);
+  h.setStack([{ ...PANEL_STACK[0], commit: 'c1b' }, ...PANEL_STACK.slice(1)]);
+  click(h, 'changes-refresh');
+  await h.drain();
+  assert.equal(words(h.render()).includes('Selected change was rewritten'), false);
+  assert.equal(h.calls.filter(isDiff).at(-1).args[4], 'c1b');
+});
+
+test('a long diff is cut short at 5,000 lines', async () => {
+  const long = '@@ -0,0 +1,6000 @@\n' + Array.from({ length: 6000 }, (_, i) => `+${i}`).join('\n') + '\n';
+  const h = panel('/r/main', (cmd, args) => args.includes('--git') ? ok(long) : undefined);
+  await shown(h);
+  assert.equal(h.view.rows.length, 5000);
+  assert.ok(words(h.render()).includes('Diff cut short at 5,000 lines or 1 MiB'));
+});
+
+test('a failed read shows its error above the last good data', async () => {
+  let failing = false;
+  const h = panel('/r/main', (cmd, args) => failing && args.includes('snapshot') ? fail('Error: The working copy is stale') : undefined);
+  await shown(h);
+  failing = true;
+  click(h, 'changes-refresh');
+  await h.drain();
+  const text = words(h.render());
+  assert.ok(text.includes('Error: The working copy is stale'));
+  assert.ok(text.includes('two'));
 });

@@ -211,7 +211,8 @@ export default class Spaces extends View {
         const [key, snapshot] = entries.find(([, s]) => s) ?? entries[0];
         this.jjPending.delete(key);
         const g = this.git[key];
-        if (!g?.jj || !g.root) continue;
+        // A place no space is at any more, such as a finished workspace, is not read.
+        if (!g?.jj || !g.root || !Object.values(this.at).includes(key)) continue;
         this.checked[key] = Date.now();
         try { g.status = await readStatus(g.root, JSON.parse(key)[0], snapshot, IO); }
         catch (e) { g.status = { error: "error", message: String(e?.message ?? e) }; }
@@ -537,7 +538,7 @@ export default class Spaces extends View {
       .when(Boolean(bookmark), (el) => el.child(div().min_w(0).overflow_hidden().whitespace_nowrap().text_ellipsis_start().child(bookmark)))
       .when(s.empty, (el) => el.child(div().flex_none().child("\u2205")))
       .when(!s.empty, (el) => el
-        .child(div().flex_none().child(`~${s.files}`))
+        .child(div().flex_none().font_bold().text_color(t.working).child(`~${s.files}`))
         .child(div().flex_none().text_color(t.ansi2).child(`+${s.added}`))
         .child(div().flex_none().text_color(t.ansi1).child(`-${s.removed}`)));
   }
