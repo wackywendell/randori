@@ -243,7 +243,7 @@ The shipped `jj-tui` layout uses these defaults. Installing copies it into `~/.c
 
 ### Stages
 
-Stage 1 delivers `jj-spaces` with nesting and status lines, the shared refresh routine, the New and Open workspace dialogs, the settings, and the menu entries. It deletes nothing and never snapshots.
+Stage 1 delivers `jj-spaces` with nesting and status lines, the shared refresh routine, the New and Open workspace dialogs, the settings, and the menu entries. It deletes no checkout and never snapshots. Stage 1 also removes this repository's `herdr-jj` Rust helper and its Workspaces manager dialog, so the repository holds only mods, layouts, scripts and tests. Until Stage 2 lands, you remove a workspace by running `jj workspace remove` yourself.
 
 Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
@@ -257,3 +257,89 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 | Timers where watches work                  | none   |                          |
 
 `just bench` gains status line, panel and diff cases on the 3, 10,000 and 100,000 file fixtures, and a 100-change stack, which the cost investigation did not measure.
+
+## Alternatives Considered
+
+### A Rust helper binary for repository work
+
+- Pros. Removal code with identity, mount and sparse-checkout checks, approval tokens and Rust tests already exists. A helper could keep one bounded log file for every read.
+- Cons. Herdr's mods ship no binaries, so users would install one beside the mods. Every read pays about 5 ms more for the helper's start-up. `jj workspace remove` already snapshots, removes the colocated Git worktree and deletes the checkout without following links out of it.
+- Reason for rejection. Rejected by author. The mods can do all of the work through `exec`, as Herdr's worktree mod does with `git`, and a general-purpose mod set should install as mods alone.
+
+### Git reads for the files changed in a jj checkout
+
+- Pros. Herdr's Changes panel already works this way, and Git counts new files.
+- Cons. Git and jj disagree on a merge `@`, intent-to-add deletions, files jj has not yet snapshotted, a root parent and files above jj's new-file size limit. Fast Git reads need `git update-index --refresh` first, because jj leaves Git's file timestamps zeroed. Repositories with no Git have no data.
+- Reason for rejection. Rejected by author after measurement. The panel would count differently from `jj log`. Git reads remain only in Git-only repositories, through the shipped panel's code.
+
+### Pinning every read to one jj operation
+
+- Pros. All reads in one refresh agree, and no read merges divergent operations.
+- Cons. Each refresh needs an extra step to find the current operation, and the panel must check for divergence before it snapshots.
+- Reason for rejection. Rejected by author. The consistency is not worth the complexity. One jj call per refresh gives consistent numbers within a result, and a later refresh corrects a race between results.
+
+### Reusing the shell prompt's status
+
+- Pros. `jj-starship` and the `prompt_diff` alias already compute similar text, and starship takes 14 to 16 ms.
+- Cons. `jj-starship` counts no files or lines and writes a "reconcile divergent operations" operation when operations diverge. `prompt_diff` computes the diff up to six times, 450 ms on 1,000 changed files against 106 ms for one pass.
+- Reason for rejection. Rejected by author. One `jj log` call with a single `diff.stat()` gives the same content at lower cost.
+
+### Linking jj's library or running a resident service
+
+- Pros. It avoids jj's start-up for each read.
+- Cons. Start-up is about 16 ms of the 33 ms a status read takes. The library ties the code to jj's storage formats, and a service adds a process to install and keep running.
+- Reason for rejection. Rejected by author. The measured cost of one `jj` process per read is acceptable.
+
+### Herdr's Spaces sidebar and Changes panel unchanged
+
+- Pros. Nothing to maintain.
+- Cons. Every jj space shows `(detached)` as its branch, and repositories without Git do not nest. The Changes panel reads Git, misses the jj stack, and costs 5.9 seconds per refresh in a new 10,000-file jj workspace.
+- Reason for rejection. Rejected by author. Clones keep Herdr's look and change only the jj parts. The clone of the Changes panel keeps its Git code for Git-only repositories.
+
+### Drawing nesting without moving spaces
+
+- Pros. The sidebar would leave Herdr's space order alone.
+- Cons. Switching between spaces follows the real order, so the display and the switching order would disagree.
+- Reason for rejection. Rejected by author. The clone moves spaces with `space.move`, as Herdr's sidebar does for worktrees.
+
+### Removing the checkout on ordinary Close
+
+- Pros. One action fewer.
+- Cons. Close stops being safe to use without thinking.
+- Reason for rejection. Rejected by author. Close stays non-destructive, and Finish is a separate menu entry.
+
+### Preserving `.tmp/` and `.local/` at Finish
+
+- Pros. Notes in `.local/` would survive, copied into the main checkout through a verified staging folder, with a dated name on collision.
+- Cons. Finish would have six stages and a partial-failure report. It would treat two project conventions as built in, which a general-purpose mod set should not.
+- Reason for rejection. Rejected by author. Finish should be predictable and straightforward, following Herdr's Remove worktree. Ignored files are deleted, and the dialog says so.
+
+### Choosing workspaces with checkboxes when a space holds several
+
+- Pros. One Finish could remove several checkouts from a mixed space.
+- Cons. The dialog would need a list and its own rules for unchecked workspaces.
+- Reason for rejection. Rejected by author. Finish acts on the checkout the space shows, as Herdr's Remove worktree does.
+
+### Settings in their own file, in code constants, or in shared state
+
+- Pros. A file such as `~/.config/herdr-app/jj.json` survives reinstalls and serves every layout. Constants follow Herdr's worktree location. Shared state could have a settings dialog.
+- Cons. No shipped Herdr mod reads its own settings file. Constants mean editing code. Shared state lives in `shared.json`, which Herdr writes, and needs a dialog to edit.
+- Reason for rejection. Rejected by author. Props on the `jj-spaces` layout block are Herdr's convention for mod options.
+
+### Starting every workspace from `trunk()`
+
+- Pros. Every new checkout starts from the same place.
+- Cons. Herdr's New worktree starts from the current checkout, and `jj workspace add` starts from the current checkout's parent by default.
+- Reason for rejection. Rejected by author. Following Herdr and jj, a name that matches a bookmark starts on it and any other name uses jj's default.
+
+### Leaving `mise` trust to the user
+
+- Pros. Start runs no extra commands and trusts nothing on your behalf.
+- Cons. Every new checkout with linked `mise` files prompts for trust before its tools work.
+- Reason for rejection. Rejected by author. Trust is a setting, on by default, that runs only when `mise` is installed and covers only the linked files.
+
+### Hourly refresh and a ten-second cache
+
+- Pros. Fewer missed updates and fewer repeated reads.
+- Cons. A timer runs while nothing changes, and a cache shows old data.
+- Reason for rejection. Rejected by author. File watches start refreshes, and the routine's pending flag guarantees a final refresh after the last change.
