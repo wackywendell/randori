@@ -1,7 +1,7 @@
 # jj workspace lifecycle in Herdr
 
 Author: Wendell Smith
-Status: Draft
+Status: Approved
 Date: 2026-11-13
 
 ---
