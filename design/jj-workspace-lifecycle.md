@@ -182,7 +182,7 @@ The diagram shows that only an agent turn, a shown panel, Refresh and Finish mak
 
 ### Reading jj state
 
-Reads that need no snapshot pass `--at-op=@`, which reads the current operation without snapshotting and without merging divergent operations. Two reads snapshot, the status line's read after an agent turn and the changes panel's `jj util snapshot` when it is shown or refreshed. These snapshot as any jj command does, so they merge divergent operations and report a stale workspace. A jj error saying the workspace is stale shows as `stale`, and one saying the operation resolved to more than one operation shows as `divergent`.
+Reads that need no snapshot pass `--ignore-working-copy`, which reads the repository without snapshotting the checkout. They avoid `--at-op=@`, which snapshots in jj 0.47.1. Two reads snapshot, the status line's read after an agent turn and the changes panel's `jj util snapshot` when it is shown or refreshed. These snapshot as any jj command does and report a stale workspace. A jj error saying the workspace is stale shows as `stale`, and one saying the operation resolved to more than one operation shows as `divergent`.
 
 Every template below was run against jj 0.47.1.
 
@@ -202,8 +202,8 @@ The text is the bookmark and distance, the file count and the line totals, as `m
 
 A status line refreshes in three cases.
 
-- After an operation. One watch on the repository's `.jj/repo/op_heads/heads/` folder, which jj rewrites after every operation, serves every workspace of that repository. Each operation refreshes the status lines of that repository's spaces one at a time, with `--at-op=@`.
-- After an agent's turn or a foreground command ends in the space, when the space's terminals go from busy to idle. The read omits `--at-op=@`, so jj snapshots that space's checkout first. Other spaces of the repository refresh through the operation the snapshot records.
+- After an operation. One watch on the repository's `.jj/repo/op_heads/heads/` folder, which jj rewrites after every operation, serves every workspace of that repository. Each operation refreshes the status lines of that repository's spaces one at a time, with `--ignore-working-copy`.
+- After an agent's turn or a foreground command ends in the space, when the space's terminals go from busy to idle. The read omits `--ignore-working-copy`, so jj snapshots that space's checkout first. Other spaces of the repository refresh through the operation the snapshot records.
 - After a space's first terminal changes folder.
 
 Where `watchFolder` rejects a watch, status lines fall back to a 30-second interval while visible.
@@ -212,9 +212,9 @@ Where `watchFolder` rejects a watch, status lines fall back to a 30-second inter
 
 The panel shows the checkout of the focused pane's folder, as the shipped panel chooses its folder.
 
-The stack is the list of changes from `trunk()` to `@`, the revset `@ | (trunk().. & first_ancestors(@))`, newest first. One `jj --at-op=@ log` call returns each change's commit ID, change ID, description, emptiness, conflict state and line totals, and for `@` each changed file's path, status and line counts. The stack stops at 100 changes, and the panel then says how many it shows.
+The stack is the list of changes from `trunk()` to `@`, the revset `@ | (trunk().. & first_ancestors(@))`, newest first. One `jj --ignore-working-copy log` call returns each change's commit ID, change ID, description, emptiness, conflict state and line totals, and for `@` each changed file's path, status and line counts. The stack stops at 100 changes, and the panel then says how many it shows.
 
-Clicking a change selects it alone. Shift-clicking a second change selects the pair. Selecting a change other than `@` runs one `jj --at-op=@ log -r <commit>` for its files and line counts. Selecting a pair runs one `jj --at-op=@ diff --from <older> --to <newer>` with a template listing each file's path and status. Selecting a file runs `jj --at-op=@ diff --git` for that file, by commit ID, with `-r <commit>` or `--from` and `--to`. The output is Git's diff format, so the shipped panel's diff parser and line renderer apply unchanged. The panel shows at most 5,000 lines or 1 MiB of a diff, whichever comes first, and says when it cut one short.
+Clicking a change selects it alone. Shift-clicking a second change selects the pair. Selecting a change other than `@` runs one `jj --ignore-working-copy log -r <commit>` for its files and line counts. Selecting a pair runs one `jj --ignore-working-copy diff --from <older> --to <newer>` with a template listing each file's path and status. Selecting a file runs `jj --ignore-working-copy diff --git` for that file, by commit ID, with `-r <commit>` or `--from` and `--to`. The output is Git's diff format, so the shipped panel's diff parser and line renderer apply unchanged. The panel shows at most 5,000 lines or 1 MiB of a diff, whichever comes first, and says when it cut one short.
 
 The panel has three regions, top to bottom.
 
@@ -240,14 +240,14 @@ A view is visible when its block and every block above it lack `hidden: true`, a
 The New workspace dialog has one input for the name, a line showing the filled folder and what the checkout starts from, and the key hints `↵ create · esc cancel`. It loads the repository's local bookmark names once when it opens. On Enter it runs these steps in the current checkout.
 
 1. Make the name safe for a folder, as Herdr's worktree mod does with branch names, and fill the `directory` setting's `{repo}` with the main checkout's folder name and `{name}` with the safe name.
-2. Run `jj --ignore-working-copy workspace add --name <name> <directory>`, adding `-r <name>` when a local bookmark of that name exists. Any other name starts from the current checkout's parent, jj's default. When jj refuses, its error stays in the dialog and nothing else runs.
+2. Make the directory's parent folder with `mkdir -p`, since jj makes only the last folder. Run `jj workspace add --name <name> <directory>`, adding `-r <name>` when a local bookmark of that name exists. jj refuses `--ignore-working-copy` on this command, so it snapshots the current checkout first. Any other name starts from the current checkout's parent, jj's default. When jj refuses, its error stays in the dialog and nothing else runs.
 3. For each path in the `links` setting that exists in the main checkout, create its parent folder and link it into the new checkout with `ln -s` and an absolute target. A path that already exists in the new checkout, as a file, folder or link, because the start revision tracks it, is left as it is.
 4. When the `miseTrust` setting is on and `mise --version` succeeds, run `mise trust` on each file step 3 linked whose name is `mise.toml`, `.mise.toml`, `mise.<env>.toml` or `.mise.<env>.toml`, or that sits under `.mise/`, `mise/` or `.config/mise/`.
 5. Open a space with `space.new {folder, machine}` and no name, so it takes its name from the checkout folder.
 
 When step 3 or 4 fails, or skips a path, the space still opens, and one notification names each path and the reason.
 
-The Open workspace dialog lists the repository's workspaces from `jj --at-op=@ workspace list` with their folders, filtered as you type, marks those already open in a space, and selects that space or opens a new one. A workspace created before jj 0.38 records no folder, and the list shows it as unavailable.
+The Open workspace dialog lists the repository's workspaces from `jj --ignore-working-copy workspace list` with their folders, filtered as you type, marks those already open in a space, and selects that space or opens a new one. A workspace created before jj 0.38 records no folder, and the list shows it as unavailable.
 
 ### Finish workspace
 
@@ -255,9 +255,9 @@ The space menu offers Finish workspace for a jj space with a terminal in a linke
 
 The dialog lists every linked workspace in which a terminal of the space works, with its folder, in tab order. The workspace of the space's first terminal comes first when it is linked, and is checked. Otherwise the first linked workspace is checked. The others are unchecked. Under each checked workspace, a line names any other space with a terminal in that checkout, since those terminals end too. The text says "Ends the terminals working in the checked folders and deletes the folders. Edits jj tracks stay in the repository. Files jj does not track, including ignored files, are deleted." The key hints are `space check · ↵ finish · esc cancel`.
 
-When it opens, the dialog runs `jj --at-op=@ workspace list` from the main checkout and records each listed workspace's name, matched by folder, the main checkout, the machine and the space's ID. Enter runs three steps on the checked workspaces.
+When it opens, the dialog runs `jj --ignore-working-copy workspace list` from the main checkout and records each listed workspace's name, matched by folder, the main checkout, the machine and the space's ID. Enter runs three steps on the checked workspaces.
 
-1. Check. Run `jj --at-op=@ workspace list` from the main checkout and confirm each checked name still has its recorded folder. Then run `jj status` in each checked checkout, which snapshots it and fails on a held lock, a stale workspace or a missing checkout.
+1. Check. Run `jj --ignore-working-copy workspace list` from the main checkout and confirm each checked name still has its recorded folder. Then run `jj status` in each checked checkout, which snapshots it and fails on a held lock, a stale workspace or a missing checkout.
 2. End terminals. Run `terminal.kill` for every terminal in `terminals()` whose folder is inside a checked checkout, which covers panes, parked terminals and workers. Wait up to 10 seconds for `terminals()` to stop listing them. When the recorded space has no terminals left, close it with `space.close {id, confirmed: true}`. Close any other pane still showing an ended terminal with `pane.close`.
 3. Remove. Run `jj workspace remove <name>` from the main checkout for one checked workspace at a time, with the ten-minute timeout Herdr's worktree mod gives `git worktree remove`. The dialog marks each name as it is removed.
 
@@ -292,13 +292,13 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
 | Work                                           | Budget | Measured basis           |
 | ---------------------------------------------- | ------ | ------------------------ |
-| One status line                                | 40 ms  | 32 to 38 ms median       |
-| Status lines of 20 workspaces after one jj run | 1 s    | not yet measured         |
+| One status line                                | 40 ms  | 37 to 51 ms median       |
+| Status lines of 20 workspaces after one jj run | 1 s    | 839 ms median            |
 | Changes panel snapshot and read, 100,000 files | 400 ms | 348 ms snapshot and stat |
 | Stack read, 100 changes                        | 400 ms | not yet measured         |
 | One file diff, 5,000 lines                     | 200 ms | not yet measured         |
 
-`just bench` measures every row on the 3, 10,000 and 100,000 file fixtures, a 100-change stack and a 20-workspace repository.
+`just bench` measures the first two rows on 3, 10,000 and 100,000 file fixtures and a 20-workspace repository, with the user's jj config, and writes `.tmp/bench.json`. Stage 2 adds the other rows. The 10,000 file read measured 51 ms, over its budget. The read after an agent turn snapshots first and measured 253 to 257 ms at every size, most of it jj's Watchman query.
 
 ## Alternatives Considered
 
@@ -502,7 +502,7 @@ The copy's folder then replaces the repository's mod folder of the same name, an
 #### 5. `mods/jj-spaces/jj.js` (Create)
 
 - Type. Module imported by `main.js`. Every function takes `exec` and `readTextFile` as arguments, so Node tests and the benchmark pass real ones. This file holds the source of `identity()` and `joinPath()`. Herdr mods import only from their own folder, so `jj-workspace`, `jj-menu`, `jj-new-menu` and, in Stage 2, `jj-changes` each keep a `jj.js` with identical copies, and `scripts/check-mods.js` fails when a copy differs.
-- Change. `identity(folder, on, io)` runs `jj --ignore-working-copy workspace root` in `folder`. An `exec` rejection for a missing `jj`, or jj's "There is no jj repo", returns `{jj: false}`. Any other failure returns `{error, message}`. It then reads `<root>/.jj/repo` with `readTextFile`, treating rejection as absent. Text means a linked workspace, and `repo` is that text, trimmed, joined to `<root>/.jj/` and normalized. Otherwise, when `<root>/.jj/repo/store/type` reads as text, `repo` is `<root>/.jj/repo`. `main` is the folder two levels above `repo`. Returns `{jj: true, root, repo, main, linked: root !== main}`. A small pure `joinPath()` normalizes `.` and `..`.
+- Change. `identity(folder, on, io)` runs `jj --ignore-working-copy workspace root` in `folder`. jj's "There is no jj repo" returns `{jj: false, final: true}`, which the mod keeps. An `exec` rejection for a missing `jj` returns `{jj: false}`, which the mod asks again on the next change to the folder. Any other failure returns `{error, message}`. It then reads `<root>/.jj/repo` with `readTextFile`, treating rejection as absent. Text means a linked workspace, and `repo` is that text, trimmed, joined to `<root>/.jj/` and normalized. Otherwise, when `<root>/.jj/repo/store/type` reads as text, `repo` is `<root>/.jj/repo`. `main` is the folder two levels above `repo`. Returns `{jj: true, root, repo, main, linked: root !== main}`. A small pure `joinPath()` normalizes `.` and `..`.
 - Change. `STATUS_TEMPLATE` is the following, one JSON line per change.
 
 ```text
@@ -515,14 +515,14 @@ if(current_working_copy,
         "bookmarks" => local_bookmarks.map(|b| b.name())})) ++ "\n"
 ```
 
-- Change. `readStatus(root, on, snapshot, io)` runs `jj [--at-op=@] log --no-graph --limit 64 -r '@ | heads(::@ & bookmarks())::@' -T STATUS_TEMPLATE` in `root` with a ten-second timeout. It returns `{bookmark, distance, empty, files, added, removed}`, where `bookmark` is the first name on the first line, in output order, that has one, and `distance` is that line's index. Errors return `{error: "stale" | "divergent" | "error", message}`, matched on jj's "stale" and "resolved to more than one operation" messages.
+- Change. `readStatus(root, on, snapshot, io)` runs `jj [--ignore-working-copy] log --no-graph --limit 64 -r '@ | heads(::@ & bookmarks())::@' -T STATUS_TEMPLATE` in `root` with a ten-second timeout. It returns `{bookmark, distance, empty, files, added, removed}`, where `bookmark` is the first name on the first line, in output order, that has one, and `distance` is that line's index. Errors return `{error: "stale" | "divergent" | "error", message}`, matched on jj's "stale" and "resolved to more than one operation" messages.
 
 #### 6. `mods/jj-workspace/main.js`, `mods/jj-workspace/mod.json`, `mods/jj-workspace/jj.js` (Replace)
 
 - Type. Mod, fresh copy of `worktree`.
 - Change. Accept `props.action` of `new`, `open` and, in Stage 2, `finish`, with `props.space` and `props.folder`, the folder the menu was opened for. Run `identity()` from its own `jj.js` on `props.folder`, and read the settings from the `jj-spaces` block in `layout()` over its own `DEFAULTS`, `{directory: "~/.herdr/worktrees/{repo}/{name}", links: [], miseTrust: true}`.
-- `new`. Keep the shipped dialog's input, key hints and spinner, and the shipped `slug()`. On open, load `jj --at-op=@ bookmark list -T 'if(!remote && present, name ++ "\n")'` into a set. The info line shows the filled directory and either "starts on bookmark <name>" or "starts from this checkout's parent". Enter runs, in `root`, `jj --ignore-working-copy workspace add --name <name> [-r <name>] <directory>`. For each link it runs `test -e <main>/<path>`, skips the link when `test -e` or `test -L` on `<directory>/<path>` succeeds, then runs `mkdir -p <parent>` and `ln -s <main>/<path> <directory>/<path>`. When `miseTrust` is on it runs `mise --version`, then `mise trust <file>` for each linked file matching the rule in the New workspace section. Last it runs `space.new {folder: directory, machine}`. Skipped and failed paths go to one `notify({title: "New workspace", body, level: "warning"})` call.
-- `open`. Lists `jj --at-op=@ workspace list -T 'json({"name" => name, "root" => root}) ++ "\n"'` with the shipped filtered list, marking a workspace open when a terminal's folder sits inside its root. Enter selects that space or runs `space.new {folder, machine}`. A workspace with an empty root is listed as unavailable.
+- `new`. Keep the shipped dialog's input, key hints and spinner, and the shipped `slug()`. On open, load `jj --ignore-working-copy bookmark list -T 'if(!remote && present, name ++ "\n")'` into a set. The info line shows the filled directory and either "starts on bookmark <name>" or "starts from this checkout's parent". Enter runs, in `root`, `mkdir -p <parent of directory>` and then `jj workspace add --name <name> [-r <name>] <directory>`. For each link it runs `test -e <main>/<path>`, skips the link when `test -e` or `test -L` on `<directory>/<path>` succeeds, then runs `mkdir -p <parent>` and `ln -s <main>/<path> <directory>/<path>`. When `miseTrust` is on it runs `mise --version`, then `mise trust <file>` for each linked file matching the rule in the New workspace section. Last it runs `space.new {folder: directory, machine}`. Skipped and failed paths go to one `notify({title: "New workspace", body, level: "warning"})` call.
+- `open`. Lists `jj --ignore-working-copy workspace list -T 'json({"name" => name, "root" => root}) ++ "\n"'` with the shipped filtered list, marking a workspace open when a terminal's folder sits inside its root. Enter selects that space or runs `space.new {folder, machine}`. A workspace with an empty root is listed as unavailable.
 - Change. Errors from any command show in the dialog in `blocked` and go to `console.log`.
 
 #### 7. `mods/jj-menu/main.js`, `mods/jj-menu/mod.json`, `mods/jj-menu/jj.js` (Replace)
@@ -549,19 +549,19 @@ if(current_working_copy,
 
 - Type. Test harness.
 - Change. Load a mod's own `./jj.js` into its sandbox in place of stripping the import.
-- Change. Add fakes for `exec` (scripted results by command and arguments, recording each call), `readTextFile`, `watchFolder` (a controllable promise), `terminals()`, `layout()` with block props, `hidden` and stack `active`, `notify`, `run`, `Scrollbar`, `v_virtual_list`, `Checkbox`, and `InputState` with its `change` and `submit` callbacks, so tests can assert every command a mod runs.
+- Change. Add fakes for `exec` (scripted results by command and arguments, recording each call), `readTextFile`, `watchFolder` (a controllable promise), `terminals()`, `layout()` with block props, `hidden` and stack `active`, `notify`, `run`, `Scrollbar`, and `InputState` with its `change` and `submit` callbacks, so tests can assert every command a mod runs. Stage 2 adds `v_virtual_list` and `Checkbox`.
 
 #### 12. `tests/mods.test.js` (Replace)
 
 - Type. Mod behavior tests with the harness.
-- Cases. `jj-spaces` nests linked workspaces under the main checkout, renders each status example from the Status lines section, renders `stale`, `divergent` and `error` with tooltips, and shows no status line for a space with terminals in two repositories. A folder whose probe is pending runs no Git command. A probe failure other than "no jj repo" shows `error`. An `op_heads` batch runs one `--at-op=@` read per space of that repository, in series. A busy-to-idle edge runs one read without `--at-op=@` for its own space only. A request during a run produces exactly one more run. A hidden or narrow sidebar runs nothing. Right-clicking a space row opens `jj-menu`.
+- Cases. `jj-spaces` nests linked workspaces under the main checkout, renders each status example from the Status lines section, renders `stale`, `divergent` and `error` with tooltips, and shows no status line for a space with terminals in two repositories. A folder whose probe is pending runs no Git command. A probe failure other than "no jj repo" shows `error`. An `op_heads` batch runs one `--ignore-working-copy` read per space of that repository, in series. A busy-to-idle edge runs one read without `--ignore-working-copy` for its own space only. A request during a run produces exactly one more run. A hidden or narrow sidebar runs nothing. Right-clicking a space row opens `jj-menu`.
 - Cases. New workspace runs the commands of item 6 in order, adds `-r` only for a local bookmark, names an existing link path in one notification, runs no `mise` when `mise --version` fails or `miseTrust` is off, and keeps jj's error in the dialog when `workspace add` fails. Open lists, filters, marks open workspaces and lists an empty root as unavailable.
 - Cases. The menus offer jj entries for jj folders and the shipped worktree entries otherwise. The layout mounts no `changes` and no `jj-agents`.
 
 #### 13. `tests/jj.test.js` (Create)
 
 - Type. Tests against real jj in disposable `/tmp` repositories, removed afterwards.
-- Cases. `identity()` for a main checkout, a linked workspace, a plain folder and a missing `jj`. `readStatus()` for an empty `@`, edits in `@`, a bookmark at distance 0 and 3, no bookmark and a merge with two bookmarked heads. `readStatus(snapshot: false)` reports `divergent` for divergent operations and records no operation. `readStatus(snapshot: true)` reports `stale` for a stale workspace. `jj workspace add --ignore-working-copy` leaves the source checkout's `@` commit ID unchanged.
+- Cases. `identity()` for a main checkout, a linked workspace, a plain folder and a missing `jj`. `readStatus()` for an empty `@`, edits in `@`, a bookmark at distance 0 and 3, no bookmark and a merge with two bookmarked heads. `readStatus(snapshot: false)` records no operation. `errorWord()` maps jj's stale and divergent messages. jj 0.47.1 updates a workspace rewritten from another workspace without reporting it stale, so no fixture produces a stale error.
 
 #### 14. `scripts/bench.js` (Replace)
 
@@ -603,7 +603,7 @@ if(current_working_copy,
 - Change. On init and on each folder change, run `identity()` from its own `jj.js` on the shipped `location()` folder. Until it answers, render nothing and start nothing. For `{jj: false}`, run the shipped Git code. For an error, show it in the header.
 - Change. For jj, keep one refresh loop with `{running, pending, generation}`. Becoming visible and Refresh run `jj util snapshot` with a ten-second timeout, then `readStack()`. A `watchFolder(<repo>/op_heads/heads)` batch, kept while visible, runs `readStack()` alone. The shipped ten-second timer and Git watch never start for jj.
 - Change. Render the header, stack and file list described in the Changes panel section with the shipped virtual list and diff rows, mapping `status` to the shipped row's `status`, `added` to `add` and `removed` to `del`. Click replaces the selection, and Shift-click adds a second commit ID. A refresh drops a selected ID that is no longer in the stack and shows "Selected change was rewritten".
-- Change. `load(path)` runs `jj --at-op=@ diff --git -r <commit> -- 'root-file:"<path>"'`, or `--from <older> --to <newer>` with the same pattern, and stops parsing at 5,000 lines or 1 MiB with a "diff cut short" row.
+- Change. `load(path)` runs `jj --ignore-working-copy diff --git -r <commit> -- 'root-file:"<path>"'`, or `--from <older> --to <newer>` with the same pattern, and stops parsing at 5,000 lines or 1 MiB with a "diff cut short" row.
 
 #### 21. `mods/jj-changes/jj.js` (Create)
 
@@ -621,9 +621,9 @@ json({"commit" => commit_id, "change" => change_id.short(),
 ```
 
 - Change. `STACK_TEMPLATE` is `if(current_working_copy, <CHANGE_TEMPLATE without ++ "\n">, <the same map without "files">) ++ "\n"`, so only `@` computes its file list.
-- Change. `readStack(root, on, io)` runs `jj --at-op=@ log --no-graph --limit 100 -r '@ | (trunk().. & first_ancestors(@))' -T STACK_TEMPLATE`.
-- Change. `readChange(root, on, commit, io)` runs `jj --at-op=@ log --no-graph -r <commit> -T CHANGE_TEMPLATE` and returns its files.
-- Change. `readPair(root, on, from, to, io)` runs `jj --at-op=@ diff --from <from> --to <to> -T 'json({"path" => path, "status" => status_char}) ++ "\n"'`.
+- Change. `readStack(root, on, io)` runs `jj --ignore-working-copy log --no-graph --limit 100 -r '@ | (trunk().. & first_ancestors(@))' -T STACK_TEMPLATE`.
+- Change. `readChange(root, on, commit, io)` runs `jj --ignore-working-copy log --no-graph -r <commit> -T CHANGE_TEMPLATE` and returns its files.
+- Change. `readPair(root, on, from, to, io)` runs `jj --ignore-working-copy diff --from <from> --to <to> -T 'json({"path" => path, "status" => status_char}) ++ "\n"'`.
 
 #### 22. `mods/jj-workspace/main.js` (Modify)
 

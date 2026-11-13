@@ -1,221 +1,329 @@
-import { View, div } from 'gpui-kit';
-import { v_flex, h_flex, InputState, Input } from 'gpui-base';
-import { props, spaces, panes, machines, terminals, theme, exec, run, pickFolder, closeOverlay, notify } from 'herdr';
+// Workspace dialog: { space, folder, action: "new" | "open" }; optional { tab, argv }.
+//
+// A copy of Herdr's `worktree` dialog for jj. New workspace runs
+// `jj workspace add`, links the configured local files from the main checkout,
+// trusts linked mise files and opens a space on the checkout. Open workspace
+// lists the repository's workspaces and selects or opens a space on one.
 
-const local = on => on ?? null;
-function failure(result) {
-  try { return JSON.parse(result.stderr).error; } catch { return result.stderr || 'Workspace operation failed'; }
+import { View, div } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, Scrollbar } from "gpui-base";
+import { run, props, closeOverlay, theme, spaces, panes, exec, home, readTextFile, layout, notify } from "herdr";
+import { identity } from "./jj.js";
+
+const IO = { exec, readTextFile };
+
+// Where a space is now: its first terminal's live folder, else where it was made.
+function place(s, all = panes()) {
+  if (!s) return null;
+  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
+  return all.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder || null;
+}
+
+// The settings on the jj-spaces layout block, over these defaults.
+const DEFAULTS = { directory: "~/.herdr/worktrees/{repo}/{name}", links: [], miseTrust: true };
+function settings(root = layout()) {
+  const find = (node) => node?.content?.mod === "jj-spaces" ? node : (node?.children ?? []).map(find).find(Boolean);
+  return { ...DEFAULTS, ...(find(root)?.content?.props ?? {}) };
+}
+
+// Home as ~.
+const tilde = (path, userHome) => (userHome && path.startsWith(userHome) ? `~${path.slice(userHome.length)}` : path);
+const untilde = (path, userHome) => (path === "~" || path.startsWith("~/") ? `${userHome}${path.slice(1)}` : path);
+const slug = (branch) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+const base = (path) => path.replace(/\/+$/, "").split("/").pop();
+const parent = (path) => path.replace(/\/[^/]*$/, "") || "/";
+const inside = (p, dir) => p === dir || p.startsWith(dir + "/");
+
+// Linked mise configuration: mise.toml, .mise.toml, mise.<env>.toml and
+// .mise.<env>.toml, and anything under .mise/, mise/ or .config/mise/.
+export const miseFile = (path) => /(^|\/)\.?mise(\.[^./]+)?\.toml$/.test(path) || /^(\.mise|mise|\.config\/mise)\//.test(path);
+
+// The space showing a checkout: its first terminal is in it (the deepest checkout wins).
+function spaceOf(path, all, on, spaceList, paneList) {
+  return spaceList.find((s) => (s.machine ?? null) === (on ?? null) && (() => {
+    const at = place(s, paneList);
+    if (!at || !inside(at, path)) return false;
+    return !all.some((c) => c.path !== path && c.path.length > path.length && inside(at, c.path));
+  })());
+}
+
+async function jj(cwd, args, on, timeout) {
+  const r = await exec("jj", args, { cwd, on, ...(timeout === undefined ? {} : { timeout }) });
+  return { ok: r.code === 0, out: (r.stdout ?? "").trim(), err: (r.stderr ?? r.stdout ?? "").trim() };
+}
+
+// Every workspace of a repo, the main checkout first: { name, path, main }.
+// A workspace made before jj 0.38 records no folder: its path is "".
+async function workspaces(repo, on) {
+  const r = await jj(repo.root, ["--ignore-working-copy", "workspace", "list", "-T", 'json({"name" => name, "root" => root}) ++ "\\n"'], on);
+  if (!r.ok) throw new Error(r.err || "jj workspace list failed.");
+  const list = r.out.split("\n").filter(Boolean).map((l) => JSON.parse(l)).map((w) => ({ name: w.name, path: w.root, main: w.root === repo.main }));
+  return list.sort((a, b) => b.main - a.main || a.name.localeCompare(b.name));
+}
+
+async function bookmarks(repo, on) {
+  const r = await jj(repo.root, ["--ignore-working-copy", "bookmark", "list", "-T", 'if(!remote && present, name ++ "\\n")'], on);
+  if (!r.ok) throw new Error(r.err || "jj bookmark list failed.");
+  return new Set(r.out.split("\n").filter(Boolean));
+}
+
+// Commands that succeed or fail without output we need.
+async function ok(command, args, on) {
+  try { return (await exec(command, args, { on })).code === 0; } catch { return false; }
 }
 
 export default class Workspace extends View {
   init(_props, cx) {
-    const p = props() ?? {};
-    this.action = p.action ?? 'new';
-    this.on = spaces().find(s => s.id === p.space)?.machine ?? p.machine ?? null;
-    this.destination = p.space ?? null;
-    this.folder = InputState.new({ value: p.folder ?? '', placeholder: 'Absolute repository or workspace folder' });
-    this.name = InputState.new({ placeholder: 'Workspace or bookmark name' });
-    this.spaceName = InputState.new({ placeholder: 'Organizational space name' });
-    for (const input of [this.folder, this.name, this.spaceName]) input.on('change', (_e, cx) => cx.notify());
-    this.folder.on('submit', (_e, cx) => this.chooseRepository(this.folder.value().trim(), cx));
-    this.name.on('submit', (_e, cx) => this.go(cx));
+    this.on = this.space()?.machine;
+    this.userHome = this.on ? null : home();
+    this.opening = props()?.action === "open";
+    this.text = "";
+    this.list = undefined; // open: the workspaces, once read
+    this.names = new Set(); // new: the local bookmarks
+    this.at = 0;
+    this.input = InputState.new({ value: this.text, placeholder: this.opening ? "filter workspaces" : "workspace name" });
+    this.input.on("change", (_e, cx) => { this.text = this.input.value(); this.error = ""; this.at = 0; cx.notify(); });
+    this.input.on("submit", (_e, cx) => this.go(cx));
+    this.inputFocused = true;
+    this.input.on("focus", (_e, cx) => { this.inputFocused = true; cx.notify(); });
+    this.input.on("blur", (_e, cx) => { this.inputFocused = false; cx.notify(); });
     this.handle = cx.focus_handle();
-    this.handle.focus();
-    this.step = 'repository';
-    this.error = '';
+    this.handle.focus(); // the root is mounted from the first frame: keep the keyboard here while loading
+    this.input.focus();
     this.busy = false;
-    this.closed = false;
-  }
-
-  close() { this.closed = true; }
-
-  start(cx, job) {
-    if (this.busy) return;
-    this.busy = true;
-    this.error = '';
-    cx.spawn(async cx => {
-      try { await job(); } catch (error) { this.error = String(error.message ?? error); }
-      this.busy = false;
-      if (!this.closed) cx.notify();
-    });
-    cx.notify();
-  }
-
-  async ask(args, cwd = this.repo?.root) {
-    const result = await exec('herdr-jj', [...args, '--cwd', cwd], { on: this.on, cwd: this.repo?.main, timeout: 600_000 });
-    if (this.closed) throw new Error('Dialog closed');
-    if (result.code !== 0) throw new Error(failure(result));
-    return JSON.parse(result.stdout);
-  }
-
-  reset(action, cx) {
-    if (this.busy) return;
-    this.action = action;
-    this.step = 'repository';
-    this.repo = this.workspace = this.plan = this.scope = null;
-    this.error = '';
-    cx.notify();
-  }
-
-  chooseRepository(folder, cx) {
-    if (!folder) return;
-    this.start(cx, async () => {
-      if (!folder.startsWith('/')) throw new Error('Enter an absolute folder path.');
-      const repo = await this.ask(['probe'], folder);
-      if (!repo) throw new Error('Choose a jj repository. Git worktrees use the existing Git tools.');
-      this.folder.set_value(folder);
-      this.repo = repo;
-      this.plan = this.workspace = this.scope = null;
-      if (this.action === 'remove' && this.on) throw new Error('Remote removal is not supported; no terminals or files were changed.');
-      if (this.action === 'new') this.step = 'create';
-      else {
-        this.list = await this.ask(['list']);
-        this.step = 'workspaces';
+    this.error = "";
+    this.repo = undefined; // undefined: looking, null: not in jj
+    cx.spawn(async (cx) => {
+      try {
+        if (this.on) {
+          const result = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: this.on });
+          if (result.code !== 0 || !result.stdout.trim()) throw new Error("Could not find the remote home folder.");
+          this.userHome = result.stdout.trim();
+        }
+        this.folder = props()?.folder || place(this.space()) || this.userHome;
+        const id = await identity(this.folder, this.on, IO);
+        if (id.error) throw new Error(id.message);
+        const repo = id.jj ? { ...id, name: base(id.main) } : null;
+        if (repo && this.opening) this.list = await workspaces(repo, this.on);
+        if (repo && !this.opening) this.names = await bookmarks(repo, this.on);
+        // The repo is set last: Enter does nothing until what it uses is known.
+        this.repo = repo;
+        cx.notify();
+        // The list (and with it the filter input) only mounts once loading is
+        // done, so the keyboard must move there now.
+        this.handle.focus();
+        cx.timer.after(100, () => this.input.focus());
+      } catch (error) {
+        console.log(`jj-workspace: ${error?.message ?? error}`);
+        this.repo = null;
+        this.error = String(error?.message ?? error);
+        cx.notify();
       }
     });
   }
 
-  chooseWorkspace(workspace, cx) {
-    if (!workspace.root || (this.action === 'remove' && workspace.main)) return;
-    this.start(cx, async () => {
-      const repo = await this.ask(['probe'], workspace.root);
-      if (!repo || repo.repo !== this.repo.repo || repo.root !== workspace.root) throw new Error('Checkout identity changed. Choose the repository again.');
-      if (this.action === 'remove' && !repo.linked) throw new Error('The main checkout cannot be removed.');
-      this.workspace = workspace;
-      this.step = this.action === 'remove' ? 'scope' : 'destination';
-    });
+  space() {
+    const p = props() ?? {};
+    return spaces().find((s) => s.id === p.space) ?? (p.folder ? { folder: p.folder, machine: p.machine ?? null, name: "" } : undefined);
   }
 
-  scopes() {
-    return spaces().filter(s => !s.machine).flatMap(s => [
-      ...s.tabs.map(tab => ({ kind: 'tab', id: tab.id, label: `Tab “${tab.name}” in “${s.name}”`,
-        detail: panes().filter(p => p.tab === tab.id && p.cwd).map(p => p.cwd).join(', ') || 'No terminal folder reported' })),
-      { kind: 'space', id: s.id, label: `Entire space “${s.name}”`, detail: `ALL ${s.tabs.length} tabs, including any other repositories` },
-    ]);
-  }
-
-  chooseScope(scope, cx) {
-    this.start(cx, async () => {
-      const plan = await this.ask(['remove-plan', `--${scope.kind}`, scope.id], this.workspace.root);
-      if (plan.root !== this.workspace.root || plan.repo !== this.repo.repo || plan.scope.kind !== scope.kind || plan.scope.id !== scope.id) throw new Error('Removal target changed. Select it again.');
-      this.scope = scope;
-      this.plan = plan;
-      this.step = 'confirm';
-    });
-  }
-
-  destinationReady() {
-    return this.destination === 'new-space' ? Boolean(this.spaceName.value().trim())
-      : spaces().some(s => s.id === this.destination && local(s.machine) === local(this.on));
-  }
-
-  open(root, name) {
-    if (!this.destinationReady()) throw new Error('Choose where to open the workspace.');
-    if (this.destination === 'new-space') run('space.new', { name: this.spaceName.value().trim(), folder: root, tab: name, machine: this.on ?? '' });
-    else run('tab.new', { name, space: this.destination, folder: root });
+  close() {
     closeOverlay(props().overlay);
   }
 
   go(cx) {
-    if (this.busy) return;
-    if (this.step === 'confirm' && this.plan) {
-      this.busy = true;
-      const plan = this.plan;
-      const args = ['remove', `--${plan.scope.kind}`, plan.scope.id, '--yes', '--approval', plan.approval, '--cwd', plan.root,
-        ...(plan.excluded.length ? ['--discard-excluded'] : [])];
-      const cwd = this.repo.main;
-      const overlay = props().overlay;
-      // Closing a mod copy cancels even owner-null tasks. Keep the dialog
-      // alive through scope closure, then report before releasing its task.
-      cx.spawn(async () => {
-        try {
-          const result = await exec('herdr-jj', args, { cwd, timeout: 600_000 });
-          if (result.code !== 0) throw new Error(failure(result));
-          notify({ title: 'Workspace removed', body: plan.root, level: 'success' });
-        } catch (error) {
-          notify({ title: 'Workspace removal stopped', body: String(error.message ?? error), level: 'error', timeout: 0 });
-        }
-        closeOverlay(overlay);
-      });
-      cx.notify();
-    } else if (this.step === 'create' && this.destinationReady() && this.name.value().trim()) {
-      const name = this.name.value().trim();
-      this.start(cx, async () => {
-        const result = await this.ask(['create', name]);
-        this.open(result.root, name.replace(/\//g, '-'));
-      });
-    } else if (this.step === 'destination' && this.destinationReady()) {
-      this.start(cx, async () => {
-        const repo = await this.ask(['probe'], this.workspace.root);
-        if (!repo || repo.root !== this.workspace.root || repo.repo !== this.repo.repo) throw new Error('Checkout identity changed. Select it again.');
-        this.open(repo.root, this.workspace.name);
-      });
+    if (this.busy || !this.repo || this.opening) return;
+    cx.spawn(async (cx) => this.work(cx));
+  }
+
+  async work(cx) {
+    if (this.busy || !this.repo) return;
+    this.busy = true;
+    this.error = "";
+    cx.notify();
+    try { this.error = await this.create(); }
+    catch (error) { this.error = String(error?.message ?? error); }
+    if (this.error) console.log(`jj-workspace: ${this.error}`);
+    this.busy = false;
+    if (!this.error) this.close();
+    cx.notify();
+  }
+
+  // The folder and start of the workspace a name would make.
+  planned(name = this.text.trim()) {
+    const directory = settings().directory.replaceAll("{repo}", this.repo.name).replaceAll("{name}", slug(name));
+    return { name, path: untilde(directory, this.userHome), bookmark: this.names.has(name) };
+  }
+
+  async create() {
+    const { name, path, bookmark } = this.planned();
+    if (!name) return "Type a workspace name.";
+    const { links, miseTrust } = settings();
+    const add = ["workspace", "add", "--name", name, ...(bookmark ? ["-r", JSON.stringify(name)] : []), path];
+    // jj workspace add makes only the last folder of the path.
+    if (!(await ok("mkdir", ["-p", parent(path)], this.on))) return `Could not make ${parent(path)}.`;
+    const r = await jj(this.repo.root, add, this.on, 600_000);
+    if (!r.ok) return r.err || "jj workspace add failed.";
+    const problems = [];
+    const linked = [];
+    for (const rel of links) {
+      const source = `${this.repo.main}/${rel}`, target = `${path}/${rel}`;
+      if (!(await ok("test", ["-e", source], this.on))) { problems.push(`${rel}: not in the main checkout`); continue; }
+      if ((await ok("test", ["-e", target], this.on)) || (await ok("test", ["-L", target], this.on))) { problems.push(`${rel}: already in the new checkout`); continue; }
+      if (!(await ok("mkdir", ["-p", parent(target)], this.on)) || !(await ok("ln", ["-s", source, target], this.on))) { problems.push(`${rel}: could not link`); continue; }
+      linked.push(rel);
     }
+    const trust = linked.filter(miseFile);
+    if (miseTrust && trust.length && (await ok("mise", ["--version"], this.on))) {
+      for (const rel of trust) if (!(await ok("mise", ["trust", `${path}/${rel}`], this.on))) problems.push(`${rel}: mise trust failed`);
+    }
+    if (problems.length) {
+      console.log(`jj-workspace: ${problems.join("; ")}`);
+      notify({ title: "New workspace", body: problems.join("\n"), level: "warning" });
+    }
+    const p = props();
+    // Leave spaces unnamed so they follow the checkout folder and nest under the repo.
+    run("space.new", { folder: path, machine: this.on ?? "", tab: p.tab, argv: p.argv });
+    return "";
+  }
+
+  shown() {
+    const f = this.text.trim().toLowerCase();
+    return (this.list ?? []).filter((c) => !f || `${c.name} ${c.path}`.toLowerCase().includes(f));
+  }
+
+  open(c) {
+    if (!c?.path) return;
+    this.close();
+    const s = spaceOf(c.path, this.list, this.on, spaces(), panes());
+    if (s) run("space.select", { id: s.id });
+    else run("space.new", { folder: c.path, machine: this.on ?? "" });
+  }
+
+  key(e, cx) {
+    if (e.key === "escape") return this.close();
+    if (this.opening) {
+      const n = this.shown().length;
+      if (e.key === "enter") this.open(this.shown()[this.at]);
+      else if ((e.key === "down" || e.key === "up") && n) this.at = (this.at + (e.key === "down" ? 1 : n - 1)) % n;
+      else return;
+      cx.stop_propagation();
+      return cx.notify();
+    }
+  }
+
+  renderOpen(t) {
+    const r = this.repo;
+    const rows = this.shown();
+    const all = this.list ?? [];
+    const spaceList = spaces();
+    const paneList = panes();
+    const row = (c, i) => {
+      const on = i === this.at;
+      const there = c.path && spaceOf(c.path, all, this.on, spaceList, paneList);
+      return v_flex()
+        .id(`wt-${i}`)
+        .flex_none()
+        .h(44)
+        .px(10)
+        .justify_center()
+        .rounded(7)
+        .cursor_pointer()
+        .when(on, (el) => el.bg(t.selected))
+        .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+        .on_click(() => this.open(c))
+        .child(
+          h_flex()
+            .gap(8)
+            .items_center()
+            .child(div().flex_1().min_w(0).truncate().text_color(c.path ? t.foreground : t.dim).child(c.name))
+            .when(c.main, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("main checkout")))
+            .when(Boolean(there), (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child("open")))
+            .when(!c.path, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("unavailable"))),
+        )
+        .child(div().truncate().text_size(11.5).text_color(t.dim).child(c.path ? tilde(c.path, this.userHome ?? "") : "jj recorded no folder for this workspace"));
+    };
+    const count = rows.length === all.length ? `${all.length} workspaces` : `${rows.length}/${all.length} workspaces`;
+    return v_flex()
+      .id("worktree")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => this.key(e, cx))
+      .size_full()
+      .p(16)
+      .gap(10)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().child(div().flex_1().font_semibold().text_color(t.foreground).child(`Open workspace${r ? ` of ${r.name}` : ""}`)).child(div().text_size(11).text_color(t.dim).child(r ? count : "")))
+      .when(r === undefined, (el) => el.child(div().text_color(t.muted).child("\u2026")))
+      .when(r === null && !this.error, (el) => el.child(div().text_color(t.muted).child(`${this.folder ? tilde(this.folder, this.userHome ?? "") : "This folder"} is not in a jj repository.`)))
+      .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
+      .when(Boolean(r && this.list), (el) =>
+        el
+          .child(Input.new(this.input).h(32).px(10).items_center().rounded(6).border(1).border_color(this.inputFocused ? t.accent : t.input).bg(t.background).text_color(t.foreground))
+          .child(
+            div()
+              .relative()
+              .flex_1()
+              .min_h(0)
+              .child(
+                v_flex()
+                  .id("wt-list")
+                  .size_full()
+                  .overflow_y_scroll()
+                  .children(rows.map(row))
+                  .when(rows.length === 0, (el) => el.child(div().p(10).text_color(t.dim).child("No matching workspaces."))),
+              )
+              .child(Scrollbar.vertical("wt-list").absolute().inset_0()),
+          ),
+      )
+      .child(h_flex().justify_end().text_size(11).text_color(t.dim).child("\u2191\u2193 choose \u00b7 \u21b5 open \u00b7 esc close"));
   }
 
   render(cx) {
     const t = theme();
-    const button = (id, text, action, enabled = true) => div().id(id).px(10).py(6).rounded(5).bg(t.selected).text_color(enabled ? t.foreground : t.dim)
-      .when(enabled, el => el.cursor_pointer().on_click(action)).child(text);
-    const input = state => Input.new(state).h(32).px(8).border(1).border_color(t.input).rounded(5).flex_none();
-    const text = value => div().flex_none().child(value);
-    const sameMachine = s => local(s.machine) === local(this.on);
-    const folders = [...new Set(panes().filter(p => p.terminal && p.cwd && spaces().some(s => sameMachine(s) && s.tabs.some(tab => tab.id === p.tab))).map(p => p.cwd))];
-    const choices = [...new Set([null, ...machines().map(m => m.name), ...spaces().map(s => local(s.machine))])];
-    const canGo = this.step === 'confirm' || (this.step === 'create' && this.destinationReady() && this.name.value().trim()) || (this.step === 'destination' && this.destinationReady());
-    return v_flex().id('jj-workspace').track_focus(this.handle).size_full().min_h(0).p(16).gap(10).bg(t.popover).text_color(t.foreground).text_size(13)
-      .on_key_down((e, cx) => {
-        if (e.key === 'escape') { cx.stop_propagation(); if (!this.busy) closeOverlay(props().overlay); }
-        if (e.key === 'enter' && this.step === 'confirm') this.go(cx);
-      })
-      .child(text('jj workspaces').font_semibold())
-      .child(h_flex().gap(6).children([['new', 'Create'], ['open', 'Open'], ['remove', 'Remove']].map(([action, label]) =>
-        button(`jj-action-${action}`, this.action === action ? `● ${label}` : label, (_e, cx) => this.reset(action, cx), !this.busy))))
-      .child(v_flex().id('jj-body').flex_1().min_h(0).overflow_y_scrollbar().gap(8)
-        .when(this.step === 'repository', el => el
-          .child(text('Choose the repository explicitly. A space can contain several checkouts.'))
-          .child(h_flex().gap(6).flex_wrap().children(choices.map((on, i) => button(`jj-machine-${i}`, `${local(this.on) === local(on) ? '● ' : ''}${on ?? 'This computer'}`, (_e, cx) => { this.on = on; cx.notify(); }, !this.busy))))
-          .child(input(this.folder))
-          .child(h_flex().gap(6)
-            .child(button('jj-use-folder', 'Use folder', (_e, cx) => this.chooseRepository(this.folder.value().trim(), cx), !this.busy && Boolean(this.folder.value().trim())))
-            .when(!this.on, el => el.child(button('jj-browse', 'Browse…', (_e, cx) => this.start(cx, async () => {
-              const folder = await pickFolder({ prompt: 'Choose jj repository' });
-              if (!this.closed && folder) this.folder.set_value(folder);
-            }), !this.busy))))
-          .child(text('Terminal folders (choose one, or enter another path above):').text_color(t.dim))
-          .children(folders.map((folder, i) => button(`jj-folder-${i}`, folder, (_e, cx) => this.chooseRepository(folder, cx), !this.busy))))
-        .when(this.step !== 'repository', el => el.child(text(`${this.on ?? 'This computer'} · Repository: ${this.repo?.main}`))
-          .when(this.repo?.root !== this.repo?.main, el => el.child(text(`From checkout: ${this.repo?.root}`))))
-        .when(this.step === 'create', el => el.child(input(this.name)).child(text('Creates ../workspaces/<name> with shared project configuration. Existing owned workspaces are reused.')))
-        .when(this.step === 'workspaces', el => el.child(text(this.action === 'remove' ? 'Choose the exact linked checkout to remove:' : 'Choose the workspace to open:'))
-          .children((this.list ?? []).map((w, i) => button(`jj-workspace-${i}`, `${w.name}${w.main ? ' (main)' : ''} · ${w.root ?? 'checkout unavailable'}`,
-            (_e, cx) => this.chooseWorkspace(w, cx), !this.busy && Boolean(w.root) && !(this.action === 'remove' && w.main)))))
-        .when(this.step === 'create' || this.step === 'destination', el => el
-          .when(Boolean(this.workspace), el => el.child(text(`Checkout: ${this.workspace?.root}`)))
-          .child(text('Open as a new tab in:'))
-          .children(spaces().filter(sameMachine).map(s => button(`jj-destination-${s.id}`, `${this.destination === s.id ? '● ' : ''}${s.name}`,
-            (_e, cx) => { this.destination = s.id; cx.notify(); }, !this.busy)))
-          .child(button('jj-destination-new', `${this.destination === 'new-space' ? '● ' : ''}New organizational space`, (_e, cx) => { this.destination = 'new-space'; cx.notify(); }, !this.busy))
-          .when(this.destination === 'new-space', el => el.child(input(this.spaceName))))
-        .when(this.step === 'scope', el => el.child(text(`Checkout: ${this.workspace?.root}`)).child(text('Choose exactly what to close. Nothing closes until the final confirmation.'))
-          .children(this.scopes().map((scope, i) => v_flex().gap(2).flex_none()
-            .child(button(`jj-scope-${i}`, scope.label, (_e, cx) => this.chooseScope(scope, cx), !this.busy))
-            .child(text(scope.detail).text_size(11).text_color(t.dim)))))
-        .when(this.step === 'confirm', el => el
-          .child(text(`Delete checkout: ${this.plan?.root}`))
-          .child(text(`Close: ${this.scope?.label} · ${this.scope?.detail}`))
-          .child(text('Stops the listed terminals, takes a final snapshot, forgets the workspace and deletes its checkout. Snapshotted work stays in the shared repository.'))
-          .child(v_flex().id('jj-terminals').max_h(120).flex_none().overflow_y_scrollbar()
-            .children((this.plan?.terminals ?? []).map(id => text(`${terminals().find(t => t.address === id)?.name || 'Terminal'} · ${id}`))))
-          .when(Boolean(this.plan?.excluded.length), el => el
-            .child(text(`${this.plan?.excluded.length} files are outside the current snapshot. Any still excluded after the final snapshot are deleted without jj recovery.`).text_color(t.blocked))
-            .child(v_flex().id('jj-excluded').h(140).flex_none().overflow_y_scrollbar()
-              .children((this.plan?.excluded ?? []).map((f, i) => text(JSON.stringify(f.path)).id(`jj-excluded-${i}`).text_size(11))))))
-        .when(Boolean(this.error), el => el.child(text(this.error).text_color(t.blocked))))
-      .child(h_flex().justify_end().gap(8)
-        .when(this.step !== 'repository', el => el.child(button('jj-back', 'Change repository', (_e, cx) => this.reset(this.action, cx), !this.busy)))
-        .child(button('jj-cancel', 'Cancel', () => closeOverlay(props().overlay), !this.busy))
-        .when(Boolean(canGo), el => el.child(button('jj-go', this.step === 'confirm' ? 'Remove and delete checkout' : this.step === 'create' ? 'Create and open tab' : 'Open tab', (_e, cx) => this.go(cx), !this.busy)))
-        .when(this.busy, el => el.child('Working…')));
+    if (this.opening) return this.renderOpen(t);
+    const r = this.repo;
+    const plan = r && this.planned();
+    const detail =
+      r === undefined
+        ? "\u2026"
+        : r === null
+          ? this.error ? "" : `${this.folder ? tilde(this.folder, this.userHome) : "This folder"} is not in a jj repository.`
+          : `${tilde(plan.path, this.userHome)}, ${plan.bookmark ? `starts on bookmark ${plan.name}` : "starts from this checkout's parent"}.`;
+    return v_flex()
+      .id("worktree")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => this.key(e, cx))
+      .size_full()
+      .p(16)
+      .gap(10)
+      .bg(t.popover)
+      .text_size(13)
+      .child(div().font_semibold().text_color(t.foreground).child(`New workspace${r ? ` of ${r.name}` : ""}`))
+      .when(Boolean(r), (el) =>
+        el.child(
+          Input.new(this.input)
+            .h(32)
+            .px(10)
+            .items_center()
+            .rounded(6)
+            .border(1)
+            .border_color(this.inputFocused ? t.accent : t.input)
+            .bg(t.background)
+            .text_color(t.foreground),
+        ),
+      )
+      .when(Boolean(detail), (el) => el.child(div().text_color(t.muted).child(detail)))
+      .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
+      .child(div().flex_1())
+      .child(
+        h_flex()
+          .justify_end()
+          .text_size(11)
+          .text_color(t.dim)
+          .gap(6)
+          .when(this.busy, (el) => el.child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
+          .child(this.busy ? "working…" : !r ? "esc close" : "↵ create · esc cancel"),
+      );
   }
 }

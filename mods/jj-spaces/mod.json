@@ -1,7 +1,1 @@
-{
-  "place": "none",
-  "cloned_from": {
-    "name": "tui-spaces",
-    "version": "0.1.14"
-  }
-}
+{ "place": "none", "title": "Spaces", "cloned_from": { "name": "spaces", "version": "0.1.15" } }

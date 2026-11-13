@@ -1,51 +1,78 @@
+// Times the jj reads the mods run, against disposable repositories in the
+// system temp folder. Writes the results to .tmp/bench.json.
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
-import assert from 'node:assert/strict';
+import { execFile, execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
+import { readStatus } from '../mods/jj-spaces/jj.js';
 
-const temp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'herdr-jj-bench-')));
-const helper = path.resolve('target/debug/herdr-jj');
-const realJJ = execFileSync('which', ['jj'], { encoding: 'utf8' }).trim();
-const count = path.join(temp, 'queries');
-const bin = path.join(temp, 'bin');
-await fs.mkdir(bin);
-await fs.writeFile(path.join(bin, 'jj'), '#!/bin/sh\nprintf "jj\\n" >> "$JJ_COUNT"\nexec "$JJ_REAL" "$@"\n', { mode: 0o755 });
-const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, JJ_REAL: realJJ, JJ_COUNT: count };
-const main = path.join(temp, 'project');
-const exec = (program, args, cwd = temp) => execFileSync(program, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-async function measure(command, n = 9) {
-  await fs.writeFile(count, '');
+let processes = 0;
+const exec = (cmd, args, { cwd } = {}) => new Promise((resolve, reject) => {
+  processes++;
+  execFile(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 8 << 20 },
+    (error, stdout, stderr) => typeof error?.code === 'string' ? reject(error) : resolve({ code: error ? error.code ?? 1 : 0, stdout, stderr }));
+});
+const io = { exec };
+const jj = (cwd, ...args) => execFileSync('jj', ['--config', 'signing.behavior=drop', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+async function measure(body, n = 9) {
   const samples = [];
+  processes = 0;
   for (let i = 0; i < n; i++) {
     const start = performance.now();
-    exec(helper, [...command, '--cwd', main]);
+    const r = await body();
+    if (r?.error) throw new Error(r.message);
     samples.push(performance.now() - start);
   }
   samples.sort((a, b) => a - b);
-  const queries = (await fs.readFile(count, 'utf8')).split('\n').filter(Boolean).length;
-  return { samples: n, median_ms: +samples[Math.floor(n / 2)].toFixed(2), max_ms: +samples.at(-1).toFixed(2), jj_processes: queries };
+  return { samples: n, median_ms: +samples[n >> 1].toFixed(1), max_ms: +samples.at(-1).toFixed(1), jj_processes: processes };
 }
-try {
-  exec(realJJ, ['git', 'init', '--colocate', main]);
-  exec(realJJ, ['config', 'set', '--repo', 'signing.behavior', 'drop'], main);
-  exec(realJJ, ['config', 'set', '--repo', 'snapshot.auto-track', 'all()'], main);
-  for (let dir = 0; dir < 10; dir++) await fs.mkdir(path.join(main, `d${dir}`));
-  await Promise.all(Array.from({ length: 1000 }, (_, i) => fs.writeFile(path.join(main, `d${i % 10}`, `file${i}`), `content ${i}\n`)));
-  exec(helper, ['inspect', '--snapshot', '--cwd', main]);
-  const probe = await measure(['probe']);
-  const metadata = await measure(['inspect']);
-  const unchanged_snapshot = await measure(['inspect', '--snapshot']);
-  await Promise.all(Array.from({ length: 1000 }, (_, i) => fs.writeFile(path.join(main, `d${i % 10}`, `file${i}`), `changed ${i}\n`)));
-  const changed_snapshot = await measure(['inspect', '--snapshot'], 1);
 
-  assert.equal(probe.jj_processes, 0);
-  assert.equal(metadata.jj_processes, 9);
-  console.log(JSON.stringify({ fixture: '1000 tracked files in 10 directories, local temporary repository', build: 'debug',
-    note: 'Real timings include helper startup and an exec-only jj counting wrapper. Organizational space rows perform no VCS work; automatic repository refresh is deferred.',
-    probe, metadata, unchanged_snapshot, changed_snapshot,
-  }, null, 2));
+// A repository with `files` tracked files in one commit and three edited in @.
+async function repo(temp, files) {
+  const main = path.join(temp, `files-${files}`);
+  jj(temp, 'git', 'init', '--quiet', main);
+  const dirs = Math.ceil(files / 1000);
+  for (let d = 0; d < dirs; d++) await fs.mkdir(path.join(main, `d${d}`));
+  for (let i = 0; i < files; i += 5000) {
+    await Promise.all(Array.from({ length: Math.min(5000, files - i) }, (_, j) => fs.writeFile(path.join(main, `d${(i + j) % dirs}`, `f${i + j}`), `line ${i + j}\n`)));
+  }
+  jj(main, 'commit', '--quiet', '-m', 'files');
+  jj(main, 'bookmark', 'create', '--quiet', 'master', '-r', '@-');
+  for (let i = 0; i < 3; i++) await fs.writeFile(path.join(main, `d${i % dirs}`, `f${i}`), `changed ${i}\n`);
+  jj(main, 'util', 'snapshot');
+  return main;
+}
+
+const temp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'herdr-jj-bench-')));
+try {
+  const status = {};
+  for (const files of [3, 10_000, 100_000]) {
+    const main = await repo(temp, files);
+    status[files] = {
+      read: await measure(() => readStatus(main, null, false, io)),
+      unchanged_snapshot: await measure(() => readStatus(main, null, true, io)),
+    };
+  }
+  // One op_heads batch rereads every space of the repository, one at a time.
+  const main = path.join(temp, 'files-3');
+  const roots = [main];
+  for (let i = 1; i < 20; i++) {
+    const root = path.join(temp, `w${i}`);
+    jj(main, 'workspace', 'add', '--quiet', '--name', `w${i}`, root);
+    roots.push(root);
+  }
+  const refresh = await measure(async () => { for (const root of roots) await readStatus(root, null, false, io); }, 5);
+  const result = {
+    jj: execFileSync('jj', ['--version'], { encoding: 'utf8' }).trim(),
+    note: 'Medians over local temporary repositories with three edited files in @, using the user jj config.',
+    status_line: status,
+    op_heads_refresh_20_workspaces: refresh,
+  };
+  await fs.mkdir('.tmp', { recursive: true });
+  await fs.writeFile('.tmp/bench.json', JSON.stringify(result, null, 2) + '\n');
+  console.log(JSON.stringify(result, null, 2));
 } finally {
-  await fs.rm(temp, { recursive: true });
+  await fs.rm(temp, { recursive: true, force: true });
 }

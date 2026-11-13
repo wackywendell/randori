@@ -1,6 +1,10 @@
+// A copy of Herdr's `new-menu`. In a jj checkout the worktree rows read New
+// and Open workspace and open `jj-workspace`.
+
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, spaces, knownAgents, run, openOverlay, closeOverlay, props, window, keys, shared, setShared } from "herdr";
+import { theme, spaces, panes, knownAgents, run, openOverlay, closeOverlay, props, window, keys, shared, setShared, exec, readTextFile } from "herdr";
+import { identity } from "./jj.js";
 
 // The last agents each machine reported, shown at once while knownAgents() checks again.
 const KNOWN = "new-menu.agents";
@@ -29,6 +33,15 @@ export default class NewMenu extends View {
     this.agents = shared(KNOWN)?.[where] ?? [];
     this.handle = cx.focus_handle();
     this.handle.focus();
+    // The focused pane's folder: { jj } once known, the rows wait until then.
+    this.folder = panes().find(p => p.focused)?.cwd;
+    this.checkout = this.folder ? undefined : { jj: false };
+    if (this.folder) cx.spawn(async cx => {
+      const id = await identity(this.folder, machine, { exec, readTextFile });
+      if (id.error) console.log(`jj-new-menu: ${this.folder}: ${id.message}`);
+      this.checkout = { jj: Boolean(id.jj) };
+      cx.notify();
+    });
     cx.spawn(async cx => {
       try {
         this.agents = await knownAgents({ on: machine });
@@ -50,7 +63,8 @@ export default class NewMenu extends View {
     const space = spaces().find(s => s.active);
     const installed = this.agents.filter(a => a.installed);
     const choices = this.failed ? installed : [...installed, ...this.agents.filter(a => !a.installed).slice(0, 2)];
-    return v_flex().min_h(0).w_full().h(Math.min(491, 136 + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
+    const known = this.checkout !== undefined, jj = Boolean(this.checkout?.jj);
+    return v_flex().min_h(0).w_full().h(Math.min(491, 167 + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
       .id("new-menu").track_focus(this.handle)
       .on_key_down((e) => {
         if (e.modifiers.control || e.modifiers.platform || e.modifiers.alt) return;
@@ -67,6 +81,7 @@ export default class NewMenu extends View {
         .when(this.failed || this.agents.length === 0, el => el.child(div().px(9).py(6).text_color(t.dim).child(this.failed ? "Could not check installed agents" : "Checking installed agents…"))))
       .child(div().h(1).mx(4).my(5).bg(t.border))
       .child(this.row("space", div().w(14).child("+"), "New space", () => run("space.new"), shortcut("space.new")))
-      .child(this.row("workspaces", svg("mods/workspace-chrome/branch.svg").size(14), "Workspaces…", () => openOverlay({ mod: "jj-workspace", kind: "dialog", modal: true, width: 720, height: 680, props: { space: space?.id } })));
+      .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "New workspace…" : "New worktree…", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: this.folder, action: "new" } }), "", Boolean(space) && known))
+      .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "Open workspace\u2026" : "Open worktree\u2026", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }), "", Boolean(space) && known));
   }
 }

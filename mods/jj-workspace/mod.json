@@ -1,7 +1,1 @@
-{
-  "place": "none",
-  "cloned_from": {
-    "name": "workspace",
-    "version": "0.1.14"
-  }
-}
+{ "place": "none", "cloned_from": { "name": "worktree", "version": "0.1.15" } }

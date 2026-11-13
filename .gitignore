@@ -1,6 +1,5 @@
 .tmp/
 .local/
-target/
 .direnv/
 mods/**/jsconfig.json
 mods/**/*.d.ts

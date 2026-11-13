@@ -3,6 +3,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+// Herdr mods import only from their own folder, so each jj mod keeps a copy
+// of the shared section of mods/jj-spaces/jj.js. Copies must not drift.
+const shared = text => text.match(/\/\/ shared:start\n[\s\S]*\/\/ shared:end\n/)?.[0];
+const source = shared(await fs.readFile('mods/jj-spaces/jj.js', 'utf8'));
+for (const name of await fs.readdir('mods')) {
+  const file = path.join('mods', name, 'jj.js');
+  const copy = await fs.readFile(file, 'utf8').catch(() => null);
+  if (copy !== null && shared(copy) !== source) throw new Error(`${file}: the shared section differs from mods/jj-spaces/jj.js`);
+}
+
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'herdr-jj-check-'));
 try {
   for (const name of await fs.readdir('mods')) {
