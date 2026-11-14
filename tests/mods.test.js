@@ -589,13 +589,16 @@ test('jj-tabs offers the Files and Changes panels', () => {
 const panelLayout = (hidden = false, active = 'changes') => ({ type: 'row', children: [{ id: 'panel', type: 'column', hidden, children: [
   { id: 'panel-body', type: 'stack', active, children: [{ id: 'files', type: 'block', content: { mod: 'files' } }, { id: 'changes', type: 'block', content: { mod: 'jj-changes' } }] }] }] });
 const PANEL_STACK = [
-  { commit: 'c1', change: 'aaaaaaaaaaaa', description: '', empty: false, conflict: false, at: true, added: 2, removed: 1,
+  { commit: 'c1', change: { prefix: 'a', rest: 'aaaaa' }, description: '', empty: false, conflict: false, at: true, bookmarks: [], base: false, added: 2, removed: 1,
     files: [{ path: 'src/a.js', status: 'M', added: 2, removed: 1 }] },
-  { commit: 'c2', change: 'bbbbbbbbbbbb', description: 'two', empty: false, conflict: false, at: false, added: 1, removed: 0 },
-  { commit: 'c3', change: 'cccccccccccc', description: 'one', empty: false, conflict: true, at: false, added: 4, removed: 0 },
+  { commit: 'c2', change: { prefix: 'bb', rest: 'bbbb' }, description: 'two', empty: false, conflict: false, at: false, added: 1, removed: 0,
+    bookmarks: [{ name: 'feat' }, { name: 'feat', remote: 'git' }, { name: 'feat', remote: 'origin' }, { name: 'wip' }], base: false },
+  { commit: 'c3', change: { prefix: 'c', rest: 'ccccc' }, description: 'one', empty: false, conflict: true, at: false, bookmarks: [], base: false, added: 4, removed: 0 },
+  { commit: 'c4', change: { prefix: 'd', rest: 'ddddd' }, description: 'start', empty: false, conflict: false, at: false, bookmarks: [{ name: 'master' }], base: true },
 ];
 const isSnap = c => c.cmd === 'jj' && c.args.join(' ') === 'util snapshot';
-const isStack = c => isLog(c) && c.args.includes('@ | (trunk().. & first_ancestors(@))');
+const stackRev = c => c.args.find(a => a.startsWith('@ | ('));
+const isStack = c => isLog(c) && Boolean(stackRev(c));
 
 // A panel focused on `cwd`. `answers(cmd, args)` answers first.
 function panel(cwd = '/r/main', answers = () => undefined, data = {}) {
@@ -605,7 +608,7 @@ function panel(cwd = '/r/main', answers = () => undefined, data = {}) {
     if (answer) return answer;
     if (cmd !== 'jj') return undefined;
     if (args.join(' ') === 'util snapshot') return ok('');
-    if (args.includes('@ | (trunk().. & first_ancestors(@))')) return ok(stack.map(c => JSON.stringify({ ...c, files: c.files?.map(f => JSON.stringify(f)) })).join('\n') + '\n');
+    if (args.some(a => a.startsWith('@ | ('))) return ok(stack.map(c => JSON.stringify({ ...c, files: c.files?.map(f => JSON.stringify(f)) })).join('\n') + '\n');
     if (args.includes('log')) return ok(JSON.stringify({ ...PANEL_STACK[1], files: [JSON.stringify({ path: 'b.txt', status: 'A', added: 1, removed: 0 })] }) + '\n');
     if (args.includes('diff')) return ok('{"path":"p.txt","status":"M"}\n');
     return undefined;
@@ -643,8 +646,92 @@ test('showing the panel snapshots and reads the stack, with the files of @', asy
   assert.equal(h.calls.some(c => c.cmd === 'git'), false);
   assert.equal(h.timers.some(t => t.every === 10000), false);
   const text = words(h.render());
-  for (const w of ['main', '@ aaaaaaaa', 'two', 'conflict', 'a.js', 'Open diff', 'Refresh']) assert.ok(text.includes(w), `${w} in ${text}`);
+  for (const w of ['main', '@ ', 'a', 'aaaaa', 'two', 'conflict', 'a.js', 'diff', 'trunk()', 'feat', 'feat@origin', '+1', 'start', 'base']) assert.ok(text.includes(w), `${w} in ${text}`);
+  assert.equal(text.includes('wip') || text.some(w => w.endsWith('@git')), false, text.join(','));
   assert.ok(text.some(w => w.startsWith('updated ')));
+  assert.match(h.calls.find(isStack).args.at(-1), /change_id\.shortest\(6\)/);
+});
+
+test('the idLength prop sets how many characters a change ID shows', async () => {
+  const layout = panelLayout();
+  layout.children[0].children[0].children[1].content.props = { idLength: 9 };
+  const h = panel('/r/main', () => undefined, { layout });
+  await shown(h);
+  assert.match(h.calls.find(isStack).args.at(-1), /change_id\.shortest\(9\)/);
+});
+
+const BOOKMARKS = (cmd, args) => args.includes('bookmark') ? ok('main\nmain@origin\nfeat/x\n') : undefined;
+const pick = (h, key) => byId(h.render(), 'changes-base-picker').handlers.on_key_down({ key }, h.cx);
+const bases = h => plain(h.shared.get('jj-changes:bases'));
+const lastBase = h => stackRev(h.calls.filter(isStack).at(-1));
+
+test('the base picker lists the newest bookmarks, filters as you type and keeps each workspace’s base', async () => {
+  const h = panel('/r/main', BOOKMARKS, { shared: { 'jj-changes:bases': { '/r/other': 'other@origin' } } });
+  await shown(h);
+  assert.equal(lastBase(h), '@ | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
+  click(h, 'changes-base');
+  await h.drain();
+  assert.equal(h.inputs[1].value(), 'trunk()');
+  assert.ok(h.calls.some(c => line(c) === 'jj --ignore-working-copy bookmark list --all-remotes --sort committer-date- -T if(!remote || remote != "git", name ++ if(remote, "@" ++ remote) ++ "\n")'));
+  for (const name of ['main', 'main@origin', 'feat/x']) assert.ok(byId(h.render(), `changes-base-${name}`), name);
+  h.inputs[1].emit('change', 'origin');
+  assert.equal(byId(h.render(), 'changes-base-main'), undefined);
+  pick(h, 'enter');
+  await h.drain();
+  assert.deepEqual(bases(h), { '/r/other': 'other@origin', '/r/main': 'main@origin' });
+  assert.equal(lastBase(h), '@ | ((main@origin).. & first_ancestors(@)) | heads(::@ & ::(main@origin))');
+  assert.equal(byId(h.render(), 'changes-base-picker'), undefined);
+  assert.ok(words(h.render()).includes('main@origin'));
+  click(h, 'changes-base');
+  await h.drain();
+  h.inputs[1].emit('change', '');
+  pick(h, 'enter');
+  await h.drain();
+  assert.deepEqual(bases(h), { '/r/other': 'other@origin' });
+  assert.equal(lastBase(h), '@ | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
+});
+
+test('the base picker takes a typed revset, a bookmark copied with Tab and edited, a click, and Escape', async () => {
+  const h = panel('/r/main', BOOKMARKS);
+  await shown(h);
+  click(h, 'changes-base');
+  await h.drain();
+  h.inputs[1].emit('change', 'main-');
+  pick(h, 'enter');
+  await h.drain();
+  assert.equal(lastBase(h), '@ | ((main-).. & first_ancestors(@)) | heads(::@ & ::(main-))');
+  click(h, 'changes-base');
+  await h.drain();
+  h.inputs[1].emit('change', 'feat');
+  pick(h, 'tab');
+  assert.equal(h.inputs[1].value(), 'feat/x');
+  h.inputs[1].emit('change', 'feat/x-');
+  pick(h, 'enter');
+  await h.drain();
+  assert.equal(lastBase(h), '@ | ((feat/x-).. & first_ancestors(@)) | heads(::@ & ::(feat/x-))');
+  click(h, 'changes-base');
+  await h.drain();
+  pick(h, 'down'); pick(h, 'down');
+  assert.ok(byId(h.render(), 'changes-base-main@origin').calls.bg);
+  click(h, 'changes-base-feat/x');
+  await h.drain();
+  assert.deepEqual(bases(h), { '/r/main': 'feat/x' });
+  click(h, 'changes-base');
+  await h.drain();
+  pick(h, 'escape');
+  assert.equal(byId(h.render(), 'changes-base-picker'), undefined);
+  assert.deepEqual(bases(h), { '/r/main': 'feat/x' });
+});
+
+test('a base jj cannot resolve shows its error', async () => {
+  const h = panel('/r/main', (cmd, args) => args.includes('@ | ((nope).. & first_ancestors(@)) | heads(::@ & ::(nope))') ? fail('Error: Revision `nope` doesn\'t exist') : BOOKMARKS(cmd, args));
+  await shown(h);
+  click(h, 'changes-base');
+  await h.drain();
+  h.inputs[1].emit('change', 'nope');
+  pick(h, 'enter');
+  await h.drain();
+  assert.ok(words(h.render()).includes('Error: Revision `nope` doesn\'t exist'));
 });
 
 test('Refresh snapshots and an operation rereads the stack without one', async () => {
@@ -726,7 +813,7 @@ test('clicking a file opens the whole change in Hunk, split right of the focused
   await shown(h);
   click(h, 'change-src/a.js');
   await h.drain();
-  assert.deepEqual(runs(h, 'pane.split'), [{ direction: 'right', argv: [...SPLIT, 'hunk', 'show', 'aaaaaaaaaaaa'] }]);
+  assert.deepEqual(runs(h, 'pane.split'), [{ direction: 'right', argv: [...SPLIT, 'hunk', 'show', 'aaaaaa'] }]);
   assert.equal(h.calls.filter(c => c.cmd === 'jj').some(c => c.args.includes('--git')), false);
 });
 
@@ -742,7 +829,7 @@ test('Open diff opens a FROM and TO pair whole, asking once whether Hunk runs', 
   click(h, 'changes-open');
   await h.drain();
   assert.deepEqual(runs(h, 'pane.split').map(a => a.argv.slice(SPLIT.length)), [
-    ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb'], ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb']]);
+    ['hunk', 'diff', 'cccccc', 'bbbbbb'], ['hunk', 'diff', 'cccccc', 'bbbbbb']]);
   assert.equal(h.calls.filter(c => c.cmd === 'hunk').length, 1);
 });
 
@@ -758,8 +845,8 @@ test('without Hunk a diff opens in jj diff, paged by less that waits for q', asy
   click(h, 'changes-open');
   await h.drain();
   assert.deepEqual(runs(h, 'pane.split').map(a => a.argv.slice(SPLIT.length)), [
-    ['jj', '--config', 'ui.pager=less -R', 'diff', '-r', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'],
-    ['jj', '--config', 'ui.pager=less -R', 'diff', '--from', 'cccccccccccc', '--to', 'bbbbbbbbbbbb']]);
+    ['jj', '--config', 'ui.pager=less -R', 'diff', '-r', 'aaaaaa', '--', 'root-file:"src/a.js"'],
+    ['jj', '--config', 'ui.pager=less -R', 'diff', '--from', 'cccccc', '--to', 'bbbbbb']]);
 });
 
 // A panel in tab tb whose tab, or `diffTab`, has diff pane p2 running terminal t9 with pid 42.
@@ -783,7 +870,7 @@ test('a later click reloads the tab’s live Hunk pane with the selection, moves
   await h.drain();
   assert.deepEqual(runs(h, 'pane.split'), []);
   assert.deepEqual(runs(h, 'pane.focus'), [{ terminal: 't9' }]);
-  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'reload S1 --source /r/main -- show aaaaaaaaaaaa', 'navigate S1 --file src/a.js --hunk 1']);
+  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'reload S1 --source /r/main -- show aaaaaa', 'navigate S1 --file src/a.js --hunk 1']);
 });
 
 test('a click in the commits the pane shows only moves to the file, and a rewritten change reloads', async () => {
@@ -803,7 +890,7 @@ test('a click in the commits the pane shows only moves to the file, and a rewrit
   h.calls.length = 0;
   click(h, 'changes-open');
   await h.drain();
-  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'reload S1 --source /r/main -- show aaaaaaaaaaaa']);
+  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'reload S1 --source /r/main -- show aaaaaa']);
 });
 
 test('a diff pane whose Hunk window is not found is replaced in place', async () => {

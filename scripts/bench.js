@@ -7,7 +7,7 @@ import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { readStatus } from '../mods/jj-spaces/jj.js';
-import { snapshot, readStack, STACK_LIMIT } from '../mods/jj-changes/jj.js';
+import { snapshot, readStack, DEFAULT_BASE, DEFAULT_ID_LENGTH, STACK_LIMIT } from '../mods/jj-changes/jj.js';
 
 let processes = 0;
 const exec = (cmd, args, { cwd } = {}) => new Promise((resolve, reject) => {
@@ -58,7 +58,7 @@ try {
       read: await measure(`status read, ${files} files`, () => readStatus(main, null, false, io)),
       unchanged_snapshot: await measure(`status read with snapshot, ${files} files`, () => readStatus(main, null, true, io)),
       // What showing the changes panel runs.
-      panel_snapshot_and_stack: await measure(`panel snapshot and stack, ${files} files`, async () => { await snapshot(main, null, io); await readStack(main, null, io); }),
+      panel_snapshot_and_stack: await measure(`panel snapshot and stack, ${files} files`, async () => { await snapshot(main, null, io); await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io); }),
     };
   }
   // One op_heads batch rereads every space of the repository, one at a time.
@@ -78,7 +78,7 @@ try {
     await fs.writeFile(path.join(deep, 'f'), `change ${i}\n`);
     jj(deep, '--config', 'fsmonitor.backend=none', 'commit', '--quiet', '-m', `change ${i}`);
   }
-  const stack = await measure('100-change stack', () => readStack(deep, null, io));
+  const stack = await measure('100-change stack', () => readStack(deep, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io));
   const result = {
     jj: execFileSync('jj', ['--version'], { encoding: 'utf8' }).trim(),
     note: 'Medians over local temporary repositories with three edited files in @, using the user jj config and tests/jj-test.toml.',

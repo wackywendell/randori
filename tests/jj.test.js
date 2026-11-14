@@ -8,7 +8,7 @@ import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { identity, joinPath, readStatus, visible, errorWord } from '../mods/jj-spaces/jj.js';
-import { readStack, readChange, readPair, filePattern, snapshot, STACK_LIMIT } from '../mods/jj-changes/jj.js';
+import { readStack, readBookmarks, DEFAULT_BASE, DEFAULT_ID_LENGTH, readChange, readPair, filePattern, snapshot, STACK_LIMIT } from '../mods/jj-changes/jj.js';
 
 // Herdr's exec: resolves { code, stdout, stderr }, rejects when the program cannot start.
 export const exec = (cmd, args, { cwd, timeout } = {}) => new Promise((resolve, reject) => execFile(cmd, args, { cwd, timeout, encoding: 'utf8', maxBuffer: 8 << 20 },
@@ -104,11 +104,22 @@ test('every jj mod keeps an identical copy of the shared section', () => {
   for (const name of ['jj-workspace', 'jj-menu', 'jj-new-menu', 'jj-changes']) assert.equal(shared(name), shared('jj-spaces'), name);
 });
 
-test('readStack lists @ alone when it sits on trunk()', async t => {
+test('readStack lists @ and then trunk() as the base when @ sits on it', async t => {
   const { main } = fixture(t);
-  const stack = await readStack(main, null, io);
-  assert.equal(stack.length, 1);
-  assert.deepEqual({ ...stack[0], commit: '', change: '' }, { commit: '', change: '', description: '', empty: true, conflict: false, at: true, added: 0, removed: 0, files: [] });
+  const stack = await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io);
+  assert.equal(stack.length, 2);
+  assert.deepEqual({ ...stack[0], commit: '', change: '', prefix: '' }, { commit: '', change: '', prefix: '', description: '', empty: true, conflict: false, at: true, bookmarks: [], base: false, added: 0, removed: 0, files: [] });
+  assert.deepEqual([stack[1].base, stack[1].at, stack[1].bookmarks, 'added' in stack[1]], [true, false, ['master'], false]);
+});
+
+test('readStack shows change IDs of at least idLength characters, split at the shortest unique prefix', async t => {
+  const { main } = fixture(t);
+  for (const n of [6, 9]) {
+    const [at] = await readStack(main, null, DEFAULT_BASE, n, io);
+    assert.equal(at.change.length, n);
+    assert.ok(at.prefix.length >= 1 && at.change.startsWith(at.prefix), JSON.stringify(at));
+    assert.equal(jj(main, '--ignore-working-copy', 'log', '--no-graph', '-r', at.prefix, '-T', 'commit_id'), at.commit);
+  }
 });
 
 test('readStack lists a stack newest first, with files only for @', async t => {
@@ -116,17 +127,36 @@ test('readStack lists a stack newest first, with files only for @', async t => {
   for (const n of ['one', 'two', 'three']) { writeFileSync(path.join(main, n), `${n}\n`); jj(main, 'commit', '--quiet', '-m', n); }
   writeFileSync(path.join(main, 'a'), 'one\n');
   await snapshot(main, null, io);
-  const stack = await readStack(main, null, io);
-  assert.deepEqual(stack.map(c => c.description), ['', 'three', 'two', 'one']);
+  const stack = await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io);
+  assert.deepEqual(stack.slice(0, 4).map(c => c.description), ['', 'three', 'two', 'one']);
+  assert.deepEqual(stack.map(c => c.base), [false, false, false, false, true]);
   assert.deepEqual(stack[0].files, [{ path: 'a', status: 'M', added: 0, removed: 1 }]);
   assert.equal(stack.slice(1).some(c => 'files' in c), false);
-  assert.deepEqual(stack.slice(1).map(c => c.added), [1, 1, 1]);
+  assert.deepEqual(stack.slice(1, 4).map(c => c.added), [1, 1, 1]);
 });
 
 test('readStack stops at the cap', async t => {
   const { main } = fixture(t);
   for (let i = 0; i <= STACK_LIMIT; i++) jj(main, 'new', '--quiet');
-  assert.equal((await readStack(main, null, io)).length, STACK_LIMIT);
+  assert.equal((await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io)).length, STACK_LIMIT);
+});
+
+test('readBookmarks lists local bookmarks without Git’s own remote, and readStack starts after any base', async t => {
+  const { main } = fixture(t);
+  for (const n of ['one', 'two']) { writeFileSync(path.join(main, n), `${n}\n`); jj(main, 'commit', '--quiet', '-m', n); }
+  jj(main, 'bookmark', 'create', '--quiet', 'feat/x', '-r', '@--');
+  const names = await readBookmarks(main, null, io);
+  assert.ok(names.includes('feat/x') && names.includes('master'), names.join(' '));
+  assert.equal(names.some(n => n.endsWith('@git')), false, names.join(' '));
+  const stack = await readStack(main, null, 'feat/x', DEFAULT_ID_LENGTH, io);
+  assert.deepEqual(stack.map(c => [c.description, c.base, c.bookmarks]), [['', false, []], ['two', false, []], ['one', true, ['feat/x']]]);
+  // A base off the stack ends it at the change both share.
+  const at = stack[0].commit, master = jj(main, '--ignore-working-copy', 'log', '--no-graph', '-r', 'master', '-T', 'commit_id');
+  jj(main, 'new', '--quiet', '-r', 'master', '-m', 'side'); jj(main, 'bookmark', 'create', '--quiet', 'side', '-r', '@'); jj(main, 'edit', '--quiet', '-r', at);
+  const off = await readStack(main, null, 'side', DEFAULT_ID_LENGTH, io);
+  assert.deepEqual(off.map(c => [c.description, c.base]).slice(0, 3), [['', false], ['two', false], ['one', false]]);
+  assert.deepEqual([off.length, off[3].commit, off[3].base], [4, master, true]);
+  await assert.rejects(readStack(main, null, 'nope', DEFAULT_ID_LENGTH, io), /nope/);
 });
 
 test('readChange, readPair and filePattern cover added, modified and deleted files', async t => {

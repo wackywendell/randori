@@ -66,22 +66,40 @@ export function visible(root, mod) {
 const FILE_LIST = `diff.stat().files().map(|f| json({"path" => f.path(),
     "status" => f.status_char(), "added" => f.lines_added(),
     "removed" => f.lines_removed()}))`;
-const FIELDS = `"commit" => commit_id, "change" => change_id.short(),
+// A jj template string literal.
+const quote = (text) => `"${text.replace(/[\\"]/g, "\\$&")}"`;
+// `change` is at least `idLength` characters, with its shortest unique
+// prefix apart.
+const fields = (idLength) => `"commit" => commit_id, "change" => change_id.shortest(${idLength}),
     "description" => description.first_line(), "empty" => empty,
-    "conflict" => conflict, "at" => current_working_copy,
-    "added" => diff.stat().total_added(), "removed" => diff.stat().total_removed()`;
+    "conflict" => conflict, "at" => current_working_copy, "bookmarks" => bookmarks`;
+const STATS = `"added" => diff.stat().total_added(), "removed" => diff.stat().total_removed()`;
 
-// One JSON line per change, with its files.
-export const CHANGE_TEMPLATE = `json({${FIELDS}, "files" => ${FILE_LIST}}) ++ "\\n"`;
-// One JSON line per change. Only `@` computes its file list.
-export const STACK_TEMPLATE = `if(current_working_copy, json({${FIELDS}, "files" => ${FILE_LIST}}), json({${FIELDS}})) ++ "\\n"`;
-export const STACK_REVSET = "@ | (trunk().. & first_ancestors(@))";
+// One JSON line with a change's files.
+export const CHANGE_TEMPLATE = `json({"files" => ${FILE_LIST}}) ++ "\\n"`;
+// One JSON line per change. Only `@` computes its file list. `base` is true on
+// the row the stack starts from, which skips its line totals: trunk() can be a
+// commit of thousands of files.
+export function stackTemplate(base, idLength) {
+  const isBase = `self.contained_in(${quote(`::(${base})`)})`;
+  return `if(current_working_copy, json({${fields(idLength)}, "base" => ${isBase}, ${STATS}, "files" => ${FILE_LIST}}),
+    if(${isBase}, json({${fields(idLength)}, "base" => true}), json({${fields(idLength)}, "base" => false, ${STATS}}))) ++ "\\n"`;
+}
+export const DEFAULT_BASE = "trunk()";
+export const DEFAULT_ID_LENGTH = 6;
+// The changes after `base` up to `@`, then the change they start from, which
+// is `base` itself when it is an ancestor of `@`. `base` is any revset; jj
+// reports one that does not parse or resolve.
+export const stackRevset = (base) => `@ | ((${base}).. & first_ancestors(@)) | heads(::@ & ::(${base}))`;
 export const STACK_LIMIT = 100;
 
 const fail = (r, what) => new Error(r.stderr.trim() || `${what} exited ${r.code}`);
 const parse = (line) => {
   const change = JSON.parse(line);
   if (change.files) change.files = change.files.map((f) => JSON.parse(f));
+  if (change.change) { change.prefix = change.change.prefix; change.change = change.change.prefix + change.change.rest; }
+  // Git's own remote mirrors the local bookmarks.
+  if (change.bookmarks) change.bookmarks = change.bookmarks.filter((b) => b.remote !== "git").map((b) => (b.remote ? `${b.name}@${b.remote}` : b.name));
   return change;
 };
 const jj = async (root, on, args, io, timeout = 10_000) => {
@@ -96,11 +114,19 @@ export async function snapshot(root, on, io) {
   await jj(root, on, ["util", "snapshot"], io);
 }
 
-// The changes from trunk() to `@`, newest first: { commit, change,
-// description, empty, conflict, at, added, removed }, with `files` on `@`.
-export async function readStack(root, on, io) {
-  const out = await jj(root, on, ["--ignore-working-copy", "log", "--no-graph", "--limit", String(STACK_LIMIT), "-r", STACK_REVSET, "-T", STACK_TEMPLATE], io);
+// The stack from `base` to `@`, newest first: { commit, change, prefix,
+// description, empty, conflict, at, bookmarks, base, added, removed }, with
+// `files` on `@`.
+export async function readStack(root, on, base, idLength, io) {
+  const out = await jj(root, on, ["--ignore-working-copy", "log", "--no-graph", "--limit", String(STACK_LIMIT), "-r", stackRevset(base), "-T", stackTemplate(base, idLength)], io);
   return out.split("\n").filter(Boolean).map(parse);
+}
+
+// Up to 20 bookmark names, local and remote, newest commit first, such as
+// "main" and "main@origin". Git's own remote is left out.
+export async function readBookmarks(root, on, io) {
+  const out = await jj(root, on, ["--ignore-working-copy", "bookmark", "list", "--all-remotes", "--sort", "committer-date-", "-T", 'if(!remote || remote != "git", name ++ if(remote, "@" ++ remote) ++ "\n")'], io);
+  return out.split("\n").filter(Boolean).slice(0, 20);
 }
 
 // One change's files: [{ path, status, added, removed }].

@@ -1,11 +1,20 @@
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, terminals, exec, hc, readTextFile, watchFolder, theme, settings, layout, run } from "herdr";
-import { identity, visible, snapshot, readStack, readChange, readPair, filePattern, STACK_LIMIT } from "./jj.js";
+import { spaces, panes, focused, terminals, exec, hc, readTextFile, watchFolder, theme, settings, layout, run, shared, setShared } from "herdr";
+import { identity, visible, snapshot, readStack, readChange, readPair, readBookmarks, filePattern, STACK_LIMIT, DEFAULT_BASE, DEFAULT_ID_LENGTH } from "./jj.js";
 
 const IO = { exec, readTextFile };
 // What a jj run does, each step including the ones after it.
 const SNAPSHOT = 3, STACK = 2, FILES = 1;
+// Workspace root -> the revset its stack starts from, when not DEFAULT_BASE.
+const BASES = "jj-changes:bases";
+const baseOf = (root) => shared(BASES)?.[root] ?? DEFAULT_BASE;
+// The `idLength` prop of the layout's jj-changes block: the fewest characters
+// a change ID shows.
+function idLength(node = layout()) {
+  const find = (n) => (n?.content?.mod === "jj-changes" ? n : (n?.children ?? []).map(find).find(Boolean));
+  return find(node)?.content?.props?.idLength ?? DEFAULT_ID_LENGTH;
+}
 const clock = () => { const d = new Date(Date.now()); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
 
 function location() {
@@ -39,6 +48,9 @@ function diffRows(lines) {
   });
 }
 
+// A bookmark on a stack row.
+const chip = (name, t) => div().flex_none().max_w(120).truncate().px(4).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(name);
+
 export default class Changes extends View {
   init(_props, cx) {
     this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
@@ -51,6 +63,12 @@ export default class Changes extends View {
     this.input.on("submit", (_e, cx) => this.commit(cx));
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
+    this.baseInput = InputState.new({ placeholder: DEFAULT_BASE });
+    this.baseInput.on("change", (_e, cx) => {
+      this.baseText = this.baseInput.value().trim();
+      this.baseAt = this.baseText && this.baseMatches().length ? 0 : -1;
+      cx.notify();
+    });
     // A folder's identity(): jj checkouts and "no jj repo" are kept, other
     // answers only until the folder changes.
     this.ids = {}; this.last = null; this.mode = null;
@@ -147,7 +165,7 @@ export default class Changes extends View {
     const { root, on } = ck;
     if (want >= SNAPSHOT) await snapshot(root, on, IO);
     if (want >= STACK) {
-      const stack = await readStack(root, on, IO);
+      const stack = await readStack(root, on, baseOf(root), idLength(), IO);
       if (this.ck !== ck) return;
       this.useStack(stack);
     }
@@ -179,6 +197,55 @@ export default class Changes extends View {
     if (sel.length === 2) return readPair(root, on, sel[0].commit, sel[1].commit, IO);
     if (sel[0].files) return sel[0].files;
     return readChange(root, on, sel[0].commit, IO);
+  }
+
+  // An empty base returns the workspace to DEFAULT_BASE. The selection starts
+  // over at `@`, since the old one may not be in the new stack.
+  setBase(text, cx) {
+    const root = this.ck?.root, base = text.trim(), bases = { ...(shared(BASES) ?? {}) };
+    this.editingBase = false;
+    if (!root) return;
+    if (!base || base === DEFAULT_BASE) delete bases[root]; else bases[root] = base;
+    setShared(BASES, bases);
+    this.sel = []; this.files = []; this.note = null; this.gen++;
+    this.request(STACK, cx);
+    cx.notify();
+  }
+
+  // The base picker: an input over the newest bookmarks, filtered by what is
+  // typed. The chip toggles it.
+  editBase(cx) {
+    this.editingBase = !this.editingBase;
+    if (!this.editingBase) return cx.notify();
+    const { root, on } = this.ck, base = baseOf(root);
+    this.baseText = ""; this.baseAt = -1; this.baseNames = null; this.baseError = null;
+    this.baseInput.set_value(base);
+    this.baseInput.set_selected_range({ start: 0, end: base.length });
+    this.baseInput.focus();
+    cx.spawn(async (cx) => {
+      try { this.baseNames = await readBookmarks(root, on, IO); }
+      catch (e) { this.baseNames = []; this.baseError = String(e?.message ?? e); }
+      cx.notify();
+    });
+    cx.notify();
+  }
+
+  baseMatches() {
+    const text = this.baseText.toLowerCase();
+    return (this.baseNames ?? []).filter((n) => !text || n.toLowerCase().includes(text));
+  }
+
+  // Enter takes the highlighted bookmark, else the typed revset. Tab copies
+  // the highlighted bookmark into the input to edit.
+  baseKey(e, cx) {
+    const shown = this.baseMatches(), n = shown.length;
+    if (e.key === "escape") this.editingBase = false;
+    else if (e.key === "enter") return this.setBase(this.baseAt >= 0 ? shown[this.baseAt] : this.baseInput.value(), cx);
+    else if ((e.key === "down" || e.key === "up") && n) this.baseAt = e.key === "down" ? (this.baseAt + 1) % n : (this.baseAt <= 0 ? n - 1 : this.baseAt - 1);
+    else if (e.key === "tab" && this.baseAt >= 0) { this.baseInput.set_value(shown[this.baseAt]); this.baseText = shown[this.baseAt]; this.baseAt = 0; }
+    else return;
+    cx.stop_propagation();
+    cx.notify();
   }
 
   // Click selects one change, Shift-click adds a second to diff the pair.
@@ -418,14 +485,32 @@ export default class Changes extends View {
         .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy ? "Committing…" : "Commit")));
   }
 
-  // The stack, newest first. A selected pair is labelled FROM and TO.
+  basePicker(t) {
+    const shown = this.baseMatches();
+    const empty = this.baseError ?? (this.baseNames === null ? "Loading bookmarks…" : !shown.length ? (this.baseText ? "Enter uses the typed revset" : "No bookmarks") : null);
+    return v_flex().id("changes-base-picker").flex_none().p(8).gap(2).border_b(1).border_color(t.border).on_key_down((e, cx) => this.baseKey(e, cx))
+      .child(h_flex().gap(8).items_center()
+        .child(div().flex_none().text_size(11).text_color(t.dim).child("Base"))
+        .child(div().id("changes-base-input").flex_1().min_w(0).h(28).px(8).flex().items_center().rounded(6).border_1().border_color(t.accent).cursor_text().child(Input.new(this.baseInput).h_full().text_size(12).text_color(t.foreground))))
+      .children(shown.map((name, i) => div().id(`changes-base-${name}`).h(24).flex_none().px(8).flex().items_center().rounded(6).truncate().text_size(12).cursor_pointer()
+        .when(i === this.baseAt, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.setBase(name, cx)).child(name)))
+      .when(Boolean(empty), (e) => e.child(div().px(8).py(4).text_size(11).text_color(this.baseError ? t.ansi1 : t.dim).child(empty)))
+      .child(div().px(8).pt(2).text_size(10).text_color(t.dim).child("↑↓ | Tab to edit | Enter to apply | <empty> for trunk()"));
+  }
+
+  // The stack, newest first, ending with the change it starts from, marked
+  // base. A selected pair is labelled FROM and TO.
   stackRow(c, t) {
     const i = this.sel.findIndex((s) => s.commit === c.commit), pair = this.sel.length === 2;
     return h_flex().id(`stack-${c.commit}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
       .when(i >= 0, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => this.select(c, Boolean(e?.modifiers?.shift), cx))
       .when(pair && i >= 0, (e) => e.child(div().w(32).flex_none().text_size(10).text_color(t.accent).child(i === 0 ? "FROM" : "TO")))
-      .child(div().flex_none().text_size(11).text_color(c.at ? t.accent : t.dim).child(`${c.at ? "@ " : ""}${c.change.slice(0, 8)}`))
-      .child(div().flex_1().min_w(0).truncate().text_color(c.description ? t.foreground : t.dim).child(c.description || "(no description)"))
+      .child(h_flex().flex_none().text_size(11).text_color(t.dim).when(c.at, (e) => e.child(div().text_color(t.accent).child("@ ")))
+        .child(div().text_color(t.ansi5).child(c.prefix)).child(c.change.slice(c.prefix.length)))
+      .children(c.bookmarks.slice(0, 2).map((b) => chip(b, t)))
+      .when(c.bookmarks.length > 2, (e) => e.child(chip(`+${c.bookmarks.length - 2}`, t)))
+      .child(div().flex_1().min_w(0).truncate().text_color(c.description && !c.base ? t.foreground : t.dim).child(c.description || "(no description)"))
+      .when(c.base, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("base")))
       .when(c.conflict, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("conflict")))
       .when(c.empty, (e) => e.child(div().text_size(11).text_color(t.dim).child("∅")))
       .when(c.added > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${c.added}`))).when(c.removed > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${c.removed}`)));
@@ -437,10 +522,12 @@ export default class Changes extends View {
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().min_w(0).truncate().font_semibold().child(ck ? ck.root.split("/").pop() : "Changes"))
+        .when(Boolean(ck), (e) => e.child(div().id("changes-base").flex_none().max_w(160).truncate().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).tooltip("The stack starts after this revset. Click to change it").on_click((_e, cx) => this.editBase(cx)).child(baseOf(ck.root))))
         .when(Boolean(this.updated), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim).child(`updated ${this.updated}`)))
         .child(div().flex_1())
-        .when(this.sel.length > 0, (e) => e.child(div().id("changes-open").flex_none().h(24).px(8).flex().items_center().rounded(6).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.openDiff(null, cx)).child("Open diff")))
-        .when(Boolean(ck), (e) => e.child(div().id("changes-refresh").flex_none().h(24).px(8).flex().items_center().rounded(6).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.request(SNAPSHOT, cx)).child("Refresh"))))
+        .when(this.sel.length > 0, (e) => e.child(div().id("changes-open").flex_none().h(24).px(8).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.openDiff(null, cx)).child("diff")))
+        .when(Boolean(ck), (e) => e.child(div().id("changes-refresh").flex_none().h(24).px(6).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).tooltip("Refresh").on_click((_e, cx) => this.request(SNAPSHOT, cx)).child(svg("mods/jj-changes/refresh.svg").size(14).text_color(t.muted)))))
+      .when(Boolean(this.editingBase), (e) => e.child(this.basePicker(t)))
       .when(Boolean(this.error), (e) => e.child(small(this.error, t.ansi1).py(6).border_b(1).border_color(t.border)))
       .when(this.stack.length > 0, (e) => e.child(div().flex_none().h(Math.min(this.stack.length, 6) * 28 + 12).relative().border_b(1).border_color(t.border)
         .child(v_flex().id("changes-stack").absolute().inset_0().overflow_y_scroll().p(6).children(this.stack.map((c) => this.stackRow(c, t))))

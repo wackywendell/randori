@@ -11,6 +11,9 @@
 //   node scripts/app-trial.js panel       add two changes in project and show the changes panel
 //   node scripts/app-trial.js pair        select the oldest two changes as a FROM and TO pair
 //   node scripts/app-trial.js verify-panel  check what the panel read
+//   node scripts/app-trial.js base [text]  add bookmark mid at second, open the panel's base picker and type text
+//   node scripts/app-trial.js base-apply  apply the picker as Enter does
+//   node scripts/app-trial.js verify-base <base>  check the saved base and the stack after it
 //   node scripts/app-trial.js diff [file]  open the pair's diff of a file ("third (x).txt") from the panel
 //   node scripts/app-trial.js verify-diff [file]  check that the diff pane's Hunk shows the whole pair at that file, in the pane opened first
 //   node scripts/app-trial.js quit-diff   press q in Hunk and check that its pane closes
@@ -145,7 +148,7 @@ export default class TrialFinish extends Workspace {
     // changes-state.json every half second.
     'trial-changes': `import Changes from './changes.js';
 import { visible } from './jj.js';
-import { appHome, readTextFile, writeTextFile, layout } from 'herdr';
+import { appHome, readTextFile, writeTextFile, layout, shared } from 'herdr';
 export default class TrialChanges extends Changes {
   init(p, cx) {
     super.init(p, cx);
@@ -169,9 +172,21 @@ export default class TrialChanges extends Changes {
           this.select(this.stack[1], true, cx);
         }
         if (r.open && this.paired && this.opened !== r.open && this.files.length) { this.opened = r.open; this.openDiff(r.open, cx); }
+        // The base picker: open it, type r.base once bookmarks are read, then
+        // apply as Enter does.
+        if (r.base !== undefined && this.ck && !this.editingBase && this.based !== r.base) { this.based = r.base; this.editBase(cx); }
+        else if (r.base !== undefined && this.editingBase && this.baseNames && this.typed !== r.base) {
+          this.typed = r.base; this.baseInput.set_value(r.base); this.baseText = r.base; this.baseAt = r.base && this.baseMatches().length ? 0 : -1; cx.notify();
+        }
+        if (r.apply && this.applied !== r.apply && this.editingBase && this.typed === r.base) {
+          this.applied = r.apply;
+          const shown = this.baseMatches();
+          this.setBase(this.baseAt >= 0 ? shown[this.baseAt] : this.baseInput.value(), cx);
+        }
         const state = { mode: this.mode, shown: this.shown, root: this.ck?.root ?? null, updated: this.updated ?? null, error: this.error ?? null,
-          stack: this.stack.map((c) => ({ description: c.description, at: c.at, added: c.added, removed: c.removed })),
-          selected: this.sel.map((c) => c.description), files: this.files, running: Boolean(this.running) };
+          stack: this.stack.map((c) => ({ description: c.description, at: c.at, base: c.base, bookmarks: c.bookmarks, change: c.change, added: c.added, removed: c.removed })),
+          selected: this.sel.map((c) => c.description), files: this.files, running: Boolean(this.running),
+          picker: this.editingBase ? { names: this.baseNames, shown: this.baseNames && this.baseMatches(), at: this.baseAt ?? -1 } : null, bases: shared('jj-changes:bases') ?? null };
         const text = JSON.stringify(state);
         await writeTextFile(appHome() + '/changes-state.json', text, this.written ?? null);
         this.written = text;
@@ -285,12 +300,28 @@ if (command === 'run') {
   assert.equal(state.mode, 'jj');
   assert.equal(state.root, main);
   assert.equal(state.error, null);
-  assert.deepEqual(state.stack.map((c) => c.description), ['', 'third', 'second']);
-  assert.deepEqual(state.stack.map((c) => [c.added, c.removed]), [[1, 0], [3, 1], [2, 0]], 'the snapshot saw the edit in @');
+  assert.deepEqual(state.stack.map((c) => [c.description, c.base, c.bookmarks]), [['', false, []], ['third', false, []], ['second', false, []], ['first', true, ['master']]]);
+  assert.deepEqual(state.stack.slice(0, 3).map((c) => [c.added, c.removed]), [[1, 0], [3, 1], [2, 0]], 'the snapshot saw the edit in @');
+  assert.equal(state.stack[0].change.length, 6);
   assert.deepEqual(state.selected, ['second', 'third'], 'FROM second, TO third');
   assert.deepEqual(state.files.map((f) => f.path).sort(), ['second', 'third (x).txt']);
   await fs.writeFile(path.resolve('.tmp/stage2-panel-trial.json'), JSON.stringify(state, null, 2));
   console.log(JSON.stringify(state, null, 2));
+} else if (command === 'base') {
+  if (!execute('jj', ['--ignore-working-copy', 'bookmark', 'list', '-T', 'name ++ "\\n"'], main).includes('mid')) execute('jj', ['bookmark', 'create', '--quiet', 'mid', '-r', 'description(exact:"second\\n")'], main);
+  await fs.writeFile(path.join(app, 'changes-request.json'), JSON.stringify({ base: process.argv[3] ?? '' }));
+} else if (command === 'base-apply') {
+  const r = JSON.parse(await fs.readFile(path.join(app, 'changes-request.json'), 'utf8'));
+  await fs.writeFile(path.join(app, 'changes-request.json'), JSON.stringify({ ...r, apply: Date.now() }));
+} else if (command === 'verify-base') {
+  // The stack starts after the base the picker saved for this workspace.
+  const base = process.argv[3], state = JSON.parse(await fs.readFile(path.join(app, 'changes-state.json'), 'utf8'));
+  assert.equal(state.error, null);
+  assert.equal(state.picker, null, 'the picker closed');
+  assert.deepEqual(state.bases, { [main]: base });
+  assert.deepEqual(state.stack.map((c) => [c.description, c.base, c.bookmarks]), [['', false, []], ['third', false, []], ['second', true, ['mid']]]);
+  await fs.writeFile(path.resolve('.tmp/base-picker-trial.json'), JSON.stringify(state, null, 2));
+  console.log(JSON.stringify({ bases: state.bases, stack: state.stack.map((c) => c.description) }));
 } else if (command === 'diff') {
   await fs.writeFile(path.join(app, 'changes-request.json'), JSON.stringify({ pair: true, open: process.argv[3] ?? 'third (x).txt' }));
 } else if (command === 'verify-diff') {
@@ -379,5 +410,5 @@ if (command === 'run') {
   // Only this fresh HOME and session is addressed; no default-session command runs.
   console.log(execute(config.core, ['server', 'stop', '--json']));
 } else {
-  throw new Error('Use prepare, run, status, resources, new, edit, open, panel, pair, verify-panel, diff, verify-diff, finish-setup, finish, lock, unlock, again, verify-finish, shot, verify, quit or stop-core');
+  throw new Error('Use prepare, run, status, resources, new, edit, open, panel, pair, verify-panel, base, base-apply, verify-base, diff, verify-diff, finish-setup, finish, lock, unlock, again, verify-finish, shot, verify, quit or stop-core');
 }

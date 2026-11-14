@@ -172,7 +172,8 @@ Every command passes the space's machine to `exec`. `watchFolder` works only on 
    shown or Refresh               ─────────▶  jj util snapshot, then jj log
    after an operation             ─────────▶  jj log, current operation only
    selection                      ─────────▶  jj log or jj diff by commit ID
-   file or Open diff              ─────────▶  hunk --version once, then pane.split or hunk session reload
+   file or diff                   ─────────▶  hunk --version once, then pane.split or hunk session reload
+   base picker opened             ─────────▶  jj bookmark list, current operation only
  jj-workspace
    New workspace                  ─────────▶  jj workspace add, ln -s, mise trust
    Open workspace                 ─────────▶  jj workspace list
@@ -213,7 +214,7 @@ Where `watchFolder` rejects a watch, status lines fall back to a 30-second inter
 
 The panel shows the checkout of the focused pane's folder, as the shipped panel chooses its folder.
 
-The stack is the list of changes from `trunk()` to `@`, the revset `@ | (trunk().. & first_ancestors(@))`, newest first. One `jj --ignore-working-copy log` call returns each change's commit ID, change ID, description, emptiness, conflict state and line totals, and for `@` each changed file's path, status and line counts. The stack stops at 100 changes, and the panel then says how many it shows.
+The stack is the list of changes after a base revset up to `@`, the revset `@ | ((<base>).. & first_ancestors(@))`, newest first. The last row is the change the stack starts from, `heads(::@ & ::(<base>))`, which is the base when the base is an ancestor of `@`. The template marks it with `self.contained_in("::(<base>)")`, and the panel dims it and labels it base, so Shift-clicking it as FROM shows the whole stack. Each row shows the change ID as `change_id.shortest(n)`, at least `idLength` characters from the `jj-changes` block's props with a default of 6, its unique prefix in purple, and up to two bookmarks with a count of the rest. Bookmarks on Git's own remote are left out. The base is `trunk()` until the user picks another for the workspace. The panel saves bases in Herdr's persisted shared value `jj-changes:bases`, keyed by workspace root, so two workspaces of one repository can compare against different bookmarks. jj parses the base, so any revset works and a bad one shows jj's error. One `jj --ignore-working-copy log` call returns each change's commit ID, change ID, description, emptiness, conflict state and line totals, and for `@` each changed file's path, status and line counts. The stack stops at 100 changes, and the panel then says how many it shows.
 
 Clicking a change selects it alone. Shift-clicking a second change selects the pair. Selecting a change other than `@` runs one `jj --ignore-working-copy log -r <commit>` for its files and line counts. Selecting a pair runs one `jj --ignore-working-copy diff --from <older> --to <newer>` with a template listing each file's path and status. Clicking a file, or Open diff, shows the selection's diff in the active tab's diff pane. The pane runs Hunk, a terminal diff viewer with comments that reads jj repositories, when `hunk --version` succeeds on the checkout's machine. The panel asks once per machine. A single change opens as `hunk show <change>` and a pair as `hunk diff <older> <newer>`, always for the whole selection, so comments on any file stay in one review. Hunk has no option to open at a file, so a new window starts at its first file. Without Hunk the pane runs `jj --config 'ui.pager=less -R' diff` with `-r <change>` or `--from` and `--to`, so the user's diff formatter applies. jj's default pager, `less -FRX`, exits at once on a short diff, which would close the pane before it could be read. A file adds `-- 'root-file:"<path>"'` to `jj diff`, a fileset that shows that file alone. The diff names changes by change ID, so it shows the change's latest commit.
 
@@ -223,7 +224,7 @@ The diff opens in a pane because the panel is narrow and read-only. A pane keeps
 
 The panel has three regions, top to bottom.
 
-1. A header with the checkout's folder name, the time of the last refresh, as "updated 14:03", an Open diff button while a change is selected, a Refresh button, and the last error with the last good data still shown below it.
+1. A header with the checkout's folder name, the base as a chip, the time of the last refresh, as "updated 14:03", a diff button while a change is selected, a refresh icon, and the last error with the last good data still shown below it.
 2. The stack, with `@` first. A selected change shows its files. A selected pair is ordered by stack position and labelled FROM and TO with both change IDs, and the panel says the older change's own edits are excluded. A refresh that finds a selected change rewritten or gone says so and clears that selection.
 3. The files of the current selection with status, and line counts for a single change. Clicking one opens its diff.
 
@@ -626,7 +627,7 @@ if(current_working_copy,
 - Change. On init and on each folder change, run `identity()` from its own `jj.js` on the shipped `location()` folder. Until it answers, render nothing and start nothing. For `{jj: false}`, run the shipped Git code. For an error, show it in the header.
 - Change. For jj, keep one refresh loop with `{running, pending, generation}`. Becoming visible and Refresh run `jj util snapshot` with a ten-second timeout, then `readStack()`. A `watchFolder(<repo>/op_heads/heads)` batch runs `readStack()` alone while the panel is visible and nothing while it is hidden. The shipped ten-second timer and Git watch never start for jj.
 - Change. Render the header, stack and file list described in the Changes panel section with the shipped virtual list and diff rows, mapping `status` to the shipped row's `status`, `added` to `add` and `removed` to `del`. Click replaces the selection, and Shift-click adds a second commit ID. A refresh drops a selected ID that is no longer in the stack and shows "Selected change was rewritten".
-- Change. Clicking a file, or Open diff, shows the diff in the active tab's diff pane, running `hunk show` or `hunk diff` when `hunk --version` succeeds on its machine, else `jj --config 'ui.pager=less -R' diff`. It reloads a live Hunk pane showing other commits, moves it to a clicked file, and otherwise splits or replaces one, as the Changes panel section describes. The panel draws no diff.
+- Change. Clicking a file, or diff, shows the diff in the active tab's diff pane, running `hunk show` or `hunk diff` when `hunk --version` succeeds on its machine, else `jj --config 'ui.pager=less -R' diff`. It reloads a live Hunk pane showing other commits, moves it to a clicked file, and otherwise splits or replaces one, as the Changes panel section describes. The panel draws no diff.
 
 #### 21. `mods/jj-changes/jj.js` (Create)
 
@@ -644,7 +645,8 @@ json({"commit" => commit_id, "change" => change_id.short(),
 ```
 
 - Change. `STACK_TEMPLATE` is `if(current_working_copy, <CHANGE_TEMPLATE without ++ "\n">, <the same map without "files">) ++ "\n"`, so only `@` computes its file list.
-- Change. `readStack(root, on, io)` runs `jj --ignore-working-copy log --no-graph --limit 100 -r '@ | (trunk().. & first_ancestors(@))' -T STACK_TEMPLATE`.
+- Change. `readStack(root, on, base, io)` runs `jj --ignore-working-copy log --no-graph --limit 100 -r '@ | ((<base>).. & first_ancestors(@))' -T STACK_TEMPLATE`. `readBookmarks(root, on, io)` runs `jj --ignore-working-copy bookmark list --all-remotes --sort committer-date-` and keeps the first 20 names, local and remote, leaving out the `git` remote.
+- Change. Clicking the base chip opens the base picker under the header, an input over the bookmarks, filtered by substring. Its key handler sits on the picker row, so keys typed in the input reach it. ↑ and ↓ move the highlight, Tab copies the highlighted name into the input, Enter applies the highlighted name or else the typed text, and Escape closes. An empty base deletes the workspace's entry, returning it to `trunk()`. Applying a base clears the selection, which starts again at `@`.
 - Change. `readChange(root, on, commit, io)` runs `jj --ignore-working-copy log --no-graph -r <commit> -T CHANGE_TEMPLATE` and returns its files.
 - Change. `readPair(root, on, from, to, io)` runs `jj --ignore-working-copy diff --from <from> --to <to> -T 'json({"path" => path, "status" => status_char}) ++ "\n"'`.
 - Change. `snapshot(root, on, io)` runs `jj util snapshot` with a ten-second timeout.
@@ -665,13 +667,13 @@ json({"commit" => commit_id, "change" => change_id.short(),
 #### 24. `tests/mods.test.js` (Modify)
 
 - Type. Mod behavior tests.
-- Cases. The panel renders nothing while its probe is pending, runs the shipped Git code for a Git-only folder (CUJ 7), snapshots then reads on show and Refresh, reads without a snapshot on `op_heads` batches, starts nothing when hidden, replaces the selection on click and adds on Shift-click, clears a rewritten selection, opens the whole change or pair in Hunk in a split pane, reloads the tab's live Hunk pane on a later click and moves it to the file, only moves it when it shows the same commits, reloads after a rewrite, replaces a pane whose Hunk window it cannot find or that runs `jj diff`, leaves a diff pane in another tab alone, asks once whether Hunk runs, and opens `jj diff` in `less -R` without Hunk.
+- Cases. The panel renders nothing while its probe is pending, runs the shipped Git code for a Git-only folder (CUJ 7), snapshots then reads on show and Refresh, reads without a snapshot on `op_heads` batches, starts nothing when hidden, replaces the selection on click and adds on Shift-click, clears a rewritten selection, opens the whole change or pair in Hunk in a split pane, reloads the tab's live Hunk pane on a later click and moves it to the file, only moves it when it shows the same commits, reloads after a rewrite, replaces a pane whose Hunk window it cannot find or that runs `jj diff`, leaves a diff pane in another tab alone, asks once whether Hunk runs, opens `jj diff` in `less -R` without Hunk, and in the base picker lists bookmarks, filters, applies a highlighted, typed, Tab-edited or clicked base per workspace, closes on Escape, returns to `trunk()` when empty and shows jj's error for a bad base.
 - Cases. Finish checks the first terminal's workspace first, stops before ending anything when `jj status` fails, kills every terminal in a checked root including one with no pane, stops when a terminal stays listed past 10 seconds, closes the space when it has no terminals left, closes only the panes in checked roots otherwise, removes one name at a time, and on Enter after a failure retries only the names not yet removed.
 
 #### 25. `tests/jj.test.js` (Modify)
 
 - Type. Tests against real jj.
-- Cases. `readStack()` for `@` on `trunk()`, a 4-change stack and the 100-change cap. `readChange()` and `readPair()` for added, modified and deleted files, and a file whose path has spaces and parentheses, which `filePattern()` selects alone in `jj diff`. `jj workspace remove` for two workspaces in turn, the second failing on a held lock.
+- Cases. `readStack()` for `@` on `trunk()`, a 4-change stack, the 100-change cap, a bookmark base and a base jj rejects. `readBookmarks()` lists local bookmarks without the `git` remote. `readChange()` and `readPair()` for added, modified and deleted files, and a file whose path has spaces and parentheses, which `filePattern()` selects alone in `jj diff`. `jj workspace remove` for two workspaces in turn, the second failing on a held lock.
 
 #### 26. `scripts/bench.js` (Modify)
 
