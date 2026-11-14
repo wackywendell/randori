@@ -11,8 +11,9 @@
 //   node scripts/app-trial.js panel       add two changes in project and show the changes panel
 //   node scripts/app-trial.js pair        select the oldest two changes as a FROM and TO pair
 //   node scripts/app-trial.js verify-panel  check what the panel read
-//   node scripts/app-trial.js diff        open the pair's diff of "third (x).txt" from the panel
-//   node scripts/app-trial.js verify-diff  check the diff tab's command and screen
+//   node scripts/app-trial.js diff [file]  open the pair's diff of a file ("third (x).txt") from the panel
+//   node scripts/app-trial.js verify-diff [file]  check the diff pane's command and screen, and that a second file reused it
+//   node scripts/app-trial.js quit-diff   press q in Hunk and check that its pane closes
 //   node scripts/app-trial.js finish-setup  edit topic, add workspaces review, nesting and locked with their spaces
 //   node scripts/app-trial.js finish <space> [names]  Finish workspace from that space, checking only names if given
 //   node scripts/app-trial.js lock | unlock  hold or release jj's working-copy lock on locked
@@ -167,7 +168,7 @@ export default class TrialChanges extends Changes {
           this.select(this.stack[2], false, cx);
           this.select(this.stack[1], true, cx);
         }
-        if (r.open && this.paired && !this.opened && this.files.length) { this.opened = true; this.openDiff(r.open, cx); }
+        if (r.open && this.paired && this.opened !== r.open && this.files.length) { this.opened = r.open; this.openDiff(r.open, cx); }
         const state = { mode: this.mode, shown: this.shown, root: this.ck?.root ?? null, updated: this.updated ?? null, error: this.error ?? null,
           stack: this.stack.map((c) => ({ description: c.description, at: c.at, added: c.added, removed: c.removed })),
           selected: this.sel.map((c) => c.description), files: this.files, running: Boolean(this.running) };
@@ -291,18 +292,40 @@ if (command === 'run') {
   await fs.writeFile(path.resolve('.tmp/stage2-panel-trial.json'), JSON.stringify(state, null, 2));
   console.log(JSON.stringify(state, null, 2));
 } else if (command === 'diff') {
-  await fs.writeFile(path.join(app, 'changes-request.json'), JSON.stringify({ pair: true, open: 'third (x).txt' }));
+  await fs.writeFile(path.join(app, 'changes-request.json'), JSON.stringify({ pair: true, open: process.argv[3] ?? 'third (x).txt' }));
 } else if (command === 'verify-diff') {
+  // The project tab's diff pane shows the file; a second file reloads the same terminal.
+  const file = process.argv[3] ?? 'third (x).txt';
   const { space } = await resources();
-  const tab = JSON.parse(execute(config.binary, ['ls'])).spaces.find((s) => s.id === space.space).tabs.find((t) => t.name === 'diff third (x).txt');
-  assert.ok(tab, 'a diff tab in the project space');
-  const address = tab.terminals[0].terminal;
-  const info = JSON.parse(execute('hc', ['ls', '--json'])).terminals.find((t) => t.address === address);
-  const screen = execute('hc', ['read', address]);
-  assert.ok(screen.includes('third (x).txt'), screen);
-  const evidence = { tab: tab.name, terminal: info, screen: screen.split('\n').filter((l) => l.trim()).slice(0, 16) };
-  await fs.writeFile(path.resolve('.tmp/diff-tab-trial.json'), JSON.stringify(evidence, null, 2));
+  const tab = JSON.parse(execute(config.binary, ['ls'])).spaces.find((s) => s.id === space.space).tabs.find((t) => t.active);
+  // hc ls leaves out argv; hc get has it.
+  const panes = tab.terminals.map((p) => JSON.parse(execute('hc', ['get', p.terminal])));
+  const diffs = panes.filter((t) => t?.argv?.[1] === 'RANDORI_DIFF=1');
+  assert.equal(diffs.length, 1, JSON.stringify(panes));
+  // A reload can take seconds to draw. A narrow pane truncates the name.
+  let screen = '';
+  for (let i = 0; i < 20 && !screen.includes(file.slice(0, 9)); i++) {
+    if (i) await new Promise((done) => setTimeout(done, 500));
+    screen = execute('hc', ['read', diffs[0].address]);
+  }
+  assert.ok(screen.includes(file.slice(0, 9)), screen);
+  const { address, argv, pid } = diffs[0];
+  const evidence = { file, tab: tab.name, panes: tab.terminals.length, terminal: { address, argv, pid }, screen: screen.split('\n').filter((l) => l.trim()).slice(0, 12) };
+  const trail = path.resolve('.tmp/diff-pane-trial.json');
+  const earlier = file === 'third (x).txt' ? [] : JSON.parse(await fs.readFile(trail, 'utf8'));
+  if (earlier.length) assert.equal(diffs[0].address, earlier[0].terminal.address, 'the second file reloads the same pane');
+  await fs.writeFile(trail, JSON.stringify([...earlier, evidence], null, 2));
   console.log(JSON.stringify(evidence, null, 2));
+} else if (command === 'quit-diff') {
+  // q in Hunk closes its pane: no shell takes over.
+  const { space } = await resources();
+  const tabOf = () => JSON.parse(execute(config.binary, ['ls'])).spaces.find((s) => s.id === space.space).tabs.find((t) => t.active);
+  const address = JSON.parse(await fs.readFile(path.resolve('.tmp/diff-pane-trial.json'), 'utf8'))[0].terminal.address;
+  execute('hc', ['keys', address, 'q']);
+  await new Promise((done) => setTimeout(done, 2000));
+  const left = tabOf().terminals.map((p) => p.terminal);
+  assert.ok(!left.includes(address), JSON.stringify(left));
+  console.log(JSON.stringify({ closed: address, left }));
 } else if (command === 'finish-setup') {
   // CUJ 4: an edit jj tracks and an ignored file in topic, whose space gets a second terminal.
   await fs.writeFile(path.join(topic, '.gitignore'), 'build.log\n');

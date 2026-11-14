@@ -719,13 +719,14 @@ test('@ stays selected as snapshots rewrite it', async () => {
 });
 
 const hunk = (cmd) => cmd === 'hunk' ? ok('hunk 0.25.0\n') : undefined;
+const SPLIT = ['env', 'RANDORI_DIFF=1', 'sh', '-c', 'cd "$0" && exec "$@"', '/r/main'];
 
-test('clicking a file opens its diff in Hunk, in a new tab in the checkout', async () => {
+test('clicking a file opens its diff in Hunk, split right of the focused pane in the checkout', async () => {
   const h = panel('/r/main', hunk);
   await shown(h);
   click(h, 'change-src/a.js');
   await h.drain();
-  assert.deepEqual(runs(h, 'tab.new'), [{ name: 'diff a.js', space: 's1', folder: '/r/main', argv: ['hunk', 'show', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'] }]);
+  assert.deepEqual(runs(h, 'pane.split'), [{ direction: 'right', argv: [...SPLIT, 'hunk', 'show', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'] }]);
   assert.equal(h.calls.filter(c => c.cmd === 'jj').some(c => c.args.includes('--git')), false);
 });
 
@@ -740,8 +741,8 @@ test('Open diff opens a FROM and TO pair whole, asking once whether Hunk runs', 
   await h.drain();
   click(h, 'changes-open');
   await h.drain();
-  assert.deepEqual(runs(h, 'tab.new').map(a => [a.name, a.argv]), [
-    ['diff cccccccc..bbbbbbbb', ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb']], ['diff cccccccc..bbbbbbbb', ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb']]]);
+  assert.deepEqual(runs(h, 'pane.split').map(a => a.argv.slice(SPLIT.length)), [
+    ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb'], ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb']]);
   assert.equal(h.calls.filter(c => c.cmd === 'hunk').length, 1);
 });
 
@@ -756,9 +757,55 @@ test('without Hunk a diff opens in jj diff, paged by less that waits for q', asy
   await h.drain();
   click(h, 'changes-open');
   await h.drain();
-  assert.deepEqual(runs(h, 'tab.new').map(a => a.argv), [
+  assert.deepEqual(runs(h, 'pane.split').map(a => a.argv.slice(SPLIT.length)), [
     ['jj', '--config', 'ui.pager=less -R', 'diff', '-r', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'],
     ['jj', '--config', 'ui.pager=less -R', 'diff', '--from', 'cccccccccccc', '--to', 'bbbbbbbbbbbb']]);
+});
+
+// A panel in tab tb whose tab, or `diffTab`, has diff pane p2 running terminal t9 with pid 42.
+function diffPanel(answers, diffTab = 'tb') {
+  return panel('/r/main', answers, {
+    panes: [{ pane: 'p1', tab: 'tb', terminal: 't1', cwd: '/r/main' }, { pane: 'p2', tab: diffTab, terminal: 't9', cwd: '/r/main' }],
+    focused: { space: 's1', tab: 'tb', pane: 'p1' },
+    terminals: [{ address: 't1', argv: ['zsh'] }, { address: 't9', argv: [...SPLIT, 'hunk', 'show', 'x'] }],
+    hc: async (args) => args.join(' ') === 'get t9 --json' ? ok('{"address":"t9","pid":42}') : { code: 1, stdout: '', stderr: 'no' },
+  });
+}
+const sessions = (pid) => (cmd, args) => cmd !== 'hunk' ? undefined
+  : args[1] === 'list' ? ok(JSON.stringify({ sessions: [{ sessionId: 'S1', pid }] })) : ok('');
+
+test('a later click reloads the tab’s live Hunk pane and focuses it', async () => {
+  const h = diffPanel(sessions(42));
+  await shown(h);
+  click(h, 'change-src/a.js');
+  await h.drain();
+  assert.deepEqual(runs(h, 'pane.split'), []);
+  assert.deepEqual(runs(h, 'pane.focus'), [{ terminal: 't9' }]);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'hunk').at(-1).args),
+    ['session', 'reload', 'S1', '--source', '/r/main', '--', 'show', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"']);
+});
+
+test('a diff pane whose Hunk window is not found is replaced in place', async () => {
+  const h = diffPanel(sessions(7));
+  await shown(h);
+  click(h, 'change-src/a.js');
+  await h.drain();
+  assert.equal(h.calls.some(c => c.cmd === 'hunk' && c.args[1] === 'reload'), false);
+  assert.deepEqual(h.actions.filter(a => a.name !== 'pane.focus').map(a => [a.name, a.args.pane ?? a.args.terminal]), [['pane.split', 'p2'], ['terminal.kill', 't9']]);
+});
+
+test('without Hunk a later click replaces the diff pane, and a diff pane in another tab is left alone', async () => {
+  let h = diffPanel(() => undefined);
+  await shown(h);
+  click(h, 'change-src/a.js');
+  await h.drain();
+  assert.deepEqual(h.actions.map(a => [a.name, a.args.pane ?? a.args.terminal]), [['pane.split', 'p2'], ['terminal.kill', 't9']]);
+  h = diffPanel(sessions(42), 'other');
+  await shown(h);
+  click(h, 'change-src/a.js');
+  await h.drain();
+  assert.deepEqual(h.actions.map(a => [a.name, a.args.pane ?? a.args.terminal]), [['pane.split', undefined]]);
+  assert.equal(h.calls.some(c => c.cmd === 'hunk' && c.args[0] === 'session'), false);
 });
 
 test('a failed read shows its error above the last good data', async () => {

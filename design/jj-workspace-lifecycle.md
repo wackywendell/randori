@@ -28,7 +28,7 @@ This document uses these terms.
 The work covers three moments.
 
 1. Starting. You choose New workspace from a space's menu or the + menu and type a name. A space opens on a new linked workspace, nested under the main checkout's space.
-2. Returning. Each space's status line shows its checkout's state with content similar to your shell prompt, such as `master~4 ~3 +120 -8`. A changes panel, opened from the tab bar, shows the stack of changes since `trunk()`, the files each change touches and a comparison between two changes, and opens diffs in a tab.
+2. Returning. Each space's status line shows its checkout's state with content similar to your shell prompt, such as `master~4 ~3 +120 -8`. A changes panel, opened from the tab bar, shows the stack of changes since `trunk()`, the files each change touches and a comparison between two changes, and opens diffs in a pane beside your terminal.
 3. Finishing. Finish workspace, in the space's menu, ends the terminals working in the checkout and removes the workspace. Its edits stay in the repository.
 
 The design follows Herdr's own support for Git worktrees. Herdr's space menu offers New, Open and Remove worktree, its + menu offers New and Open worktree, its sidebar nests worktree spaces under their repository's space and shows each one's branch, and its Changes panel opens from the tab bar. This design offers the jj equivalents in the same places, and each mod starts as a copy of the shipped mod it follows.
@@ -49,7 +49,7 @@ The design gives each workspace its own space. A space's identity then answers "
 
 - Start from a name. Typing a name and pressing Enter creates the workspace, checkout and nested space. The dialog says where the checkout goes and what it starts from. When the name or folder is taken, jj's error appears in the dialog.
 - See each workspace's state at a glance. The status line of each jj space shows its nearest bookmark, the number of changes since it, and the files and lines changed in `@`, or `∅` when `@` has no changes. An agent's edits appear when its turn ends.
-- Inspect progress in jj terms. The changes panel shows the stack since `trunk()`, per-change line totals, the files a change touches and the files that differ between two changes, and opens any of those diffs in a tab you can comment on. In jj repositories every number comes from jj and matches `jj log`.
+- Inspect progress in jj terms. The changes panel shows the stack since `trunk()`, per-change line totals, the files a change touches and the files that differ between two changes, and opens any of those diffs in a pane you can comment on. In jj repositories every number comes from jj and matches `jj log`.
 - Stay quiet when unwatched. In jj checkouts, a hidden sidebar or panel starts no jj process, and jj refreshes follow file watches and agent turns, with no timer where file watching works.
 - Finish in one action. In the common case the Finish dialog opens with the space's own workspace checked, and Enter removes it. Before you confirm, the dialog says which folders it deletes, that edits jj tracks stay in the repository, and that files jj does not track are deleted.
 - Work in any jj repository. Nothing assumes a project's files or tools. Linked files and `mise` trust are settings.
@@ -91,7 +91,7 @@ None.
 
 - Given a workspace whose stack has four changes since `trunk()`.
 - When you open the changes panel.
-- Then the panel lists the four changes with lines added and removed, and the files changed in `@`. Selecting a file opens its diff in a new tab. Shift-clicking a second change lists the files that differ between the two, labelled with both change IDs, and their diff opens from the older to the newer. Running `jj describe` in a terminal updates the panel. Hiding the panel stops all of its work.
+- Then the panel lists the four changes with lines added and removed, and the files changed in `@`. Selecting a file opens its diff in a pane beside the terminal, and selecting another file shows that diff in the same pane. Pressing `q` in Hunk closes the pane. Shift-clicking a second change lists the files that differ between the two, labelled with both change IDs, and their diff opens from the older to the newer. Running `jj describe` in a terminal updates the panel. Hiding the panel stops all of its work.
 
 ### CUJ 4. Finish
 
@@ -172,7 +172,7 @@ Every command passes the space's machine to `exec`. `watchFolder` works only on 
    shown or Refresh               ─────────▶  jj util snapshot, then jj log
    after an operation             ─────────▶  jj log, current operation only
    selection                      ─────────▶  jj log or jj diff by commit ID
-   file or Open diff              ─────────▶  hunk --version once, then tab.new
+   file or Open diff              ─────────▶  hunk --version once, then pane.split or hunk session reload
  jj-workspace
    New workspace                  ─────────▶  jj workspace add, ln -s, mise trust
    Open workspace                 ─────────▶  jj workspace list
@@ -215,9 +215,11 @@ The panel shows the checkout of the focused pane's folder, as the shipped panel 
 
 The stack is the list of changes from `trunk()` to `@`, the revset `@ | (trunk().. & first_ancestors(@))`, newest first. One `jj --ignore-working-copy log` call returns each change's commit ID, change ID, description, emptiness, conflict state and line totals, and for `@` each changed file's path, status and line counts. The stack stops at 100 changes, and the panel then says how many it shows.
 
-Clicking a change selects it alone. Shift-clicking a second change selects the pair. Selecting a change other than `@` runs one `jj --ignore-working-copy log -r <commit>` for its files and line counts. Selecting a pair runs one `jj --ignore-working-copy diff --from <older> --to <newer>` with a template listing each file's path and status. Clicking a file, or Open diff for the whole selection, opens a terminal tab with `tab.new` in the active space and the checkout's folder. The tab runs Hunk, a terminal diff viewer with comments that reads jj repositories, when `hunk --version` succeeds on the checkout's machine. The panel asks once per machine. A single change opens as `hunk show <change>` and a pair as `hunk diff <older> <newer>`. Without Hunk the tab runs `jj --config 'ui.pager=less -R' diff` with `-r <change>` or `--from` and `--to`, so the user's diff formatter applies. jj's default pager, `less -FRX`, exits at once on a short diff, which would close the tab before it could be read. A file adds `-- 'root-file:"<path>"'`, a fileset Hunk passes on to jj. The tab names changes by change ID, so it shows the change's latest commit. Quitting the program closes the tab, and Herdr shows a toast with the exit code and last output when it exits nonzero within two seconds.
+Clicking a change selects it alone. Shift-clicking a second change selects the pair. Selecting a change other than `@` runs one `jj --ignore-working-copy log -r <commit>` for its files and line counts. Selecting a pair runs one `jj --ignore-working-copy diff --from <older> --to <newer>` with a template listing each file's path and status. Clicking a file, or Open diff for the whole selection, shows the diff in the active tab's diff pane. The pane runs Hunk, a terminal diff viewer with comments that reads jj repositories, when `hunk --version` succeeds on the checkout's machine. The panel asks once per machine. A single change opens as `hunk show <change>` and a pair as `hunk diff <older> <newer>`. Without Hunk the pane runs `jj --config 'ui.pager=less -R' diff` with `-r <change>` or `--from` and `--to`, so the user's diff formatter applies. jj's default pager, `less -FRX`, exits at once on a short diff, which would close the pane before it could be read. A file adds `-- 'root-file:"<path>"'`, a fileset Hunk passes on to jj. The diff names changes by change ID, so it shows the change's latest commit.
 
-The diff opens in a tab because the panel is narrow and read-only. A tab gets the main area and Hunk's comments for annotation, and running a program in a tab needs no new interface. Editing stays in the editors and terminals of the space.
+The first diff in a tab runs `pane.split {direction: "right", argv}` beside the focused pane. `pane.split` takes no folder, so the argv is `env RANDORI_DIFF=1 sh -c 'cd "$0" && exec "$@"' <root> <program>`. `run()` returns nothing to a mod, so the `RANDORI_DIFF=1` marker is how the panel finds the pane again in `terminals()`. A later click looks for a pane in the active tab whose terminal carries the marker. With Hunk, the panel reads that terminal's pid with `hc get`, finds the Hunk session with the same pid in `hunk session list --json`, runs `hunk session reload <id> --source <root> -- <show or diff arguments>` and focuses the pane. When no session has that pid, as when a wrapper starts Hunk as a child process, when the reload fails, and without Hunk, the panel splits the old pane and kills its terminal, so the new diff takes the old one's place. Quitting the program closes the pane, because `pane.split` starts no shell after the program.
+
+The diff opens in a pane because the panel is narrow and read-only. A pane keeps the terminal in view, gets Hunk's comments for annotation and closes when Hunk quits. One diff pane per tab keeps repeated clicks from piling up splits. Editing stays in the editors and terminals of the space.
 
 The panel has three regions, top to bottom.
 
@@ -320,9 +322,21 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
 ### A diff inside the panel
 
-- Pros. The shipped Changes and Files panels draw diffs and previews in the panel, and a click shows a diff with no new tab.
+- Pros. The shipped Changes and Files panels draw diffs and previews in the panel, and a click shows a diff with no new pane.
 - Cons. The panel is a sidebar column, so long lines and side-by-side views do not fit. Mods write files only under `~/.config/herdr-app`, so comments would need their own storage and an editor would need shell writes. Each diff needs a cap to keep the panel responsive.
-- Reason for rejection. Rejected by author after trying it. A terminal tab running Hunk gets the main area, comments and Hunk's own navigation for no new code beyond `tab.new`.
+- Reason for rejection. Rejected by author after trying it. A pane running Hunk gets room beside the terminal, comments and Hunk's own navigation, and the panel draws no diff.
+
+### A diff in a new tab
+
+- Pros. `tab.new {folder, argv}` runs a program in the checkout with one command, and the tab gets the whole main area.
+- Cons. `tab.new` and `terminal.open` run the program as `sh -lic '"$@"; exec "$0" -li'`, so quitting Hunk leaves a shell prompt in the tab. Each click adds a tab.
+- Reason for rejection. Rejected by author after trying it.
+
+### A diff in a peek overlay
+
+- Pros. `terminal.peek` shows a terminal over the tab with Herdr's keep-as-tab and close controls, and the overlay closes when the program exits.
+- Cons. Peek needs a terminal without a pane, started with `hc run --rm`. The app did not list that terminal for about a second, and `terminal.peek` failed until it did, so opening needs a retry.
+- Reason for rejection. Rejected by author in favor of a split pane.
 
 ### Pinning every read to one operation ID
 
@@ -442,7 +456,7 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
 - Performance. The Performance budget table sets the limits, and `just bench` checks them. In jj checkouts, no mod starts a jj process while its view is hidden, and no timer runs where `watchFolder` works. Git-only repositories and the shipped sidebar's machine list keep Herdr's own timers.
 - Safety. Only Finish deletes anything, and only after its check step passes. Nothing runs `jj workspace update-stale`, overwrites an existing path when linking, or runs commit, push or merge in a jj checkout. Git-only folders keep the shipped Changes panel's commit action. Ordinary Close and `space.close` from Herdr's own menus stay non-destructive.
-- Command safety. Every command runs through `exec` with an argument list, so workspace names, folders and revsets never pass through a shell. File paths reach `jj diff` and Hunk as `root-file:` patterns after `--`, and diff tabs run their program from an argument list with `tab.new`.
+- Command safety. Every command runs through `exec` with an argument list, so workspace names, folders and revsets never pass through a shell. File paths reach `jj diff` and Hunk as `root-file:` patterns after `--`, and diff panes run their program from an argument list with `pane.split`. Their only shell is `sh -c 'cd "$0" && exec "$@"'`, which takes the checkout and the program as arguments.
 - Errors. Every mod writes each failure with `console.log` and shows it where the action happened.
 - Rollout and rollback. Installing copies the mods into `~/.config/herdr-app/mods/` and the layout into `~/.config/herdr-app/layouts/`. Switching back with `herdr-app do layout.switch '{"name":"main"}'`, or to any other layout, stops every jj mod, and deleting the `jj-*` mod folders uninstalls them. Existing checkouts and workspaces stay as they are. Stage 1 retires the `herdr-jj` command, so scripts that call it stop working.
 
@@ -612,7 +626,7 @@ if(current_working_copy,
 - Change. On init and on each folder change, run `identity()` from its own `jj.js` on the shipped `location()` folder. Until it answers, render nothing and start nothing. For `{jj: false}`, run the shipped Git code. For an error, show it in the header.
 - Change. For jj, keep one refresh loop with `{running, pending, generation}`. Becoming visible and Refresh run `jj util snapshot` with a ten-second timeout, then `readStack()`. A `watchFolder(<repo>/op_heads/heads)` batch runs `readStack()` alone while the panel is visible and nothing while it is hidden. The shipped ten-second timer and Git watch never start for jj.
 - Change. Render the header, stack and file list described in the Changes panel section with the shipped virtual list and diff rows, mapping `status` to the shipped row's `status`, `added` to `add` and `removed` to `del`. Click replaces the selection, and Shift-click adds a second commit ID. A refresh drops a selected ID that is no longer in the stack and shows "Selected change was rewritten".
-- Change. Clicking a file, or Open diff, opens a `tab.new` tab in the checkout running `hunk show` or `hunk diff` when `hunk --version` succeeds on its machine, else `jj --config 'ui.pager=less -R' diff`, as the Changes panel section describes. The panel draws no diff.
+- Change. Clicking a file, or Open diff, shows the diff in the active tab's diff pane, running `hunk show` or `hunk diff` when `hunk --version` succeeds on its machine, else `jj --config 'ui.pager=less -R' diff`. It reloads a live Hunk pane and otherwise splits or replaces one, as the Changes panel section describes. The panel draws no diff.
 
 #### 21. `mods/jj-changes/jj.js` (Create)
 
@@ -651,7 +665,7 @@ json({"commit" => commit_id, "change" => change_id.short(),
 #### 24. `tests/mods.test.js` (Modify)
 
 - Type. Mod behavior tests.
-- Cases. The panel renders nothing while its probe is pending, runs the shipped Git code for a Git-only folder (CUJ 7), snapshots then reads on show and Refresh, reads without a snapshot on `op_heads` batches, starts nothing when hidden, replaces the selection on click and adds on Shift-click, clears a rewritten selection, opens a file's or a pair's diff in Hunk in a new tab, asks once whether Hunk runs, and opens `jj diff` in `less -R` without Hunk.
+- Cases. The panel renders nothing while its probe is pending, runs the shipped Git code for a Git-only folder (CUJ 7), snapshots then reads on show and Refresh, reads without a snapshot on `op_heads` batches, starts nothing when hidden, replaces the selection on click and adds on Shift-click, clears a rewritten selection, opens a file's or a pair's diff in Hunk in a split pane, reloads the tab's live Hunk pane on a later click, replaces a pane whose Hunk window it cannot find or that runs `jj diff`, leaves a diff pane in another tab alone, asks once whether Hunk runs, and opens `jj diff` in `less -R` without Hunk.
 - Cases. Finish checks the first terminal's workspace first, stops before ending anything when `jj status` fails, kills every terminal in a checked root including one with no pane, stops when a terminal stays listed past 10 seconds, closes the space when it has no terminals left, closes only the panes in checked roots otherwise, removes one name at a time, and on Enter after a failure retries only the names not yet removed.
 
 #### 25. `tests/jj.test.js` (Modify)
@@ -667,7 +681,7 @@ json({"commit" => commit_id, "change" => change_id.short(),
 #### 27. `scripts/app-trial.js` (Modify)
 
 - Type. Native trial.
-- Change. Cover CUJs 3, 4, 5 and 6. Open the panel and select a pair through a `trial-changes` subclass that the trial's layout copy mounts, and record what the panel shows after an outside `jj describe`. Open one file's diff of the pair and record the new tab's name and screen. Seed `frame.welcomed` so the first-run welcome stays closed. Finish a single-workspace space and record that it closes and `jj log` keeps the change. Finish one workspace of a two-workspace space and record which tabs remain. Hold jj's lock during Finish and record the error, the open spaces and the retry. Record that the dialog stays open after its space closes and whether a pane closes when its terminal is killed.
+- Change. Cover CUJs 3, 4, 5 and 6. Open the panel and select a pair through a `trial-changes` subclass that the trial's layout copy mounts, and record what the panel shows after an outside `jj describe`. Open one file's diff of the pair, then a second file, and record that one pane shows each in turn and that `q` closes it. Seed `frame.welcomed` so the first-run welcome stays closed. Finish a single-workspace space and record that it closes and `jj log` keeps the change. Finish one workspace of a two-workspace space and record which tabs remain. Hold jj's lock during Finish and record the error, the open spaces and the retry. Record that the dialog stays open after its space closes and whether a pane closes when its terminal is killed.
 
 #### 28. `README.md` (Modify)
 
