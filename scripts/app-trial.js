@@ -12,7 +12,7 @@
 //   node scripts/app-trial.js pair        select the oldest two changes as a FROM and TO pair
 //   node scripts/app-trial.js verify-panel  check what the panel read
 //   node scripts/app-trial.js diff [file]  open the pair's diff of a file ("third (x).txt") from the panel
-//   node scripts/app-trial.js verify-diff [file]  check the diff pane's command and screen, and that a second file reused it
+//   node scripts/app-trial.js verify-diff [file]  check that the diff pane's Hunk shows the whole pair at that file, in the pane opened first
 //   node scripts/app-trial.js quit-diff   press q in Hunk and check that its pane closes
 //   node scripts/app-trial.js finish-setup  edit topic, add workspaces review, nesting and locked with their spaces
 //   node scripts/app-trial.js finish <space> [names]  Finish workspace from that space, checking only names if given
@@ -302,17 +302,22 @@ if (command === 'run') {
   const panes = tab.terminals.map((p) => JSON.parse(execute('hc', ['get', p.terminal])));
   const diffs = panes.filter((t) => t?.argv?.[1] === 'RANDORI_DIFF=1');
   assert.equal(diffs.length, 1, JSON.stringify(panes));
-  // A reload can take seconds to draw. A narrow pane truncates the name.
-  let screen = '';
-  for (let i = 0; i < 20 && !screen.includes(file.slice(0, 9)); i++) {
+  // Hunk's session for that pane shows the whole pair with the file selected.
+  // A reload or a move can take seconds.
+  let context;
+  for (let i = 0; i < 20; i++) {
     if (i) await new Promise((done) => setTimeout(done, 500));
-    screen = execute('hc', ['read', diffs[0].address]);
+    const session = JSON.parse(execute('hunk', ['session', 'list', '--json'])).sessions.find((s) => s.pid === diffs[0].pid);
+    context = session && { ...JSON.parse(execute('hunk', ['session', 'context', session.sessionId, '--json'])).context, fileCount: session.fileCount };
+    if (context?.selectedFile?.path === file) break;
   }
-  assert.ok(screen.includes(file.slice(0, 9)), screen);
+  assert.equal(context?.selectedFile?.path, file, JSON.stringify(context));
+  assert.equal(context.fileCount, 2, 'the whole pair');
   const { address, argv, pid } = diffs[0];
-  const evidence = { file, tab: tab.name, panes: tab.terminals.length, terminal: { address, argv, pid }, screen: screen.split('\n').filter((l) => l.trim()).slice(0, 12) };
+  const evidence = { file, tab: tab.name, panes: tab.terminals.length, terminal: { address, argv, pid },
+    session: { id: context.sessionId, title: context.title, fileCount: context.fileCount, selected: context.selectedFile.path } };
   const trail = path.resolve('.tmp/diff-pane-trial.json');
-  const earlier = file === 'third (x).txt' ? [] : JSON.parse(await fs.readFile(trail, 'utf8'));
+  const earlier = existsSync(trail) ? JSON.parse(await fs.readFile(trail, 'utf8')) : [];
   if (earlier.length) assert.equal(diffs[0].address, earlier[0].terminal.address, 'the second file reloads the same pane');
   await fs.writeFile(trail, JSON.stringify([...earlier, evidence], null, 2));
   console.log(JSON.stringify(evidence, null, 2));

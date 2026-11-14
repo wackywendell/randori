@@ -721,12 +721,12 @@ test('@ stays selected as snapshots rewrite it', async () => {
 const hunk = (cmd) => cmd === 'hunk' ? ok('hunk 0.25.0\n') : undefined;
 const SPLIT = ['env', 'RANDORI_DIFF=1', 'sh', '-c', 'cd "$0" && exec "$@"', '/r/main'];
 
-test('clicking a file opens its diff in Hunk, split right of the focused pane in the checkout', async () => {
+test('clicking a file opens the whole change in Hunk, split right of the focused pane in the checkout', async () => {
   const h = panel('/r/main', hunk);
   await shown(h);
   click(h, 'change-src/a.js');
   await h.drain();
-  assert.deepEqual(runs(h, 'pane.split'), [{ direction: 'right', argv: [...SPLIT, 'hunk', 'show', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'] }]);
+  assert.deepEqual(runs(h, 'pane.split'), [{ direction: 'right', argv: [...SPLIT, 'hunk', 'show', 'aaaaaaaaaaaa'] }]);
   assert.equal(h.calls.filter(c => c.cmd === 'jj').some(c => c.args.includes('--git')), false);
 });
 
@@ -774,15 +774,36 @@ function diffPanel(answers, diffTab = 'tb') {
 const sessions = (pid) => (cmd, args) => cmd !== 'hunk' ? undefined
   : args[1] === 'list' ? ok(JSON.stringify({ sessions: [{ sessionId: 'S1', pid }] })) : ok('');
 
-test('a later click reloads the tab’s live Hunk pane and focuses it', async () => {
+const hunkSessionCalls = h => plain(h.calls.filter(c => c.cmd === 'hunk' && c.args[0] === 'session').map(c => c.args.slice(1).join(' ')));
+
+test('a later click reloads the tab’s live Hunk pane with the selection, moves to the file and focuses it', async () => {
   const h = diffPanel(sessions(42));
   await shown(h);
   click(h, 'change-src/a.js');
   await h.drain();
   assert.deepEqual(runs(h, 'pane.split'), []);
   assert.deepEqual(runs(h, 'pane.focus'), [{ terminal: 't9' }]);
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'hunk').at(-1).args),
-    ['session', 'reload', 'S1', '--source', '/r/main', '--', 'show', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"']);
+  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'reload S1 --source /r/main -- show aaaaaaaaaaaa', 'navigate S1 --file src/a.js --hunk 1']);
+});
+
+test('a click in the commits the pane shows only moves to the file, and a rewritten change reloads', async () => {
+  const h = diffPanel(sessions(42));
+  await shown(h);
+  click(h, 'change-src/a.js');
+  await h.drain();
+  h.calls.length = 0;
+  click(h, 'change-src/a.js');
+  await h.drain();
+  click(h, 'changes-open');
+  await h.drain();
+  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'navigate S1 --file src/a.js --hunk 1', 'list --json']);
+  h.setStack([{ ...PANEL_STACK[0], commit: 'c1b' }, ...PANEL_STACK.slice(1)]);
+  click(h, 'changes-refresh');
+  await h.drain();
+  h.calls.length = 0;
+  click(h, 'changes-open');
+  await h.drain();
+  assert.deepEqual(hunkSessionCalls(h), ['list --json', 'reload S1 --source /r/main -- show aaaaaaaaaaaa']);
 });
 
 test('a diff pane whose Hunk window is not found is replaced in place', async () => {

@@ -56,6 +56,7 @@ export default class Changes extends View {
     this.ids = {}; this.last = null; this.mode = null;
     this.stack = []; this.sel = []; this.want = 0; this.gen = 0; this.watching = new Set();
     this.hunk = {}; // machine -> Hunk runs there
+    this.diffShows = {}; // tab -> commit IDs its Hunk diff pane shows
     // Only reads the layout: being shown again snapshots and reads once.
     cx.timer.every(1000, (cx) => this.checkShown(cx));
   }
@@ -190,40 +191,50 @@ export default class Changes extends View {
     cx.notify();
   }
 
-  // The selection's diff, or one file's, in the active tab's diff pane:
-  // Hunk where it runs, for its comments, else jj diff in less. A live Hunk
-  // pane reloads; any other first splits right of the focused pane, or
-  // replaces the old pane. pane.split runs the argv with no shell after it,
-  // so q closes the pane. Change IDs follow rewrites.
+  // The selection's diff in the active tab's diff pane. Hunk, where it runs,
+  // shows the whole selection for its comments and moves to a clicked file;
+  // jj diff in less shows only that file. A live Hunk pane reloads when it
+  // shows other commits and otherwise only moves. Any other first splits
+  // right of the focused pane, or replaces the old pane. pane.split runs the
+  // argv with no shell after it, so q closes the pane.
   openDiff(path, cx) {
     const { root, on } = this.ck ?? {}, sel = this.sel;
     if (!root || !sel.length) return;
-    const ids = sel.map((c) => c.change), files = path ? ["--", filePattern(path)] : [];
+    const ids = sel.map((c) => c.change), commits = sel.map((c) => c.commit).join(" ");
     const tab = focused()?.tab;
     cx.spawn(async () => {
       this.hunk[on] ??= await exec("hunk", ["--version"], { on }).then((r) => r.code === 0, () => false);
-      const args = [...(ids.length === 2 ? ["diff", ...ids] : ["show", ids[0]]), ...files];
       const old = panes().find((p) => p.tab === tab && p.terminal && terminals().some((t) => t.address === p.terminal && t.argv?.[1] === DIFF_MARK));
-      if (old && this.hunk[on] && await this.reloadHunk(old.terminal, root, on, args)) return run("pane.focus", { terminal: old.terminal });
-      const argv = this.hunk[on] ? ["hunk", ...args]
+      let argv;
+      if (this.hunk[on]) {
+        const args = ids.length === 2 ? ["diff", ...ids] : ["show", ids[0]];
+        const session = old && await this.hunkSession(old.terminal, on);
+        const shown = session && (this.diffShows[tab] === commits
+          || (await exec("hunk", ["session", "reload", session, "--source", root, "--", ...args], { on })).code === 0);
+        this.diffShows[tab] = commits;
+        if (shown) {
+          if (path) await exec("hunk", ["session", "navigate", session, "--file", path, "--hunk", "1"], { on });
+          return run("pane.focus", { terminal: old.terminal });
+        }
+        argv = ["hunk", ...args];
+      } else {
         // less without -F, so a short diff stays until q.
-        : ["jj", "--config", "ui.pager=less -R", "diff", ...(ids.length === 2 ? ["--from", ids[0], "--to", ids[1]] : ["-r", ids[0]]), ...files];
+        argv = ["jj", "--config", "ui.pager=less -R", "diff", ...(ids.length === 2 ? ["--from", ids[0], "--to", ids[1]] : ["-r", ids[0]]), ...(path ? ["--", filePattern(path)] : [])];
+      }
       // pane.split takes no folder: sh changes to the checkout and becomes the program.
       run("pane.split", { direction: "right", ...(old && { pane: old.pane }), argv: ["env", DIFF_MARK, "sh", "-c", 'cd "$0" && exec "$@"', root, ...argv] });
       if (old) run("terminal.kill", { terminal: old.terminal });
     });
   }
 
-  // Shows `args` in the Hunk window of terminal `address`, found by its pid.
-  // False when no window has that pid, as when a wrapper started Hunk as a
-  // child, or when the reload fails.
-  async reloadHunk(address, root, on, args) {
+  // The ID of the Hunk session in terminal `address`, found by its pid. Null
+  // when no window has that pid, as when a wrapper started Hunk as a child.
+  async hunkSession(address, on) {
     const got = await hc(["get", address, "--json"]);
     const list = got.code === 0 ? await exec("hunk", ["session", "list", "--json"], { on }) : null;
-    if (list?.code !== 0) return false;
+    if (list?.code !== 0) return null;
     const pid = JSON.parse(got.stdout).pid;
-    const session = JSON.parse(list.stdout).sessions.find((s) => s.pid === pid);
-    return Boolean(session) && (await exec("hunk", ["session", "reload", session.sessionId, "--source", root, "--", ...args], { on })).code === 0;
+    return JSON.parse(list.stdout).sessions.find((s) => s.pid === pid)?.sessionId ?? null;
   }
 
   watch(root, cx) {
