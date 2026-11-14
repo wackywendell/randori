@@ -1,11 +1,11 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, layout } from "herdr";
-import { identity, visible, snapshot, readStack, readChange, readPair, readDiff, STACK_LIMIT } from "./jj.js";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, layout, run } from "herdr";
+import { identity, visible, snapshot, readStack, readChange, readPair, filePattern, STACK_LIMIT } from "./jj.js";
 
 const IO = { exec, readTextFile };
 // What a jj run does, each step including the ones after it.
-const SNAPSHOT = 4, STACK = 3, FILES = 2, DIFF = 1;
+const SNAPSHOT = 3, STACK = 2, FILES = 1;
 const clock = () => { const d = new Date(Date.now()); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
 
 function location() {
@@ -53,6 +53,7 @@ export default class Changes extends View {
     // answers only until the folder changes.
     this.ids = {}; this.last = null; this.mode = null;
     this.stack = []; this.sel = []; this.want = 0; this.gen = 0; this.watching = new Set();
+    this.hunk = {}; // machine -> Hunk runs there
     // Only reads the layout: being shown again snapshots and reads once.
     cx.timer.every(1000, (cx) => this.checkShown(cx));
   }
@@ -90,8 +91,8 @@ export default class Changes extends View {
   checkout(id, on, fresh, cx) {
     if (!fresh && this.ck?.root === id.root && this.ck.on === on) return;
     this.ck = { root: id.root, repo: id.repo, on };
-    this.stack = []; this.sel = []; this.files = []; this.open = null; this.closed = false; this.setLines([]);
-    this.error = null; this.note = null; this.cut = false; this.updated = null; this.gen++;
+    this.stack = []; this.sel = []; this.files = [];
+    this.error = null; this.note = null; this.updated = null; this.gen++;
     if (on === null) this.watchOps(id.repo, cx);
     this.request(SNAPSHOT, cx);
   }
@@ -152,18 +153,6 @@ export default class Changes extends View {
       const files = await this.readFiles(ck, sel);
       if (this.gen !== gen) return;
       this.files = files.map((f) => ({ path: f.path, status: f.status, add: f.added ?? 0, del: f.removed ?? 0 }));
-      if (this.open && !this.files.some((f) => f.path === this.open)) this.open = null;
-      // The first file's diff shows until you pick another.
-      if (!this.open && !this.closed && this.files.length) this.open = this.files[0].path;
-      if (!this.open) this.setLines([]);
-    }
-    const open = this.open;
-    if (open) {
-      const range = sel.length === 2 ? ["--from", sel[0].commit, "--to", sel[1].commit] : ["-r", sel[0].commit];
-      const { lines, cut } = await readDiff(root, on, range, open, IO);
-      if (this.gen !== gen || this.open !== open) return;
-      this.cut = cut;
-      this.setLines(lines.length ? lines.map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line) : ["No text diff available"]);
     }
     this.error = null;
   }
@@ -175,7 +164,7 @@ export default class Changes extends View {
     const at = stack.find((c) => c.at);
     const sel = this.sel.map((s) => s.at ? at : stack.find((c) => c.commit === s.commit));
     if (sel.some((c) => !c) || !sel.length) {
-      if (this.sel.length) { this.note = "Selected change was rewritten"; this.open = null; this.closed = false; }
+      if (this.sel.length) this.note = "Selected change was rewritten";
       this.sel = at ? [at] : [];
     } else this.sel = sel;
     // A pair runs older to newer: stack order is newest first.
@@ -194,16 +183,28 @@ export default class Changes extends View {
     const pair = shift && this.sel.length && this.sel[0].commit !== change.commit;
     this.sel = pair ? [this.sel[0], change] : [change];
     if (pair && this.stack.indexOf(this.sel[0]) < this.stack.indexOf(this.sel[1])) this.sel.reverse();
-    this.gen++; this.files = []; this.open = null; this.closed = false; this.cut = false; this.note = null; this.setLines([]);
+    this.gen++; this.files = []; this.note = null;
     this.request(FILES, cx);
     cx.notify();
   }
 
-  pickJj(path, cx) {
-    this.open = this.open === path ? null : path; this.closed = !this.open;
-    this.cut = false; this.setLines([]);
-    if (this.open) this.request(DIFF, cx);
-    cx.notify();
+  // The selection's diff, or one file's, in a new terminal tab in the checkout:
+  // Hunk where it runs, for its comments, else jj diff in less. Change IDs
+  // follow rewrites. Herdr toasts a command that fails at once.
+  openDiff(path, cx) {
+    const { root, on } = this.ck ?? {}, sel = this.sel;
+    if (!root || !sel.length) return;
+    const ids = sel.map((c) => c.change), files = path ? ["--", filePattern(path)] : [];
+    const name = `diff ${path ? path.split("/").pop() : ids.map((id) => id.slice(0, 8)).join("..")}`;
+    const space = spaces().find((s) => s.active)?.id;
+    cx.spawn(async () => {
+      this.hunk[on] ??= await exec("hunk", ["--version"], { on }).then((r) => r.code === 0, () => false);
+      const argv = this.hunk[on]
+        ? ["hunk", ...(ids.length === 2 ? ["diff", ...ids] : ["show", ids[0]]), ...files]
+        // less without -F, so a short diff stays until q.
+        : ["jj", "--config", "ui.pager=less -R", "diff", ...(ids.length === 2 ? ["--from", ids[0], "--to", ids[1]] : ["-r", ids[0]]), ...files];
+      run("tab.new", { name, space, folder: root, argv });
+    });
   }
 
   watch(root, cx) {
@@ -408,6 +409,7 @@ export default class Changes extends View {
         .child(div().min_w(0).truncate().font_semibold().child(ck ? ck.root.split("/").pop() : "Changes"))
         .when(Boolean(this.updated), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim).child(`updated ${this.updated}`)))
         .child(div().flex_1())
+        .when(this.sel.length > 0, (e) => e.child(div().id("changes-open").flex_none().h(24).px(8).flex().items_center().rounded(6).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.openDiff(null, cx)).child("Open diff")))
         .when(Boolean(ck), (e) => e.child(div().id("changes-refresh").flex_none().h(24).px(8).flex().items_center().rounded(6).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.request(SNAPSHOT, cx)).child("Refresh"))))
       .when(Boolean(this.error), (e) => e.child(small(this.error, t.ansi1).py(6).border_b(1).border_color(t.border)))
       .when(this.stack.length > 0, (e) => e.child(div().flex_none().h(Math.min(this.stack.length, 6) * 28 + 12).relative().border_b(1).border_color(t.border)
@@ -416,8 +418,6 @@ export default class Changes extends View {
       .when(this.stack.length >= STACK_LIMIT, (e) => e.child(small(`Showing the newest ${STACK_LIMIT} changes`, t.dim)))
       .when(pair, (e) => e.child(small("Edits made after FROM, up to TO. FROM's own edits are excluded.", t.dim)))
       .when(Boolean(this.note), (e) => e.child(small(this.note, t.blocked)))
-      .when(Boolean(ck), (e) => e.child(this.fileList(t, empty, (path, cx) => this.pickJj(path, cx))))
-      .when(this.cut, (e) => e.child(small("Diff cut short at 5,000 lines or 1 MiB", t.blocked)))
-      .when(Boolean(ck), (e) => e.child(this.diffPane(t)));
+      .when(Boolean(ck), (e) => e.child(this.fileList(t, empty, (path, cx) => this.openDiff(path, cx))));
   }
 }

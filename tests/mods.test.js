@@ -596,7 +596,6 @@ const PANEL_STACK = [
 ];
 const isSnap = c => c.cmd === 'jj' && c.args.join(' ') === 'util snapshot';
 const isStack = c => isLog(c) && c.args.includes('@ | (trunk().. & first_ancestors(@))');
-const isDiff = c => c.cmd === 'jj' && c.args.includes('--git');
 
 // A panel focused on `cwd`. `answers(cmd, args)` answers first.
 function panel(cwd = '/r/main', answers = () => undefined, data = {}) {
@@ -608,7 +607,6 @@ function panel(cwd = '/r/main', answers = () => undefined, data = {}) {
     if (args.join(' ') === 'util snapshot') return ok('');
     if (args.includes('@ | (trunk().. & first_ancestors(@))')) return ok(stack.map(c => JSON.stringify({ ...c, files: c.files?.map(f => JSON.stringify(f)) })).join('\n') + '\n');
     if (args.includes('log')) return ok(JSON.stringify({ ...PANEL_STACK[1], files: [JSON.stringify({ path: 'b.txt', status: 'A', added: 1, removed: 0 })] }) + '\n');
-    if (args.includes('--git')) return ok('diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n');
     if (args.includes('diff')) return ok('{"path":"p.txt","status":"M"}\n');
     return undefined;
   });
@@ -637,16 +635,15 @@ test('the panel runs the shipped Git code in a Git-only folder', async () => {
   assert.ok(h.timers.some(t => t.every === 10000));
 });
 
-test('showing the panel snapshots, reads the stack and opens the first file of @', async () => {
+test('showing the panel snapshots and reads the stack, with the files of @', async () => {
   const h = panel();
   await shown(h);
   const jjCalls = h.calls.filter(c => c.cmd === 'jj').map(c => c.args.slice(0, 2).join(' '));
-  assert.deepEqual(plain(jjCalls), ['--ignore-working-copy workspace', 'util snapshot', '--ignore-working-copy log', '--ignore-working-copy diff']);
-  assert.deepEqual(plain(h.calls.find(isDiff).args), ['--ignore-working-copy', 'diff', '--git', '-r', 'c1', '--', 'root-file:"src/a.js"']);
+  assert.deepEqual(plain(jjCalls), ['--ignore-working-copy workspace', 'util snapshot', '--ignore-working-copy log']);
   assert.equal(h.calls.some(c => c.cmd === 'git'), false);
   assert.equal(h.timers.some(t => t.every === 10000), false);
   const text = words(h.render());
-  for (const w of ['main', '@ aaaaaaaa', 'two', 'conflict', 'a.js', 'new', 'Refresh']) assert.ok(text.includes(w), `${w} in ${text}`);
+  for (const w of ['main', '@ aaaaaaaa', 'two', 'conflict', 'a.js', 'Open diff', 'Refresh']) assert.ok(text.includes(w), `${w} in ${text}`);
   assert.ok(text.some(w => w.startsWith('updated ')));
 });
 
@@ -656,7 +653,7 @@ test('Refresh snapshots and an operation rereads the stack without one', async (
   h.calls.length = 0;
   click(h, 'changes-refresh');
   await h.drain();
-  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'jj').map(c => c.args[0] === 'util' ? 'snapshot' : c.args[1])), ['snapshot', 'log', 'diff']);
+  assert.deepEqual(plain(h.calls.filter(c => c.cmd === 'jj').map(c => c.args[0] === 'util' ? 'snapshot' : c.args[1])), ['snapshot', 'log']);
   h.calls.length = 0;
   await h.fire('/r/main/.jj/repo/op_heads/heads');
   assert.equal(h.calls.some(isSnap), false);
@@ -689,9 +686,8 @@ test('click selects one change and Shift-click adds a second for a FROM and TO p
   assert.ok(words(h.render()).includes('b.txt'));
   click(h, 'stack-c3', true);
   await h.drain();
-  const pair = h.calls.filter(c => c.cmd === 'jj' && c.args.includes('diff') && !c.args.includes('--git')).at(-1);
+  const pair = h.calls.filter(c => c.cmd === 'jj' && c.args.includes('diff')).at(-1);
   assert.deepEqual(plain(pair.args.slice(0, 6)), ['--ignore-working-copy', 'diff', '--from', 'c3', '--to', 'c2']);
-  assert.deepEqual(plain(h.calls.filter(isDiff).at(-1).args.slice(3, 7)), ['--from', 'c3', '--to', 'c2']);
   assert.deepEqual(words(byId(h.render(), 'stack-c3')).slice(0, 1), ['FROM']);
   assert.deepEqual(words(byId(h.render(), 'stack-c2')).slice(0, 1), ['TO']);
   click(h, 'stack-c1');
@@ -709,7 +705,7 @@ test('a refresh that finds a selected change rewritten says so and selects @', a
   const text = words(h.render());
   assert.ok(text.includes('Selected change was rewritten'));
   assert.ok(text.includes('a.js'));
-  assert.equal(h.calls.filter(isDiff).at(-1).args[4], 'c1');
+  assert.equal(h.view.sel[0].commit, 'c1');
 });
 
 test('@ stays selected as snapshots rewrite it', async () => {
@@ -719,15 +715,50 @@ test('@ stays selected as snapshots rewrite it', async () => {
   click(h, 'changes-refresh');
   await h.drain();
   assert.equal(words(h.render()).includes('Selected change was rewritten'), false);
-  assert.equal(h.calls.filter(isDiff).at(-1).args[4], 'c1b');
+  assert.equal(h.view.sel[0].commit, 'c1b');
 });
 
-test('a long diff is cut short at 5,000 lines', async () => {
-  const long = '@@ -0,0 +1,6000 @@\n' + Array.from({ length: 6000 }, (_, i) => `+${i}`).join('\n') + '\n';
-  const h = panel('/r/main', (cmd, args) => args.includes('--git') ? ok(long) : undefined);
+const hunk = (cmd) => cmd === 'hunk' ? ok('hunk 0.25.0\n') : undefined;
+
+test('clicking a file opens its diff in Hunk, in a new tab in the checkout', async () => {
+  const h = panel('/r/main', hunk);
   await shown(h);
-  assert.equal(h.view.rows.length, 5000);
-  assert.ok(words(h.render()).includes('Diff cut short at 5,000 lines or 1 MiB'));
+  click(h, 'change-src/a.js');
+  await h.drain();
+  assert.deepEqual(runs(h, 'tab.new'), [{ name: 'diff a.js', space: 's1', folder: '/r/main', argv: ['hunk', 'show', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'] }]);
+  assert.equal(h.calls.filter(c => c.cmd === 'jj').some(c => c.args.includes('--git')), false);
+});
+
+test('Open diff opens a FROM and TO pair whole, asking once whether Hunk runs', async () => {
+  const h = panel('/r/main', hunk);
+  await shown(h);
+  click(h, 'stack-c2');
+  await h.drain();
+  click(h, 'stack-c3', true);
+  await h.drain();
+  click(h, 'changes-open');
+  await h.drain();
+  click(h, 'changes-open');
+  await h.drain();
+  assert.deepEqual(runs(h, 'tab.new').map(a => [a.name, a.argv]), [
+    ['diff cccccccc..bbbbbbbb', ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb']], ['diff cccccccc..bbbbbbbb', ['hunk', 'diff', 'cccccccccccc', 'bbbbbbbbbbbb']]]);
+  assert.equal(h.calls.filter(c => c.cmd === 'hunk').length, 1);
+});
+
+test('without Hunk a diff opens in jj diff, paged by less that waits for q', async () => {
+  const h = panel();
+  await shown(h);
+  click(h, 'change-src/a.js');
+  await h.drain();
+  click(h, 'stack-c2');
+  await h.drain();
+  click(h, 'stack-c3', true);
+  await h.drain();
+  click(h, 'changes-open');
+  await h.drain();
+  assert.deepEqual(runs(h, 'tab.new').map(a => a.argv), [
+    ['jj', '--config', 'ui.pager=less -R', 'diff', '-r', 'aaaaaaaaaaaa', '--', 'root-file:"src/a.js"'],
+    ['jj', '--config', 'ui.pager=less -R', 'diff', '--from', 'cccccccccccc', '--to', 'bbbbbbbbbbbb']]);
 });
 
 test('a failed read shows its error above the last good data', async () => {

@@ -11,6 +11,8 @@
 //   node scripts/app-trial.js panel       add two changes in project and show the changes panel
 //   node scripts/app-trial.js pair        select the oldest two changes as a FROM and TO pair
 //   node scripts/app-trial.js verify-panel  check what the panel read
+//   node scripts/app-trial.js diff        open the pair's diff of "third (x).txt" from the panel
+//   node scripts/app-trial.js verify-diff  check the diff tab's command and screen
 //   node scripts/app-trial.js finish-setup  edit topic, add workspaces review, nesting and locked with their spaces
 //   node scripts/app-trial.js finish <space> [names]  Finish workspace from that space, checking only names if given
 //   node scripts/app-trial.js lock | unlock  hold or release jj's working-copy lock on locked
@@ -137,8 +139,9 @@ export default class TrialFinish extends Workspace {
     this.save('closed').finally(() => super.close());
   }
 }`,
-    // jj-changes that selects a pair when changes-request.json asks and
-    // writes what it shows to changes-state.json every half second.
+    // jj-changes that selects a pair, then opens one file's diff, when
+    // changes-request.json asks, and writes what it shows to
+    // changes-state.json every half second.
     'trial-changes': `import Changes from './changes.js';
 import { visible } from './jj.js';
 import { appHome, readTextFile, writeTextFile, layout } from 'herdr';
@@ -150,7 +153,7 @@ export default class TrialChanges extends Changes {
   // jj-changes looks for its own name in the layout.
   checkShown(cx) {
     const shown = visible(layout(), 'trial-changes');
-    if (shown && !this.shown && this.mode === 'jj') { this.shown = true; this.request(4, cx); }
+    if (shown && !this.shown && this.mode === 'jj') { this.shown = true; this.request(3, cx); } // 3 is SNAPSHOT
     this.shown = shown;
   }
   trial(cx) {
@@ -164,9 +167,10 @@ export default class TrialChanges extends Changes {
           this.select(this.stack[2], false, cx);
           this.select(this.stack[1], true, cx);
         }
+        if (r.open && this.paired && !this.opened && this.files.length) { this.opened = true; this.openDiff(r.open, cx); }
         const state = { mode: this.mode, shown: this.shown, root: this.ck?.root ?? null, updated: this.updated ?? null, error: this.error ?? null,
           stack: this.stack.map((c) => ({ description: c.description, at: c.at, added: c.added, removed: c.removed })),
-          selected: this.sel.map((c) => c.description), files: this.files, open: this.open, rows: this.rows.slice(0, 6).map((r) => r.text), running: Boolean(this.running) };
+          selected: this.sel.map((c) => c.description), files: this.files, running: Boolean(this.running) };
         const text = JSON.stringify(state);
         await writeTextFile(appHome() + '/changes-state.json', text, this.written ?? null);
         this.written = text;
@@ -284,9 +288,21 @@ if (command === 'run') {
   assert.deepEqual(state.stack.map((c) => [c.added, c.removed]), [[1, 0], [3, 1], [2, 0]], 'the snapshot saw the edit in @');
   assert.deepEqual(state.selected, ['second', 'third'], 'FROM second, TO third');
   assert.deepEqual(state.files.map((f) => f.path).sort(), ['second', 'third (x).txt']);
-  assert.ok(state.rows.some((r) => r.startsWith('@@')));
   await fs.writeFile(path.resolve('.tmp/stage2-panel-trial.json'), JSON.stringify(state, null, 2));
   console.log(JSON.stringify(state, null, 2));
+} else if (command === 'diff') {
+  await fs.writeFile(path.join(app, 'changes-request.json'), JSON.stringify({ pair: true, open: 'third (x).txt' }));
+} else if (command === 'verify-diff') {
+  const { space } = await resources();
+  const tab = JSON.parse(execute(config.binary, ['ls'])).spaces.find((s) => s.id === space.space).tabs.find((t) => t.name === 'diff third (x).txt');
+  assert.ok(tab, 'a diff tab in the project space');
+  const address = tab.terminals[0].terminal;
+  const info = JSON.parse(execute('hc', ['ls', '--json'])).terminals.find((t) => t.address === address);
+  const screen = execute('hc', ['read', address]);
+  assert.ok(screen.includes('third (x).txt'), screen);
+  const evidence = { tab: tab.name, terminal: info, screen: screen.split('\n').filter((l) => l.trim()).slice(0, 16) };
+  await fs.writeFile(path.resolve('.tmp/diff-tab-trial.json'), JSON.stringify(evidence, null, 2));
+  console.log(JSON.stringify(evidence, null, 2));
 } else if (command === 'finish-setup') {
   // CUJ 4: an edit jj tracks and an ignored file in topic, whose space gets a second terminal.
   await fs.writeFile(path.join(topic, '.gitignore'), 'build.log\n');
@@ -335,5 +351,5 @@ if (command === 'run') {
   // Only this fresh HOME and session is addressed; no default-session command runs.
   console.log(execute(config.core, ['server', 'stop', '--json']));
 } else {
-  throw new Error('Use prepare, run, status, resources, new, edit, open, panel, pair, verify-panel, finish-setup, finish, lock, unlock, again, verify-finish, shot, verify, quit or stop-core');
+  throw new Error('Use prepare, run, status, resources, new, edit, open, panel, pair, verify-panel, diff, verify-diff, finish-setup, finish, lock, unlock, again, verify-finish, shot, verify, quit or stop-core');
 }

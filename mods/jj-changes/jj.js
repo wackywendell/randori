@@ -77,9 +77,6 @@ export const CHANGE_TEMPLATE = `json({${FIELDS}, "files" => ${FILE_LIST}}) ++ "\
 export const STACK_TEMPLATE = `if(current_working_copy, json({${FIELDS}, "files" => ${FILE_LIST}}), json({${FIELDS}})) ++ "\\n"`;
 export const STACK_REVSET = "@ | (trunk().. & first_ancestors(@))";
 export const STACK_LIMIT = 100;
-// A diff shows at most this much.
-export const DIFF_LINES = 5000;
-export const DIFF_BYTES = 1 << 20;
 
 const fail = (r, what) => new Error(r.stderr.trim() || `${what} exited ${r.code}`);
 const parse = (line) => {
@@ -118,17 +115,6 @@ export async function readPair(root, on, from, to, io) {
   return out.split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-// One file's diff in Git's format, from its first hunk: { lines, cut }.
-// `range` is ["-r", commit] or ["--from", older, "--to", newer]. `cut`
-// says the diff passed DIFF_LINES or DIFF_BYTES and was shortened.
-export async function readDiff(root, on, range, path, io) {
-  const pattern = `root-file:"${path.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
-  let out = await jj(root, on, ["--ignore-working-copy", "diff", "--git", ...range, "--", pattern], io);
-  let cut = out.length > DIFF_BYTES;
-  if (cut) out = out.slice(0, DIFF_BYTES);
-  const all = out.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-  if (first < 0) return { lines: [], cut: false };
-  const lines = all.slice(first);
-  if (lines.length > DIFF_LINES) cut = true;
-  return { lines: lines.slice(0, DIFF_LINES), cut };
-}
+// A fileset naming exactly one path from the checkout's root, for jj and
+// Hunk's `-- path`, which passes it to jj: plain paths are parsed as filesets.
+export const filePattern = (path) => `root-file:"${path.replace(/[\\"]/g, (c) => `\\${c}`)}"`;

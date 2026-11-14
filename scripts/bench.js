@@ -7,7 +7,7 @@ import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { readStatus } from '../mods/jj-spaces/jj.js';
-import { snapshot, readStack, readDiff, STACK_LIMIT } from '../mods/jj-changes/jj.js';
+import { snapshot, readStack, STACK_LIMIT } from '../mods/jj-changes/jj.js';
 
 let processes = 0;
 const exec = (cmd, args, { cwd } = {}) => new Promise((resolve, reject) => {
@@ -70,8 +70,7 @@ try {
     roots.push(root);
   }
   const refresh = await measure('20-workspace refresh', async () => { for (const root of roots) await readStatus(root, null, false, io); }, 5);
-  // A stack of STACK_LIMIT changes above trunk(), each editing one file,
-  // and a change adding a 5,000-line file.
+  // A stack of STACK_LIMIT changes above trunk(), each editing one file.
   const deep = path.join(temp, 'deep');
   jj(temp, 'git', 'init', '--quiet', deep);
   jj(deep, 'bookmark', 'create', '--quiet', 'master', '-r', '@');
@@ -79,17 +78,13 @@ try {
     await fs.writeFile(path.join(deep, 'f'), `change ${i}\n`);
     jj(deep, '--config', 'fsmonitor.backend=none', 'commit', '--quiet', '-m', `change ${i}`);
   }
-  await fs.writeFile(path.join(deep, 'big'), Array.from({ length: 5000 }, (_, i) => `line ${i}`).join('\n') + '\n');
-  jj(deep, 'util', 'snapshot');
   const stack = await measure('100-change stack', () => readStack(deep, null, io));
-  const diff = await measure('5,000-line diff', () => readDiff(deep, null, ['-r', '@'], 'big', io));
   const result = {
     jj: execFileSync('jj', ['--version'], { encoding: 'utf8' }).trim(),
     note: 'Medians over local temporary repositories with three edited files in @, using the user jj config and tests/jj-test.toml.',
     status_line: status,
     op_heads_refresh_20_workspaces: refresh,
     stack_read_100_changes: stack,
-    file_diff_5000_lines: diff,
   };
   await fs.mkdir('.tmp', { recursive: true });
   await fs.writeFile('.tmp/bench.json', JSON.stringify(result, null, 2) + '\n');

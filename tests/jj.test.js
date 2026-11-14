@@ -8,7 +8,7 @@ import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { identity, joinPath, readStatus, visible, errorWord } from '../mods/jj-spaces/jj.js';
-import { readStack, readChange, readPair, readDiff, snapshot, STACK_LIMIT } from '../mods/jj-changes/jj.js';
+import { readStack, readChange, readPair, filePattern, snapshot, STACK_LIMIT } from '../mods/jj-changes/jj.js';
 
 // Herdr's exec: resolves { code, stdout, stderr }, rejects when the program cannot start.
 export const exec = (cmd, args, { cwd, timeout } = {}) => new Promise((resolve, reject) => execFile(cmd, args, { cwd, timeout, encoding: 'utf8', maxBuffer: 8 << 20 },
@@ -129,7 +129,7 @@ test('readStack stops at the cap', async t => {
   assert.equal((await readStack(main, null, io)).length, STACK_LIMIT);
 });
 
-test('readChange, readPair and readDiff cover added, modified and deleted files', async t => {
+test('readChange, readPair and filePattern cover added, modified and deleted files', async t => {
   const { main } = fixture(t);
   const odd = 'dir/b (x) "q".txt';
   execFileSync('mkdir', ['-p', path.join(main, 'dir')]);
@@ -151,8 +151,8 @@ test('readChange, readPair and readDiff cover added, modified and deleted files'
   const base = jj(main, 'log', '--no-graph', '-r', 'master', '-T', 'commit_id').trim();
   assert.deepEqual(await readPair(main, null, base, newer, io), [
     { path: 'a', status: 'M' }, { path: odd, status: 'A' }, { path: 'new', status: 'A' }]);
-  assert.deepEqual(await readDiff(main, null, ['-r', newer], odd, io), { lines: ['@@ -1,1 +1,1 @@ b2', '-b', '+b2'], cut: false });
-  assert.deepEqual(await readDiff(main, null, ['--from', base, '--to', newer], odd, io), { lines: ['@@ -0,0 +1,1 @@ b2', '+b2'], cut: false });
+  assert.equal(jj(main, 'diff', '--name-only', '-r', newer, '--', filePattern(odd)), `${odd}\n`);
+  assert.equal(jj(main, 'diff', '--name-only', '--from', base, '--to', newer, '--', filePattern(odd)), `${odd}\n`);
 });
 
 // Holds jj's working-copy lock on a checkout until the returned function is called.
