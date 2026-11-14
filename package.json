@@ -1,5 +1,5 @@
 {
-  "name": "herdr-jj-workspaces",
+  "name": "randori",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" }

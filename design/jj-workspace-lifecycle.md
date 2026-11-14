@@ -77,9 +77,9 @@ None.
 
 ### CUJ 1. Start a workspace
 
-- Given the main checkout `herdr-jj-workspaces` is open in a space of the same name, and the repository has no bookmark named `nesting`. Its `mise.toml` is trusted, and the layout lists `mise.toml` and `AGENTS.local.md` as linked files.
+- Given the main checkout `randori` is open in a space of the same name, and the repository has no bookmark named `nesting`. Its `mise.toml` is trusted, and the layout lists `mise.toml` and `AGENTS.local.md` as linked files.
 - When you choose New workspace from that space's menu and type `nesting`.
-- Then the dialog shows `~/.herdr/worktrees/herdr-jj-workspaces/nesting` and "starts from this checkout's parent". After you press Enter, a space `nesting` opens below the main space, drawn as its child, with a terminal in the checkout. Both files are links to the main checkout's copies, and `mise` runs there without a trust prompt.
+- Then the dialog shows `~/.herdr/worktrees/randori/nesting` and "starts from this checkout's parent". After you press Enter, a space `nesting` opens below the main space, drawn as its child, with a terminal in the checkout. Both files are links to the main checkout's copies, and `mise` runs there without a trust prompt.
 
 ### CUJ 2. Glance at status
 
@@ -97,7 +97,7 @@ None.
 
 - Given the `nesting` space holds two terminals, one of them an agent, both in the checkout. The checkout has an edited `src/lib.rs` and an ignored `build.log`.
 - When you choose Finish workspace from the space's menu.
-- Then the dialog lists `nesting`, checked, with its folder `~/.herdr/worktrees/herdr-jj-workspaces/nesting`. It says the terminals end, that edits jj tracks stay in the repository, and that files jj does not track are deleted. After you press Enter, both terminals end and the space closes, jj snapshots the edit to `src/lib.rs` into the workspace's change, and the checkout and `build.log` are gone. `jj log` in the main checkout shows the change.
+- Then the dialog lists `nesting`, checked, with its folder `~/.herdr/worktrees/randori/nesting`. It says the terminals end, that edits jj tracks stay in the repository, and that files jj does not track are deleted. After you press Enter, both terminals end and the space closes, jj snapshots the edit to `src/lib.rs` into the workspace's change, and the checkout and `build.log` are gone. `jj log` in the main checkout shows the change.
 
 ### CUJ 5. Finish a space that holds two workspaces
 
