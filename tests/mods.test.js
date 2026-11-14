@@ -79,14 +79,50 @@ test('linked jj workspaces nest under their main checkout', async () => {
   assert.deepEqual([...new Set(order)], ['space-s1', 'space-s2', 'space-s3']);
 });
 
-test('a space working in two jj repositories shows no status line', async () => {
-  const s = space('s1', '/r/main');
-  s.tabs.push({ id: 'second' });
-  const w = world();
-  const h = load('jj-spaces', { layout: sidebar(), spaces: [s], panes: [pane('s1', '/r/main'), { ...pane('s1', '/o'), pane: 'p2', tab: 'second' }],
+// A space named "main" with a tab in /r/main and a tab in /o, whose @ is on bookmark "other-o".
+function twoRepos(active) {
+  const s = { ...space('s1', '/r/main'), name: 'main', tabs: [{ id: 's1-tab', active: active === 0 }, { id: 'second', active: active === 1 }] };
+  const w = world((cmd, args, opts) => isLog({ cmd, args }) && opts.cwd === '/o'
+    ? ok(JSON.stringify({ ...STACK[0], bookmarks: ['other-o'] }) + '\n') : undefined);
+  const h = load('jj-spaces', { layout: sidebar(), spaces: [s], panes: [pane('s1', '/r/main'), { ...pane('s1', '/o'), pane: 'p2', terminal: 't2', tab: 'second' }],
     exec: w.exec, readTextFile: w.readTextFile });
+  h.calls = w.calls;
+  return h;
+}
+
+test('a space in two jj repositories shows its active tab’s, named when the space’s name differs', async () => {
+  const h = twoRepos(1);
   await settle(h);
-  assert.equal(row(h, 's1').includes('master~4'), false);
+  assert.deepEqual(row(h, 's1').slice(-5), ['o', 'other-o', '~3', '+120', '-8']);
+  h.state.spaces[0].tabs = h.state.spaces[0].tabs.map((t, i) => ({ ...t, active: i === 0 }));
+  await settle(h);
+  assert.deepEqual(row(h, 's1').slice(-4), ['master~4', '~3', '+120', '-8']);
+});
+
+test('going back to a tab rereads its checkout, which no operation reread while it was hidden', async () => {
+  const h = twoRepos(1);
+  await settle(h);
+  const select = n => { h.state.spaces[0].tabs = h.state.spaces[0].tabs.map((t, i) => ({ ...t, active: i === n })); };
+  select(0);
+  await settle(h);
+  h.calls.length = 0;
+  await h.fire('/o/.jj/repo/op_heads/heads');
+  assert.deepEqual(h.calls.filter(isLog), []);
+  select(1);
+  await settle(h);
+  assert.deepEqual(h.calls.filter(isLog).map(c => [c.cwd, c.args[0]]), [['/o', '--ignore-working-copy']]);
+});
+
+test('an agent turn ending in a space’s active tab snapshots that tab’s checkout', async () => {
+  const h = twoRepos(1);
+  await settle(h);
+  h.calls.length = 0;
+  h.state.panes[1].status = 'working';
+  await h.advance(250);
+  h.state.panes[1].status = 'idle';
+  await h.advance(250);
+  const logs = h.calls.filter(isLog);
+  assert.deepEqual(logs.map(c => [c.cwd, c.args.includes('--ignore-working-copy')]), [['/o', false]]);
 });
 
 test('stale, divergent and failed reads show one dim word with jj\u2019s message', async () => {

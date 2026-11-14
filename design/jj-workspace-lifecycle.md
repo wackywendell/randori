@@ -48,7 +48,7 @@ The design gives each workspace its own space. A space's identity then answers "
 ## Goals
 
 - Start from a name. Typing a name and pressing Enter creates the workspace, checkout and nested space. The dialog says where the checkout goes and what it starts from. When the name or folder is taken, jj's error appears in the dialog.
-- See each workspace's state at a glance. The status line of each space working in one jj repository shows its nearest bookmark, the number of changes since it, and the files and lines changed in `@`, or `∅` when `@` has no changes. An agent's edits appear when its turn ends.
+- See each workspace's state at a glance. The status line of each jj space shows its nearest bookmark, the number of changes since it, and the files and lines changed in `@`, or `∅` when `@` has no changes. An agent's edits appear when its turn ends.
 - Inspect progress in jj terms. The changes panel shows the stack since `trunk()`, per-change line totals, the files a change touches, any file's diff and a diff between two changes. In jj repositories every number comes from jj and matches `jj log`.
 - Stay quiet when unwatched. In jj checkouts, a hidden sidebar or panel starts no jj process, and jj refreshes follow file watches and agent turns, with no timer where file watching works.
 - Finish in one action. In the common case the Finish dialog opens with the space's own workspace checked, and Enter removes it. Before you confirm, the dialog says which folders it deletes, that edits jj tracks stay in the repository, and that files jj does not track are deleted.
@@ -192,7 +192,7 @@ Each mod finds a folder's repository when it first needs it, and keeps the answe
 
 A mod uses the shipped Git code for a folder only when `jj` is not installed or reports "There is no jj repo". Any other failure shows as an error in that mod. Until the answer arrives, the mod shows nothing for the folder and runs no Git command.
 
-`jj-spaces` nests every linked workspace's space under its main checkout's space with `space.move`, as the shipped sidebar does for worktrees. A space's repositories are those of its terminals' folders. A space with exactly one jj repository gets a status line describing the checkout of its first terminal with a folder.
+`jj-spaces` nests every linked workspace's space under its main checkout's space with `space.move`, as the shipped sidebar does for worktrees. A space nests by the checkout of its first terminal with a folder, as in the shipped sidebar. Its status line describes the checkout of the first terminal in its active tab when that is a jj checkout, so a space with tabs in several repositories shows the one you are on, and switching tabs moves no space in the tree. As on Git rows, the line starts with the repository's name, the main checkout's folder name, unless the space's name or its nesting under that repository already gives it.
 
 ### Status lines
 
@@ -202,9 +202,9 @@ The text is the bookmark and distance, the file count and the line totals, as `m
 
 A status line refreshes in three cases.
 
-- After an operation. One watch on the repository's `.jj/repo/op_heads/heads/` folder, which jj rewrites after every operation, serves every workspace of that repository. Each operation refreshes the status lines of that repository's spaces one at a time, with `--ignore-working-copy`.
-- After an agent's turn or a foreground command ends in the space, when the space's terminals go from busy to idle. The read omits `--ignore-working-copy`, so jj snapshots that space's checkout first. Other spaces of the repository refresh through the operation the snapshot records.
-- After a space's first terminal changes folder.
+- After an operation. One watch on the repository's `.jj/repo/op_heads/heads/` folder, which jj rewrites after every operation, serves every workspace of that repository. Each operation refreshes the status lines of that repository's spaces one at a time, with `--ignore-working-copy`. A checkout no space shows is skipped, and read once when a space shows it again.
+- After an agent's turn or a foreground command ends in the space, when the space's terminals go from busy to idle. The read omits `--ignore-working-copy`, so jj snapshots the checkout that terminal works in first, when a space shows it, and the space's own checkout otherwise. Other spaces of the repository refresh through the operation the snapshot records.
+- After a space's first terminal changes folder, or its active tab changes to another checkout.
 
 Where `watchFolder` rejects a watch, status lines fall back to a 30-second interval while visible.
 
@@ -495,7 +495,7 @@ The copy's folder then replaces the repository's mod folder of the same name, an
 - Type. Mod, fresh copy of `spaces`.
 - Change. Probe every terminal's folder with `identity()` from its own `jj.js`, once per folder, keyed by `JSON.stringify([machine, folder])` as the shipped sidebar keys its cache. Use the shipped Git check only for folders `identity()` reports as not jj.
 - Change. Nest spaces by `repo`, with the main checkout's space as parent, through the shipped `space.move` ordering.
-- Change. Replace `gitTail()` for spaces with one jj repository by the status elements, drawn on the same row, with the bookmark in `dim`, the file count bold in `working`, `+N` in `ansi2`, `-N` in `ansi1`, and a dim `stale`, `divergent` or `error` word with jj's message as a tooltip.
+- Change. Replace `gitTail()` for spaces whose active tab is in a jj checkout by the status elements, after the repository's name as `gitTail()` places it, drawn on the same row, with the bookmark in `dim`, the file count bold in `working`, `+N` in `ansi2`, `-N` in `ansi1`, and a dim `stale`, `divergent` or `error` word with jj's message as a tooltip.
 - Change. Keep one `watchFolder(<repo>/op_heads/heads)` per local repository while visible. A batch marks that repository's spaces pending with `snapshot: false`. The shipped busy-to-idle edge in `due()` marks only its own space pending with `snapshot: true`, without the shipped `sameRepo` spread. A folder change marks its space pending with `snapshot: false`.
 - Change. One refresh loop runs pending reads one at a time, `snapshot: true` first, with `{running, pending, generation}` per space. It starts nothing while the sidebar is hidden or narrow by the Refresh rules. A rejected watch, and every remote repository, switch to a 30-second interval while visible.
 - Change. Right-click on a space row opens `jj-menu`. The shipped copy opens `menu`, which `mod.clone` leaves unchanged.

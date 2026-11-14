@@ -40,6 +40,12 @@ const rowHeight = ({ tree }) => (tree ? 28 : 30);
 const RAIL_CELL = 32;
 const railCell = (el) => h_flex().flex_none().justify_center().child(el);
 const where = (s, ps) => JSON.stringify([s.machine ?? null, place(s, ps)]);
+// The first terminal of the tab a space shows, whose checkout its jj status line gives.
+function shownWhere(s, ps) {
+  const tab = (s.tabs ?? []).find((c) => c.active)?.id;
+  const cwd = ps.find((p) => p.tab === tab && p.cwd)?.cwd;
+  return cwd ? JSON.stringify([s.machine ?? null, cwd]) : where(s, ps);
+}
 const base = (path) => path.replace(/\/+$/, "").split("/").pop();
 // Changes made outside Herdr (an editor's save, a commit in another app): looked
 // for this often, in repos the list shows, while the window is in front.
@@ -67,6 +73,7 @@ export default class Spaces extends View {
     this.busy = {}; // pane -> an agent working or a program in front of its shell
     this.ready = {}; // machine -> its layout was readable at the last look
     this.at = {}; // space -> its where() at the last look
+    this.places = new Set(); // where()s and jj shownWhere()s of the spaces at the last look
     this.watching = new Set(); // local repos' git folders
     this.ids = {}; // where() -> identity(), kept once jj answered for certain
     this.probing = {}; // where() -> its identity() in flight
@@ -119,7 +126,12 @@ export default class Spaces extends View {
     // Moved there: what it knew of that place may be old.
     const at = {};
     for (const s of sp) at[s.id] = where(s, ps);
-    const keys = new Set(Object.values(at).filter((k) => JSON.parse(k)[1]));
+    // A space's active tab in another jj checkout gives its status line, so that is read too.
+    const shownJj = sp.map((s) => shownWhere(s, ps)).filter((k) => this.ids[k]?.jj);
+    const keys = new Set([...Object.values(at), ...shownJj].filter((k) => JSON.parse(k)[1]));
+    // Operations skip places no space shows; one shown again is read once.
+    for (const k of keys) if (!this.places.has(k) && this.git[k]?.jj) this.queue(k, false);
+    this.places = keys;
     const due = new Set([...keys].filter((k) => !(k in this.git)));
     for (const [id, k] of Object.entries(at)) if (this.at[id] && this.at[id] !== k && keys.has(k)) due.add(k);
     this.at = at;
@@ -132,7 +144,8 @@ export default class Spaces extends View {
       if (this.busy[p.pane] && !busy[p.pane]) {
         // In jj, only this space's checkout: its snapshot records an operation
         // when it finds edits, and the op_heads watch refreshes the rest.
-        const k = at[spaceOf[p.tab].id];
+        const own = JSON.stringify([spaceOf[p.tab].machine ?? null, p.cwd]);
+        const k = this.git[own]?.jj ? own : at[spaceOf[p.tab].id];
         if (this.git[k]?.jj) this.queue(k, true);
         else this.sameRepo(k, keys).forEach((k) => due.add(k));
       }
@@ -185,17 +198,6 @@ export default class Spaces extends View {
     return this.probing[key];
   }
 
-  // The jj repos a space's terminals work in, as far as known.
-  jjRepos(s, ps) {
-    const tabs = new Set((s.tabs ?? []).map((c) => c.id));
-    const repos = new Set();
-    for (const p of ps) {
-      const id = tabs.has(p.tab) && p.cwd && this.ids[JSON.stringify([s.machine ?? null, p.cwd])];
-      if (id?.jj) repos.add(id.repo);
-    }
-    return repos;
-  }
-
   queue(key, snapshot) {
     this.jjPending.set(key, Boolean(this.jjPending.get(key)) || snapshot);
   }
@@ -212,7 +214,7 @@ export default class Spaces extends View {
         this.jjPending.delete(key);
         const g = this.git[key];
         // A place no space is at any more, such as a finished workspace, is not read.
-        if (!g?.jj || !g.root || !Object.values(this.at).includes(key)) continue;
+        if (!g?.jj || !g.root || !this.places.has(key)) continue;
         this.checked[key] = Date.now();
         try { g.status = await readStatus(g.root, JSON.parse(key)[0], snapshot, IO); }
         catch (e) { g.status = { error: "error", message: String(e?.message ?? e) }; }
@@ -400,7 +402,10 @@ export default class Spaces extends View {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
     for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
-    const list = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null, many: this.jjRepos(w, ps).size > 1 }));
+    const list = sp.map((w, i) => {
+      const g = this.git[where(w, ps)] ?? null, shown = this.git[shownWhere(w, ps)];
+      return { w, i, g, jg: shown?.jj ? shown : g?.jj ? g : null };
+    });
     const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
     const nested = (r) => r.g?.linked && mains.has(r.g.repo);
     const out = [];
@@ -525,12 +530,15 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  // The jj status after a space's name: "master~4 ~3 +120 -8", "∅" for an
-  // empty @, or one dim word with jj's message as its tooltip. The bookmark
-  // is cut from the left when the row is narrow.
-  jjTail(g, many, id, t) {
-    const s = many ? null : g.status;
-    const el = h_flex().flex_1().min_w(0).gap(5).justify_end().items_center().text_size(11.5).text_color(t.dim);
+  // The jj status of the space's active tab after its name: "master~4 ~3 +120 -8",
+  // "∅" for an empty @, or one dim word with jj's message as its tooltip. As for
+  // git, the repo's name comes first unless the space's name or nesting says it.
+  // The bookmark is cut from the left when the row is narrow.
+  jjTail(jg, g, tree, name, id, t) {
+    const s = jg.status;
+    const said = (tree && jg.repo === g?.repo) || jg.name.toLowerCase() === name.toLowerCase();
+    const el = h_flex().flex_1().min_w(0).gap(5).justify_end().items_center().text_size(11.5).text_color(t.dim)
+      .when(!said && Boolean(jg.name), (el) => el.child(div().min_w(0).truncate().child(jg.name)));
     if (!s) return el;
     if (s.error) return el.child(div().id(`jj-status-${id}`).flex_none().tooltip(s.message).child(s.error));
     const bookmark = s.bookmark ? (s.distance ? `${s.bookmark}~${s.distance}` : s.bookmark) : "";
@@ -543,7 +551,7 @@ export default class Spaces extends View {
         .child(div().flex_none().text_color(t.ansi1).child(`-${s.removed}`)));
   }
 
-  row({ w, i, g, tree, many }, t) {
+  row({ w, i, g, jg, tree }, t) {
     const on = w.active;
     const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
     const colors = shared("space.colors") ?? {};
@@ -596,7 +604,7 @@ export default class Spaces extends View {
           .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
-          .child(g?.jj ? this.jjTail(g, many, w.id, t) : g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
+          .child(jg ? this.jjTail(jg, g, tree, w.name, w.id, t) : g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
       );
   }
 
