@@ -43,13 +43,27 @@ The line refreshes after any jj operation in the repository, through a watch on 
 
 ## Changes panel
 
-The Changes button in the tab bar opens the panel for the focused pane's checkout. The header gives the checkout's folder name, the stack's base, the time of the last refresh, a diff button and a refresh button. Below it is the stack, the changes after the base up to `@`, newest first, then the change they start from, dimmed and marked base. Each row shows the change ID with its shortest unique prefix in purple, up to two bookmarks, the description, the conflict state, the number of files changed as an orange `~N` like the status line's, and the lines added and removed. When the base is not an ancestor of `@`, the last row is the newest change both share. The stack shows at most 100 changes.
+The Changes button in the tab bar opens the panel for the focused pane's checkout. The header gives the checkout's folder name, the stack's base, the time of the last refresh, a diff button and a refresh button. Below it is the stack, the changes after the base up to `@` and any above `@`, newest first, then the change they start from, dimmed and marked base. Each row shows the change ID with its shortest unique prefix in purple, up to two bookmarks, the description, the conflict state, the number of files changed as an orange `~N` like the status line's, and the lines added and removed. When the base is not an ancestor of `@`, the last row is the newest change both share. The stack shows at most 100 changes.
 
 The base is `trunk()` until you change it. Click it to open a picker with your 20 newest bookmarks, local and remote, filtered as you type. Typing highlights the first match. As in a browser's address bar, ↑ and ↓ move through the list and put the highlighted bookmark in the input, where you can apply it or keep typing to edit it. Moving past either end puts back what you typed, and Escape puts it back too, then closes the picker. Enter or a click applies the highlighted bookmark. Enter with nothing highlighted applies the input's text, and an empty one returns to `trunk()`. Each workspace keeps its own base, saved by Herdr. When jj cannot resolve the base, the panel shows jj's error.
 
 Click a change to see its files. Shift-click a second change to see the files that changed from the older one, labelled FROM, to the newer one, labelled TO. The older change's own edits are left out of that comparison. Click a file, or diff, to open the selection's diff in a pane right of the focused one, in the checkout's folder. The pane runs [Hunk](https://hunk.dev/) when `hunk` is installed, as `hunk show <change>` or `hunk diff <from> <to>` for the whole selection, so you can add comments with Hunk. A new Hunk window starts at its first file, and a later click on a file moves the window to it. Without Hunk the pane runs `jj diff` for the clicked file with your diff formatter, paged by `less -R`, which stays open until you press `q`. Each tab has one diff pane. A later click reloads the Hunk window in it when the selection's commits changed, or replaces the pane when it runs `jj diff` or its Hunk window cannot be found by process ID. Quitting closes the pane. The diff names changes by change ID, so it follows them as jj rewrites them. `@` stays selected as jj rewrites it, and a selected change that another command rewrites or abandons is cleared with the note "Selected change was rewritten".
 
-Showing the panel and pressing refresh run `jj util snapshot` and then read the stack. After any jj operation in the repository, the panel rereads the stack without a snapshot. A hidden panel starts no jj process. In a Git-only folder the panel is Herdr's shipped Changes panel, with its Commit box and ten-second Git refresh. The panel has no commit action in jj checkouts.
+Showing the panel and pressing refresh run `jj util snapshot` and then read the stack. After any jj operation in the repository, the panel rereads the stack without a snapshot. A hidden panel starts no jj process. In a Git-only folder the panel is Herdr's shipped Changes panel, with its Commit box and ten-second Git refresh. The panel has no commit or push action in jj checkouts.
+
+The panel edits the stack with one jj command per click, and shows jj's error when one fails. `jj undo` reverses any of them.
+
+| Action | How | jj command |
+|---|---|---|
+| New change on `@` | `+` in the header | `jj new` |
+| New change after a change, and edit it | `+` on the row, shown on hover | `jj new --insert-after <change>` |
+| Squash a change into its parent | `↓` on the row, shown on hover | `jj squash -r <change>` |
+| Describe a change | Double-click its description. Enter saves, Shift+Enter adds a line, Escape cancels | `jj describe -r <change> -m <text>` |
+| Edit a change | Right-click menu | `jj edit <change>` |
+| Abandon a change | Right-click menu | `jj abandon <change>` |
+| Copy a change ID | Right-click menu | |
+
+When both changes have descriptions, squash joins them with a blank line, the text jj's editor would start with. The base row has no buttons, and its menu only copies its ID. `↓` is left off the change above the base.
 
 ## Finish workspace
 
@@ -86,4 +100,5 @@ just bench
 - Install the mods only where the Herdr app runs. A remote machine needs `jj` on the `PATH` its herdr-core starts with, which can differ from your login shell's. Hunk and mise there are optional. A folder inside a jj checkout where `jj` cannot start shows `no jj`, with the reason in its tooltip.
 - On another machine the status line refreshes after agent turns and every 30 seconds, and the Changes panel only when shown or when you press refresh. jj commands you run there show up then.
 - The native trial covers New and Open workspace, nesting and a status line refresh after an operation. The Changes panel's native trial covers showing it, the snapshot of an unrecorded edit, a FROM and TO pair, the reread after a jj operation the pair opening whole in Hunk in a split pane, a second file moving that window to it, `q` closing it and the next click opening a new one. The trial selects the pair and the file from a test subclass, so clicks are covered by fake tests only. The `jj diff` pane used without Hunk, and replacing a pane, are covered by fake tests only. The refresh after an agent's turn is covered by fake tests only. Finish's native trial covers a space with one workspace, one workspace of a space with two, and a held lock with its retry, each choosing workspaces from a test subclass. Its key presses and checkbox clicks are covered by fake tests only.
+- The stack actions are covered by fixture tests and by checking their jj commands in a disposable repository. The hover buttons, the right-click menu and the Enter key in the describe textarea have not been tried in the app.
 - jj 0.47.1 brings a workspace up to date when another workspace rewrites its `@`, so no test produces a real `stale` error.

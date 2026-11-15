@@ -76,7 +76,7 @@ const quote = (text) => `"${text.replace(/[\\"]/g, "\\$&")}"`;
 // `change` is at least `idLength` characters, with its shortest unique
 // prefix apart.
 const fields = (idLength) => `"commit" => commit_id, "change" => change_id.shortest(${idLength}),
-    "description" => description.first_line(), "empty" => empty,
+    "description" => description, "empty" => empty,
     "conflict" => conflict, "at" => current_working_copy, "bookmarks" => bookmarks`;
 // Each file's "added removed" from one diff.stat(), which jj computes again
 // on every call. `parse` turns them, or `@`'s file list, into count and totals.
@@ -94,16 +94,17 @@ export function stackTemplate(base, idLength) {
 }
 export const DEFAULT_BASE = "trunk()";
 export const DEFAULT_ID_LENGTH = 6;
-// The changes after `base` up to `@`, then the change they start from, which
-// is `base` itself when it is an ancestor of `@`. `base` is any revset; jj
-// reports one that does not parse or resolve.
-export const stackRevset = (base) => `@ | ((${base}).. & first_ancestors(@)) | heads(::@ & ::(${base}))`;
+// The changes after `base` up to `@` and any above `@`, then the change they
+// start from, which is `base` itself when it is an ancestor of `@`. `base` is
+// any revset; jj reports one that does not parse or resolve.
+export const stackRevset = (base) => `@:: | ((${base}).. & first_ancestors(@)) | heads(::@ & ::(${base}))`;
 export const STACK_LIMIT = 100;
 
 const fail = (r, what) => new Error(r.stderr.trim() || `${what} exited ${r.code}`);
 const parse = (line) => {
   const change = JSON.parse(line);
   if (change.files) change.files = change.files.map((f) => JSON.parse(f));
+  if (typeof change.description === "string") { change.text = change.description; change.description = change.description.split("\n")[0]; }
   const lines = change.lines?.map((l) => l.split(" ").map(Number)) ?? (change.at ? change.files?.map((f) => [f.added, f.removed]) : null);
   if (lines) {
     change.count = lines.length;
@@ -128,12 +129,28 @@ export async function snapshot(root, on, io) {
   await jj(root, on, ["util", "snapshot"], io);
 }
 
-// The stack from `base` to `@`, newest first: { commit, change, prefix,
-// description, empty, conflict, at, bookmarks, base, count, added, removed }, with
-// `files` on `@`.
+// The stack from `base` to `@` and above, newest first: { commit, change,
+// prefix, description (its first line), text (all of it), empty, conflict, at,
+// bookmarks, base, count, added, removed }, with `files` on `@`.
 export async function readStack(root, on, base, idLength, io) {
   const out = await jj(root, on, ["--ignore-working-copy", "log", "--no-graph", "--limit", String(STACK_LIMIT), "-r", stackRevset(base), "-T", stackTemplate(base, idLength)], io);
   return out.split("\n").filter(Boolean).map(parse);
+}
+
+// Runs one jj command that changes the repository, such as new, squash or
+// describe. It snapshots first, as any jj command does.
+export async function change(root, on, args, io) {
+  await jj(root, on, args, io, 30_000);
+}
+
+// Squashes a stack change into its parent. With both descriptions set, jj
+// would open an editor starting with both joined; this passes that text
+// instead. With one empty, jj keeps the other without asking.
+export async function squashArgs(root, on, c, io) {
+  const out = await jj(root, on, ["--ignore-working-copy", "log", "--no-graph", "-r", `${c.commit}-`, "-T", 'json(description) ++ "\\n"'], io);
+  const parents = out.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const texts = [parents.length === 1 ? parents[0] : "", c.text ?? ""].map((s) => s.trim());
+  return ["squash", "-r", c.commit, ...(texts.every(Boolean) ? ["-m", texts.join("\n\n")] : [])];
 }
 
 // Up to 20 bookmark names, local and remote, newest commit first, such as

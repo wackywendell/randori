@@ -1,7 +1,7 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popover, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, terminals, exec, hc, readTextFile, watchFolder, theme, settings, layout, run, shared, setShared } from "herdr";
-import { identity, visible, snapshot, readStack, readChange, readPair, readBookmarks, filePattern, STACK_LIMIT, DEFAULT_BASE, DEFAULT_ID_LENGTH } from "./jj.js";
+import { identity, visible, snapshot, readStack, readChange, readPair, readBookmarks, change, squashArgs, filePattern, STACK_LIMIT, DEFAULT_BASE, DEFAULT_ID_LENGTH } from "./jj.js";
 
 const IO = { exec, readTextFile };
 // What a jj run does, each step including the ones after it.
@@ -74,6 +74,12 @@ export default class Changes extends View {
       this.baseAt = this.baseText && this.baseMatches().length ? 0 : -1;
       cx.notify();
     });
+    // Describing a change in place: Enter saves, Shift+Enter adds a line.
+    this.describeInput = TextareaState.new({ placeholder: "Describe this change" });
+    this.describeInput.set_auto_grow(1, 6);
+    this.describeInput.on("submit", (e, cx) => { if (!e?.shift) this.saveDescribe(cx); });
+    this.describeInput.on("blur", (_e, cx) => this.endDescribe(cx));
+    this.describing = null; this.menuFor = null; this.hovered = null; this.acting = false; this.actError = null;
     // A folder's identity(): jj checkouts and "no jj repo" are kept, other
     // answers only until the folder changes.
     this.ids = {}; this.last = null; this.mode = null;
@@ -196,6 +202,66 @@ export default class Changes extends View {
     } else this.sel = sel;
     // A pair runs older to newer: stack order is newest first.
     if (this.sel.length === 2 && stack.indexOf(this.sel[0]) < stack.indexOf(this.sel[1])) this.sel.reverse();
+  }
+
+  // Runs one jj edit from a click, one at a time. `args` is the command, or a
+  // function that reads what it needs first. The stack rereads after it.
+  act(args, cx) {
+    const ck = this.ck;
+    if (!ck || this.acting) return;
+    this.acting = true; this.menuFor = null; this.actError = null;
+    cx.spawn(async (cx) => {
+      try { await change(ck.root, ck.on, typeof args === "function" ? await args() : args, IO); }
+      catch (e) { this.actError = String(e?.message ?? e); }
+      finally { this.acting = false; this.request(STACK, cx); cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  squash(c, cx) {
+    const { root, on } = this.ck;
+    this.act(() => squashArgs(root, on, c, IO), cx);
+  }
+
+  startDescribe(c, cx) {
+    this.menuFor = null; this.describing = c.commit;
+    this.describeInput.set_value((c.text ?? "").trimEnd());
+    this.describeInput.focus();
+    cx.notify();
+  }
+
+  endDescribe(cx) {
+    if (!this.describing) return;
+    this.describing = null;
+    cx.notify();
+  }
+
+  saveDescribe(cx) {
+    const c = this.stack.find((s) => s.commit === this.describing), text = this.describeInput.value();
+    this.endDescribe(cx);
+    if (c && text.trim() !== (c.text ?? "").trim()) this.act(["describe", "-r", c.commit, "-m", text], cx);
+  }
+
+  // The right-click menu: [label, hint, action]. The base row is where the
+  // stack starts, so it only offers its ID.
+  menuItems(c, canSquash) {
+    const copy = ["Copy change ID", c.change, (cx) => { cx.write_to_clipboard(c.change); this.menuFor = null; cx.notify(); }];
+    if (c.base) return [copy];
+    return [
+      ["Describe", "jj describe", (cx) => this.startDescribe(c, cx)],
+      ["New change after", "jj new -A", (cx) => this.act(["new", "--insert-after", c.commit], cx)],
+      ...(canSquash ? [["Squash into parent", "jj squash", (cx) => this.squash(c, cx)]] : []),
+      ...(c.at ? [] : [["Edit", "jj edit", (cx) => this.act(["edit", c.commit], cx)]]),
+      ["Abandon", "jj abandon", (cx) => this.act(["abandon", c.commit], cx)],
+      copy,
+    ];
+  }
+
+  menu(c, t, canSquash) {
+    return v_flex().id(`stack-menu-${c.commit}-items`).w(220).p(5).rounded(8).border_1().border_color(t.border).bg(t.popover).shadow_lg().text_size(12.8)
+      .children(this.menuItems(c, canSquash).map(([label, hint, action], n) => h_flex().id(`stack-menu-${c.commit}-${n}`).h(29).px(8).gap(9).rounded(6).items_center().cursor_pointer()
+        .hover((s) => s.bg(t.hover)).on_click((_e, cx) => action(cx))
+        .child(div().flex_1().child(label)).child(div().flex_none().text_size(11).text_color(t.dim).child(hint))));
   }
 
   readFiles({ root, on }, sel) {
@@ -520,9 +586,23 @@ export default class Changes extends View {
   // The stack, newest first, ending with the change it starts from, marked
   // base. A selected pair is labelled FROM and TO. `full` rows put the
   // description under the ID, bookmarks and counts, with a line between rows.
-  stackRow(c, t, full) {
-    const i = this.sel.findIndex((s) => s.commit === c.commit), pair = this.sel.length === 2;
-    const description = div().flex_1().min_w(0).truncate().text_color(c.description && !c.base ? t.foreground : t.dim).child(c.description || "(no description)");
+  // Hovering a row shows + (jj new -A) and ↓ (jj squash), right-clicking
+  // opens its menu, and double-clicking its description edits it.
+  stackRow(c, t, full, canSquash) {
+    const i = this.sel.findIndex((s) => s.commit === c.commit), pair = this.sel.length === 2, editing = this.describing === c.commit;
+    const description = div().flex_1().min_w(0).truncate().text_color(c.description && !c.base ? t.foreground : t.dim).child(c.description || "(no description)")
+      .when(!c.base, (e) => e.on_mouse_down("left", (ev, cx) => { if (ev.click_count === 2) this.startDescribe(c, cx); }));
+    const button = (id, label, tip, action) => div().id(`stack-${c.commit}-${id}`).flex_none().size(20).flex().items_center().justify_center().rounded(5).text_size(13).text_color(t.muted).cursor_pointer()
+      .hover((s) => s.bg(t.raised).text_color(t.foreground)).tooltip(tip)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => { cx.stop_propagation(); action(cx); }).child(label);
+    const buttons = h_flex().flex_none().gap(2).when(this.hovered !== c.commit || this.acting, (e) => e.invisible())
+      .child(button("new", "+", "New change after this one, and edit it (jj new -A)", (cx) => this.act(["new", "--insert-after", c.commit], cx)))
+      .when(canSquash, (e) => e.child(button("squash", "↓", "Squash into its parent (jj squash)", (cx) => this.squash(c, cx))));
+    const editor = v_flex().w_full().gap(4).pt(4).pl(pair && i >= 0 ? 40 : 0)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => cx.stop_propagation())
+      .on_key_down((e, cx) => { if (e.key === "escape") this.endDescribe(cx); })
+      .child(Textarea.new(this.describeInput).w_full())
+      .child(div().text_size(10).text_color(t.dim).child("Enter saves, Shift+Enter adds a line, Esc cancels"));
     const top = h_flex().w_full().flex_none().gap(8).items_center()
       .when(pair && i >= 0, (e) => e.child(div().w(32).flex_none().text_size(10).text_color(t.accent).child(i === 0 ? "FROM" : "TO")))
       .child(h_flex().flex_none().text_size(11).text_color(t.dim).when(c.at, (e) => e.child(div().text_color(t.accent).child("@ ")))
@@ -534,12 +614,19 @@ export default class Changes extends View {
       .when(c.conflict, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("conflict")))
       .when(c.empty, (e) => e.child(div().text_size(11).text_color(t.dim).child("∅")))
       .when(c.count > 0, (e) => e.child(div().text_size(11).font_bold().text_color(t.working).child(`~${c.count}`)))
-      .when(c.added > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${c.added}`))).when(c.removed > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${c.removed}`)));
-    return v_flex().id(`stack-${c.commit}`).flex_none().px(8).justify_center().rounded(7).cursor_pointer()
-      .h(rowHeight(full))
+      .when(c.added > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${c.added}`))).when(c.removed > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${c.removed}`)))
+      .when(!full && !c.base, (e) => e.child(buttons));
+    const row = v_flex().id(`stack-${c.commit}`).flex_none().px(8).justify_center().rounded(7).cursor_pointer()
+      .when(editing, (e) => e.py(6)).when(!editing, (e) => e.h(rowHeight(full)))
       .when(i >= 0, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => this.select(c, Boolean(e?.modifiers?.shift), cx))
+      .on_hover((hovered, cx) => { if (hovered) this.hovered = c.commit; else if (this.hovered === c.commit) this.hovered = null; cx.notify(); })
       .child(top)
-      .when(full, (e) => e.child(h_flex().w_full().pl(pair && i >= 0 ? 40 : 0).child(description)));
+      .when(full && !editing, (e) => e.child(h_flex().w_full().gap(8).items_center().pl(pair && i >= 0 ? 40 : 0).child(description).when(!c.base, (e) => e.child(buttons))))
+      .when(editing, (e) => e.child(editor));
+    const open = this.menuFor === c.commit;
+    return Popover.new(`stack-menu-${c.commit}`).mouse_button("right").open(open)
+      .on_open_change((value, cx) => { this.menuFor = value ? c.commit : null; cx.notify(); })
+      .trigger(row).when(open, (e) => e.content(this.menu(c, t, canSquash)));
   }
 
   renderJj(cx) {
@@ -551,12 +638,14 @@ export default class Changes extends View {
         .when(Boolean(ck), (e) => e.child(div().id("changes-base").flex_none().max_w(160).truncate().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).tooltip("The stack starts after this revset. Click to change it").on_click((_e, cx) => this.editBase(cx)).child(baseOf(ck.root))))
         .when(Boolean(this.updated), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim).child(`updated ${this.updated}`)))
         .child(div().flex_1())
+        .child(div().id("changes-new").flex_none().h(24).px(8).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(13).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).tooltip("New change on top of @ (jj new)").on_click((_e, cx) => this.act(["new"], cx)).child("+"))
         .when(this.sel.length > 0, (e) => e.child(div().id("changes-open").flex_none().h(24).px(8).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.openDiff(null, cx)).child("diff")))
         .when(Boolean(ck), (e) => e.child(div().id("changes-refresh").flex_none().h(24).px(6).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).tooltip("Refresh").on_click((_e, cx) => this.request(SNAPSHOT, cx)).child(svg("mods/jj-changes/refresh.svg").size(14).text_color(t.muted)))))
       .when(Boolean(this.editingBase), (e) => e.child(this.basePicker(t)))
       .when(Boolean(this.error), (e) => e.child(small(this.error, t.ansi1).py(6).border_b(1).border_color(t.border)))
-      .when(this.stack.length > 0, (e) => e.child(div().flex_none().h(Math.min(this.stack.length, 6) * (rowHeight(this.fullRows) + (this.fullRows ? 1 : 0)) + 12).relative().border_b(1).border_color(t.border)
-        .child(v_flex().id("changes-stack").absolute().inset_0().overflow_y_scroll().p(6).children(this.stack.flatMap((c, n) => [...(this.fullRows && n ? [div().flex_none().h(1).mx(8).bg(t.border)] : []), this.stackRow(c, t, this.fullRows)])))
+      .when(Boolean(this.actError), (e) => e.child(small(this.actError, t.ansi1).py(6).border_b(1).border_color(t.border)))
+      .when(this.stack.length > 0, (e) => e.child(div().flex_none().h(Math.min(this.stack.length, 6) * (rowHeight(this.fullRows) + (this.fullRows ? 1 : 0)) + 12 + (this.describing ? 96 : 0)).relative().border_b(1).border_color(t.border)
+        .child(v_flex().id("changes-stack").absolute().inset_0().overflow_y_scroll().p(6).children(this.stack.flatMap((c, n) => [...(this.fullRows && n ? [div().flex_none().h(1).mx(8).bg(t.border)] : []), this.stackRow(c, t, this.fullRows, !c.base && !this.stack[n + 1]?.base)])))
         .child(Scrollbar.vertical("changes-stack").absolute().inset_0())))
       .when(this.stack.length >= STACK_LIMIT, (e) => e.child(small(`Showing the newest ${STACK_LIMIT} changes`, t.dim)))
       .when(pair, (e) => e.child(small("Edits made after FROM, up to TO. FROM's own edits are excluded.", t.dim)))

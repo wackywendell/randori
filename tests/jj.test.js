@@ -118,7 +118,7 @@ test('readStack lists @ and then trunk() as the base when @ sits on it', async t
   const { main } = fixture(t);
   const stack = await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io);
   assert.equal(stack.length, 2);
-  assert.deepEqual({ ...stack[0], commit: '', change: '', prefix: '' }, { commit: '', change: '', prefix: '', description: '', empty: true, conflict: false, at: true, bookmarks: [], base: false, count: 0, added: 0, removed: 0, files: [] });
+  assert.deepEqual({ ...stack[0], commit: '', change: '', prefix: '' }, { commit: '', change: '', prefix: '', description: '', text: '', empty: true, conflict: false, at: true, bookmarks: [], base: false, count: 0, added: 0, removed: 0, files: [] });
   assert.deepEqual([stack[1].base, stack[1].at, stack[1].bookmarks, 'added' in stack[1]], [true, false, ['master'], false]);
 });
 
@@ -170,6 +170,14 @@ test('readBookmarks lists local bookmarks without Git’s own remote, and readSt
   assert.deepEqual(off.map(c => [c.description, c.base]).slice(0, 3), [['', false], ['two', false], ['one', false]]);
   assert.deepEqual([off.length, off[3].commit, off[3].base], [4, master, true]);
   await assert.rejects(readStack(main, null, 'nope', DEFAULT_ID_LENGTH, io), /nope/);
+  // With @ in the middle, as after jj new -A, the changes above it stay, and
+  // text keeps the whole description.
+  jj(main, 'describe', '--quiet', '-r', 'description(exact:"two\n")', '-m', 'two\n\nbody');
+  writeFileSync(path.join(main, 'three'), 'three\n'); // jj drops an empty @ it leaves
+  jj(main, 'new', '--quiet', '--insert-after', 'description(glob:"two*")');
+  const mid = await readStack(main, null, 'feat/x', DEFAULT_ID_LENGTH, io);
+  assert.deepEqual(mid.map(c => [c.description, c.at]), [['', false], ['', true], ['two', false], ['one', false]]);
+  assert.equal(mid[2].text, 'two\n\nbody\n');
 });
 
 test('readChange, readPair and filePattern cover added, modified and deleted files', async t => {

@@ -597,7 +597,7 @@ const PANEL_STACK = [
   { commit: 'c4', change: { prefix: 'd', rest: 'ddddd' }, description: 'start', empty: false, conflict: false, at: false, bookmarks: [{ name: 'master' }], base: true },
 ];
 const isSnap = c => c.cmd === 'jj' && c.args.join(' ') === 'util snapshot';
-const stackRev = c => c.args.find(a => a.startsWith('@ | ('));
+const stackRev = c => c.args.find(a => a.startsWith('@:: | ('));
 const isStack = c => isLog(c) && Boolean(stackRev(c));
 
 // A panel focused on `cwd`. `answers(cmd, args)` answers first.
@@ -608,7 +608,7 @@ function panel(cwd = '/r/main', answers = () => undefined, data = {}) {
     if (answer) return answer;
     if (cmd !== 'jj') return undefined;
     if (args.join(' ') === 'util snapshot') return ok('');
-    if (args.some(a => a.startsWith('@ | ('))) return ok(stack.map(c => JSON.stringify({ ...c, files: c.files?.map(f => JSON.stringify(f)) })).join('\n') + '\n');
+    if (args.some(a => a.startsWith('@:: | ('))) return ok(stack.map(c => JSON.stringify({ ...c, files: c.files?.map(f => JSON.stringify(f)) })).join('\n') + '\n');
     if (args.includes('log')) return ok(JSON.stringify({ ...PANEL_STACK[1], files: [JSON.stringify({ path: 'b.txt', status: 'A', added: 1, removed: 0 })] }) + '\n');
     if (args.includes('diff')) return ok('{"path":"p.txt","status":"M"}\n');
     return undefined;
@@ -664,7 +664,7 @@ test('full rows, the default, put the description on a second line for every cha
     const lines = c => byId(h.render(), `stack-${c}`)._children.map(words);
     const full = rows !== 'compact';
     assert.equal(lines('c2').length, full ? 2 : 1, rows);
-    assert.deepEqual(full ? lines('c2')[1] : [], full ? ['two'] : [], rows);
+    assert.deepEqual(full ? lines('c2')[1] : [], full ? ['two', '+', '↓'] : [], String(rows));
     assert.ok(lines('c2')[0].includes('~1') && lines('c2')[0].includes('feat'), rows);
     assert.equal(lines('c4').length, full ? 2 : 1, `${rows}: the base row has the same layout`);
   }
@@ -686,7 +686,7 @@ const lastBase = h => stackRev(h.calls.filter(isStack).at(-1));
 test('the base picker lists the newest bookmarks, filters as you type and keeps each workspace’s base', async () => {
   const h = panel('/r/main', BOOKMARKS, { shared: { 'jj-changes:bases': { '/r/other': 'other@origin' } } });
   await shown(h);
-  assert.equal(lastBase(h), '@ | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
+  assert.equal(lastBase(h), '@:: | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
   click(h, 'changes-base');
   await h.drain();
   assert.equal(h.inputs[1].value(), 'trunk()');
@@ -697,7 +697,7 @@ test('the base picker lists the newest bookmarks, filters as you type and keeps 
   pick(h, 'enter');
   await h.drain();
   assert.deepEqual(bases(h), { '/r/other': 'other@origin', '/r/main': 'main@origin' });
-  assert.equal(lastBase(h), '@ | ((main@origin).. & first_ancestors(@)) | heads(::@ & ::(main@origin))');
+  assert.equal(lastBase(h), '@:: | ((main@origin).. & first_ancestors(@)) | heads(::@ & ::(main@origin))');
   assert.equal(byId(h.render(), 'changes-base-picker'), undefined);
   assert.ok(words(h.render()).includes('main@origin'));
   click(h, 'changes-base');
@@ -706,7 +706,7 @@ test('the base picker lists the newest bookmarks, filters as you type and keeps 
   pick(h, 'enter');
   await h.drain();
   assert.deepEqual(bases(h), { '/r/other': 'other@origin' });
-  assert.equal(lastBase(h), '@ | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
+  assert.equal(lastBase(h), '@:: | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
 });
 
 test('the base picker takes a typed revset, fills the input as ↑↓ move like an address bar, takes a click, and Escape', async () => {
@@ -717,7 +717,7 @@ test('the base picker takes a typed revset, fills the input as ↑↓ move like 
   h.inputs[1].emit('change', 'main-');
   pick(h, 'enter');
   await h.drain();
-  assert.equal(lastBase(h), '@ | ((main-).. & first_ancestors(@)) | heads(::@ & ::(main-))');
+  assert.equal(lastBase(h), '@:: | ((main-).. & first_ancestors(@)) | heads(::@ & ::(main-))');
   // ↓ fills the input and keeps the list; past the end it puts back what was typed.
   click(h, 'changes-base');
   await h.drain();
@@ -743,7 +743,7 @@ test('the base picker takes a typed revset, fills the input as ↑↓ move like 
   h.inputs[1].emit('change', 'feat/x-');
   pick(h, 'enter');
   await h.drain();
-  assert.equal(lastBase(h), '@ | ((feat/x-).. & first_ancestors(@)) | heads(::@ & ::(feat/x-))');
+  assert.equal(lastBase(h), '@:: | ((feat/x-).. & first_ancestors(@)) | heads(::@ & ::(feat/x-))');
   click(h, 'changes-base');
   await h.drain();
   click(h, 'changes-base-feat/x');
@@ -757,7 +757,7 @@ test('the base picker takes a typed revset, fills the input as ↑↓ move like 
 });
 
 test('a base jj cannot resolve shows its error', async () => {
-  const h = panel('/r/main', (cmd, args) => args.includes('@ | ((nope).. & first_ancestors(@)) | heads(::@ & ::(nope))') ? fail('Error: Revision `nope` doesn\'t exist') : BOOKMARKS(cmd, args));
+  const h = panel('/r/main', (cmd, args) => args.includes('@:: | ((nope).. & first_ancestors(@)) | heads(::@ & ::(nope))') ? fail('Error: Revision `nope` doesn\'t exist') : BOOKMARKS(cmd, args));
   await shown(h);
   click(h, 'changes-base');
   await h.drain();
@@ -959,4 +959,73 @@ test('a failed read shows its error above the last good data', async () => {
   const text = words(h.render());
   assert.ok(text.includes('Error: The working copy is stale'));
   assert.ok(text.includes('two'));
+});
+
+// The edits the panel runs, in the order they ran, without the reads.
+const edits = h => h.calls.filter(c => c.cmd === 'jj' && ['new', 'squash', 'describe', 'edit', 'abandon'].includes(c.args[0])).map(c => c.args);
+const parentLog = (desc) => (cmd, args) => args.includes('log') && args.some(a => /^c\d-$/.test(a)) ? ok(`${JSON.stringify(desc)}\n`) : undefined;
+
+test('+ runs jj new, and a row\u2019s hidden + and \u2193 insert a change after it and squash it, then the stack rereads', async () => {
+  const h = panel('/r/main', parentLog('one\n'));
+  await shown(h);
+  const reads = h.calls.filter(isStack).length;
+  click(h, 'changes-new'); await h.drain();
+  click(h, 'stack-c2-new'); await h.drain();
+  click(h, 'stack-c2-squash'); await h.drain();
+  assert.deepEqual(plain(edits(h)), [['new'], ['new', '--insert-after', 'c2'], ['squash', '-r', 'c2', '-m', 'one\n\ntwo']]);
+  assert.ok(h.calls.filter(isStack).length > reads, 'the stack rereads');
+  assert.ok(byId(h.render(), 'stack-c2-squash'), 'c2 can squash into c3');
+  assert.equal(byId(h.render(), 'stack-c3-squash'), undefined, 'c3 would squash into the base');
+  assert.equal(byId(h.render(), 'stack-c4-new'), undefined, 'the base row has no buttons');
+  assert.ok(byId(h.render(), 'stack-c2-new')?.calls.invisible || nodes(h.render()).some(n => n.calls.invisible), 'row buttons hide until hovered');
+  byId(h.render(), 'stack-c2').handlers.on_hover(true, h.cx);
+  const shownButtons = nodes(byId(h.render(), 'stack-c2')).filter(n => n.calls.invisible);
+  assert.equal(shownButtons.length, 0, 'hovering a row shows its buttons');
+});
+
+test('squash passes no message when one of the two descriptions is empty, and a failed edit shows jj\u2019s error', async () => {
+  const h = panel('/r/main', (cmd, args) => parentLog('')(cmd, args) ?? (args[0] === 'abandon' ? fail('Error: Commit c3 is immutable') : undefined));
+  await shown(h);
+  click(h, 'stack-c2-squash'); await h.drain();
+  assert.deepEqual(plain(edits(h)), [['squash', '-r', 'c2']]);
+  byId(h.render(), 'stack-menu-c3').handlers.on_open_change(true, h.cx);
+  const abandon = nodes(h.render()).find(n => /^stack-menu-c3-\d+$/.test(n.calls.id?.[0] ?? '') && words(n).includes('Abandon'));
+  abandon.handlers.on_click({}, h.cx); await h.drain();
+  assert.ok(words(h.render()).includes('Error: Commit c3 is immutable'));
+});
+
+test('double-clicking a description edits all of it in place: Enter saves, Shift+Enter does not, Escape cancels', async () => {
+  const h = panel('/r/main');
+  await shown(h);
+  const area = h.inputs.find(i => i.set_auto_grow);
+  const dbl = id => nodes(byId(h.render(), id)).find(n => words(n).length === 1 && n.handlers['on_mouse_down:left'])?.handlers['on_mouse_down:left']({ click_count: 2 }, h.cx);
+  dbl('stack-c4');
+  assert.equal(h.view.describing, null, 'the base is not described');
+  dbl('stack-c2');
+  assert.equal(area.value(), 'two');
+  assert.ok(area.focused);
+  area.emit('submit', 'two\nmore', { shift: true });
+  assert.deepEqual(plain(edits(h)), []);
+  area.emit('submit', 'two\n\nbody');
+  await h.drain();
+  assert.deepEqual(plain(edits(h)), [['describe', '-r', 'c2', '-m', 'two\n\nbody']]);
+  dbl('stack-c3');
+  nodes(byId(h.render(), 'stack-c3')).find(n => n.handlers.on_key_down).handlers.on_key_down({ key: 'escape' }, h.cx);
+  assert.equal(h.view.describing, null);
+  assert.equal(edits(h).length, 1);
+});
+
+test('right-click opens a row\u2019s menu: @ has no Edit, the base only copies its ID', async () => {
+  const h = panel('/r/main');
+  await shown(h);
+  const menu = c => { byId(h.render(), `stack-menu-${c}`).handlers.on_open_change(true, h.cx); return nodes(h.render()).filter(n => n.calls.id?.[0]?.match(new RegExp(`^stack-menu-${c}-\\d+$`))); };
+  const labels = c => menu(c).map(n => words(n)[0]);
+  assert.deepEqual(labels('c1'), ['Describe', 'New change after', 'Squash into parent', 'Abandon', 'Copy change ID']);
+  assert.deepEqual(labels('c3'), ['Describe', 'New change after', 'Edit', 'Abandon', 'Copy change ID']);
+  assert.deepEqual(labels('c4'), ['Copy change ID']);
+  menu('c2').find(n => words(n)[0] === 'Copy change ID').handlers.on_click({}, h.cx);
+  assert.deepEqual(plain(h.clipboard), ['bbbbbb']);
+  assert.equal(h.view.menuFor, null);
+  menu('c2').find(n => words(n)[0] === 'Edit').handlers.on_click({}, h.cx); await h.drain();
+  assert.deepEqual(plain(edits(h)), [['edit', 'c2']]);
 });

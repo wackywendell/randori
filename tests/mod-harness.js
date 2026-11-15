@@ -7,7 +7,7 @@ export function element() {
   proxy = new Proxy(node, { get(target, key) {
     if (key in target) return target[key];
     return (...args) => {
-      if (key === 'child') target._children.push(args[0]);
+      if (key === 'child' || key === 'trigger' || key === 'content') target._children.push(args[0]);
       else if (key === 'children') target._children.push(...args[0]);
       else if (key === 'when') { if (args[0]) args[1](proxy); }
       else if (key.startsWith('on_')) {
@@ -44,7 +44,8 @@ export function load(name, data = {}) {
   const storage = new Map();
   const actions = [], tasks = [], timers = [], notifications = [], overlays = [], logs = [], inputs = [], watches = [], errors = [];
   const task = entry => { entry.cancelled = false; entry.cancel = () => { entry.cancelled = true; }; return entry; };
-  const cx = { notify() {}, stop_propagation() {}, focus_handle: () => ({ focus() {} }),
+  const clipboard = [];
+  const cx = { notify() {}, stop_propagation() {}, write_to_clipboard: text => clipboard.push(text), focus_handle: () => ({ focus() {} }),
     spawn(body, opts) { const t = task({ body, opts }); tasks.push(t); return t; },
     timer: {
       after(ms, body) { const t = task({ at: state.now + ms, body }); timers.push(t); return t; },
@@ -62,6 +63,14 @@ export function load(name, data = {}) {
       inputs.push(input);
       return input;
     } },
+    TextareaState: { new: ({ value = '' } = {}) => {
+      const on = {};
+      const area = { value: () => value, set_value(next) { value = next; }, set_auto_grow() {}, on(event, body) { on[event] = body; }, focus() { area.focused = true; },
+        emit(event, next, payload = {}) { if (next !== undefined) value = next; on[event]?.(payload, cx); } };
+      inputs.push(area);
+      return area;
+    } },
+    Textarea: { new: element }, Popover: { new: id => element().id(id) },
     Input: { new: element }, ScrollHandle: { new: () => ({ scroll_to_item() {} }) }, Scrollbar: { vertical: element }, Checkbox: { new: id => element().id(id) },
     // Every row of a virtual list, as if all were on screen.
     v_virtual_list: (id, count, height, key, rows) => element().id(id).children(rows({ start: 0, end: count })),
@@ -85,7 +94,7 @@ export function load(name, data = {}) {
   });
   const view = new Mod();
   view.init({}, cx);
-  const harness = { state, view, cx, shared, actions, tasks, timers, notifications, overlays, logs, inputs, watches, render: () => view.render(cx),
+  const harness = { state, view, cx, shared, clipboard, actions, tasks, timers, notifications, overlays, logs, inputs, watches, render: () => view.render(cx),
     // Starts every spawned task and lets them run until they wait on
     // something that is not ready (a watch, a pending exec).
     async drain() {
