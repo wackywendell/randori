@@ -26,7 +26,12 @@ export async function identity(folder, on, { exec, readTextFile }) {
   let r;
   try {
     r = await exec("jj", ["--ignore-working-copy", "workspace", "root"], { cwd: folder, on, timeout: 10_000 });
-  } catch {
+  } catch (e) {
+    // Inside a jj checkout, a jj that cannot start is an error to fix, not a Git folder.
+    for (let dir = folder; dir; dir = dir.slice(0, dir.lastIndexOf("/"))) {
+      if (typeof (await readTextFile(`${dir}/.jj/working_copy/type`, { on }).catch(() => null)) === "string")
+        return { error: "no jj", message: `jj could not run${on ? ` on ${on}` : ""}: ${e?.message ?? e}` };
+    }
     return { jj: false };
   }
   if (r.code !== 0) {

@@ -81,6 +81,8 @@ just bench
 
 ## Limits
 
-- The tested versions are jj 0.47.1 and Herdr 0.1.15 on macOS. Linux and remote machines are untested. On another machine the Changes panel refreshes only when shown or when you press refresh.
+- The tested versions are jj 0.47.1 and Herdr 0.1.15 on macOS. One hand-run trial covered a Linux remote machine. Herdr on Linux is untested.
+- Install the mods only where the Herdr app runs. A remote machine needs `jj` on the `PATH` its herdr-core starts with, which can differ from your login shell's. Hunk and mise there are optional. A folder inside a jj checkout where `jj` cannot start shows `no jj`, with the reason in its tooltip.
+- On another machine the status line refreshes after agent turns and every 30 seconds, and the Changes panel only when shown or when you press refresh. jj commands you run there show up then.
 - The native trial covers New and Open workspace, nesting and a status line refresh after an operation. The Changes panel's native trial covers showing it, the snapshot of an unrecorded edit, a FROM and TO pair, the reread after a jj operation the pair opening whole in Hunk in a split pane, a second file moving that window to it, `q` closing it and the next click opening a new one. The trial selects the pair and the file from a test subclass, so clicks are covered by fake tests only. The `jj diff` pane used without Hunk, and replacing a pane, are covered by fake tests only. The refresh after an agent's turn is covered by fake tests only. Finish's native trial covers a space with one workspace, one workspace of a space with two, and a held lock with its retry, each choosing workspaces from a test subclass. Its key presses and checkbox clicks are covered by fake tests only.
 - jj 0.47.1 brings a workspace up to date when another workspace rewrites its `@`, so no test produces a real `stale` error.

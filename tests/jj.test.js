@@ -79,6 +79,16 @@ test('identity treats a jj that cannot start as no jj', async () => {
   assert.deepEqual(await identity('/anywhere', null, missing), { jj: false });
 });
 
+test('identity reports a jj that cannot start inside a jj checkout as an error', async () => {
+  const read = [];
+  const io = { exec: async () => { throw new Error('No such file or directory'); },
+    readTextFile: async (p, o) => { read.push([p, o.on]); return p === '/r/main/.jj/working_copy/type' ? 'local' : null; } };
+  const id = await identity('/r/main/src/deep', 'vps', io);
+  assert.equal(id.error, 'no jj');
+  assert.match(id.message, /^jj could not run on vps: No such file or directory/);
+  assert.deepEqual(read, [['/r/main/src/deep/.jj/working_copy/type', 'vps'], ['/r/main/src/.jj/working_copy/type', 'vps'], ['/r/main/.jj/working_copy/type', 'vps']]);
+});
+
 test('errorWord names stale workspaces and divergent operations', () => {
   assert.equal(errorWord('Error: The "@" expression resolved to more than one operation'), 'divergent');
   assert.equal(errorWord('Error: The working copy is stale (not updated since operation 1234).'), 'stale');

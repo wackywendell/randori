@@ -67,7 +67,7 @@ The design gives each workspace its own space. A space's identity then answers "
 - Moving existing checkouts. Checkouts outside Herdr's worktree location keep working where they are.
 - Rearranging existing mixed spaces. Spaces you already use for several repositories keep their tabs.
 - Editing Herdr's shipped mods. Each mod here is a project-owned copy.
-- Streams integration, remote machines and Linux. The mods pass each space's machine to every command, but remote machines and Linux remain untested.
+- Streams integration and Linux. The mods pass each space's machine to every command. One hand-run trial covered a Linux remote machine, and Herdr on Linux remains untested.
 
 ## Open Questions
 
@@ -192,7 +192,7 @@ Every template below was run against jj 0.47.1.
 
 Each mod finds a folder's repository when it first needs it, and keeps the answer in its own memory. `identity(folder)` runs `jj --ignore-working-copy workspace root`, which gives the checkout's root. In the main checkout `<root>/.jj/repo` is a folder, and in a linked workspace it is a file holding the path to the main checkout's `.jj/repo`. The repository's `.jj/repo` path identifies it, and the main checkout is the folder that holds it.
 
-A mod uses the shipped Git code for a folder only when `jj` is not installed or reports "There is no jj repo". Any other failure shows as an error in that mod. Until the answer arrives, the mod shows nothing for the folder and runs no Git command.
+A mod uses the shipped Git code for a folder only when `jj` is not installed or reports "There is no jj repo". A `jj` that cannot start in a folder inside a jj checkout shows `no jj`, since the Git code would offer Git's commit there. Any other failure shows as an error in that mod. Until the answer arrives, the mod shows nothing for the folder and runs no Git command.
 
 `jj-spaces` nests every linked workspace's space under its main checkout's space with `space.move`, as the shipped sidebar does for worktrees. A space nests by the checkout of its first terminal with a folder, as in the shipped sidebar. Its status line describes the checkout of the first terminal in its active tab when that is a jj checkout, so a space with tabs in several repositories shows the one you are on, and switching tabs moves no space in the tree. As on Git rows, the line starts with the repository's name, the main checkout's folder name, unless the space's name or its nesting under that repository already gives it.
 
@@ -467,7 +467,7 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 - Trust. A linked `mise` file runs commands when trusted. Only files linked from the main checkout are trusted, and the setting turns trust off.
 - Links. Linked files point into the main checkout, so edits through a link change the main checkout's copy. Finish removes the link and leaves its target alone.
 - Terminals that ignore an end request. Finish stops with the terminal's name after 10 seconds and deletes nothing.
-- Untested platforms. Remote machines and Linux have no verification. On Linux, `watchFolder` skips Git-ignored folders, which changes no behavior here since no mod watches the checkout.
+- Untested platforms. Herdr on Linux has no verification. A hand-run trial on a Linux remote machine covered the status line, the Changes panel and base picker, the Hunk diff pane with navigation, New workspace and Finish. It found that the remote core's `PATH` decides whether the mods find `jj`. On Linux, `watchFolder` skips Git-ignored folders, which changes no behavior here since no mod watches the checkout.
 
 ## Additional Resources
 
@@ -480,7 +480,7 @@ Stage 2 delivers `jj-changes` and the Finish workspace dialog.
 
 - History actions in the changes panel, such as describe, squash and abandon.
 - An interdiff between two versions of one change.
-- Verified support for remote machines and Linux.
+- Verified support for Herdr on Linux, and automated remote trials.
 - A status line for spaces that work in several repositories.
 - An explicit Update stale workspace action.
 
@@ -526,7 +526,7 @@ The copy's folder then replaces the repository's mod folder of the same name, an
 #### 5. `mods/jj-spaces/jj.js` (Create)
 
 - Type. Module imported by `main.js`. Every function takes `exec` and `readTextFile` as arguments, so Node tests and the benchmark pass real ones. This file holds the source of `identity()`, `joinPath()` and `visible()`. Herdr mods import only from their own folder, so `jj-workspace`, `jj-menu`, `jj-new-menu` and, in Stage 2, `jj-changes` each keep a `jj.js` with identical copies, and `scripts/check-mods.js` fails when a copy differs.
-- Change. `identity(folder, on, io)` runs `jj --ignore-working-copy workspace root` in `folder`. jj's "There is no jj repo" returns `{jj: false, final: true}`, which the mod keeps. An `exec` rejection for a missing `jj` returns `{jj: false}`, which the mod asks again on the next change to the folder. Any other failure returns `{error, message}`. It then reads `<root>/.jj/repo` with `readTextFile`, treating rejection as absent. Text means a linked workspace, and `repo` is that text, trimmed, joined to `<root>/.jj/` and normalized. Otherwise, when `<root>/.jj/repo/store/type` reads as text, `repo` is `<root>/.jj/repo`. `main` is the folder two levels above `repo`. Returns `{jj: true, root, repo, main, linked: root !== main}`. A small pure `joinPath()` normalizes `.` and `..`.
+- Change. `identity(folder, on, io)` runs `jj --ignore-working-copy workspace root` in `folder`. jj's "There is no jj repo" returns `{jj: false, final: true}`, which the mod keeps. An `exec` rejection for a missing `jj` looks for `.jj/working_copy/type` in the folder and each parent. Found, it returns `{error: "no jj", message}`, naming the machine. Otherwise it returns `{jj: false}`, which the mod asks again on the next change to the folder. Any other failure returns `{error, message}`. It then reads `<root>/.jj/repo` with `readTextFile`, treating rejection as absent. Text means a linked workspace, and `repo` is that text, trimmed, joined to `<root>/.jj/` and normalized. Otherwise, when `<root>/.jj/repo/store/type` reads as text, `repo` is `<root>/.jj/repo`. `main` is the folder two levels above `repo`. Returns `{jj: true, root, repo, main, linked: root !== main}`. A small pure `joinPath()` normalizes `.` and `..`.
 - Change. `STATUS_TEMPLATE` is the following, one JSON line per change.
 
 ```text
@@ -697,4 +697,4 @@ json({"commit" => commit_id, "change" => change_id.short(),
 - Static checks. `just check-mods` runs `herdr-app check` on every mod in an isolated app home. `just verify` adds `node --check` on every script and mod file, and the check that every copy of the shared section matches.
 - Coverage. Every command each mod runs appears in at least one test asserting its arguments. CUJs 1, 2, 4 and 7 have harness tests, and CUJs 3, 5 and 6 have harness tests and real-jj tests.
 - Performance. `just bench` meets every row of the Performance budget.
-- Native. `node scripts/app-trial.js` in an isolated app home and core session covers CUJs 1 and 2 in Stage 1, and CUJs 3, 4, 5 and 6 in Stage 2. Remote machines, Linux and visual review in the personal app remain unverified until run by hand.
+- Native. `node scripts/app-trial.js` in an isolated app home and core session covers CUJs 1 and 2 in Stage 1, and CUJs 3, 4, 5 and 6 in Stage 2. Remote machines are checked by hand, with the trial core added to a machine under its own `--session`. Linux and visual review in the personal app remain unverified until run by hand.
