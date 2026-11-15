@@ -655,6 +655,21 @@ test('showing the panel snapshots and reads the stack, with the files of @', asy
   assert.match(h.calls.find(isStack).args.at(-1), /change_id\.shortest\(6\)/);
 });
 
+test('full rows, the default, put the description on a second line for every change including the base, and the rows prop compact keeps one', async () => {
+  for (const rows of [undefined, 'full', 'compact']) {
+    const layout = panelLayout();
+    if (rows) layout.children[0].children[0].children[1].content.props = { rows };
+    const h = panel('/r/main', () => undefined, { layout });
+    await shown(h);
+    const lines = c => byId(h.render(), `stack-${c}`)._children.map(words);
+    const full = rows !== 'compact';
+    assert.equal(lines('c2').length, full ? 2 : 1, rows);
+    assert.deepEqual(full ? lines('c2')[1] : [], full ? ['two'] : [], rows);
+    assert.ok(lines('c2')[0].includes('~1') && lines('c2')[0].includes('feat'), rows);
+    assert.equal(lines('c4').length, full ? 2 : 1, `${rows}: the base row has the same layout`);
+  }
+});
+
 test('the idLength prop sets how many characters a change ID shows', async () => {
   const layout = panelLayout();
   layout.children[0].children[0].children[1].content.props = { idLength: 9 };

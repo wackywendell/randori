@@ -9,12 +9,15 @@ const SNAPSHOT = 3, STACK = 2, FILES = 1;
 // Workspace root -> the revset its stack starts from, when not DEFAULT_BASE.
 const BASES = "jj-changes:bases";
 const baseOf = (root) => shared(BASES)?.[root] ?? DEFAULT_BASE;
-// The `idLength` prop of the layout's jj-changes block: the fewest characters
-// a change ID shows.
-function idLength(node = layout()) {
+// A stack row's height: full rows take two lines.
+const rowHeight = (full) => (full ? 40 : 28);
+// The props of the layout's jj-changes block: `idLength`, the fewest
+// characters a change ID shows, and `rows`, "full" or "compact".
+function blockProps(node = layout()) {
   const find = (n) => (n?.content?.mod === "jj-changes" ? n : (n?.children ?? []).map(find).find(Boolean));
-  return find(node)?.content?.props?.idLength ?? DEFAULT_ID_LENGTH;
+  return find(node)?.content?.props ?? {};
 }
+
 const clock = () => { const d = new Date(Date.now()); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
 
 function location() {
@@ -167,8 +170,9 @@ export default class Changes extends View {
     const { root, on } = ck;
     if (want >= SNAPSHOT) await snapshot(root, on, IO);
     if (want >= STACK) {
-      const stack = await readStack(root, on, baseOf(root), idLength(), IO);
+      const props = blockProps(), stack = await readStack(root, on, baseOf(root), props.idLength ?? DEFAULT_ID_LENGTH, IO);
       if (this.ck !== ck) return;
+      this.fullRows = props.rows !== "compact";
       this.useStack(stack);
     }
     const gen = this.gen, sel = this.sel;
@@ -514,22 +518,28 @@ export default class Changes extends View {
   }
 
   // The stack, newest first, ending with the change it starts from, marked
-  // base. A selected pair is labelled FROM and TO.
-  stackRow(c, t) {
+  // base. A selected pair is labelled FROM and TO. `full` rows put the
+  // description under the ID, bookmarks and counts, with a line between rows.
+  stackRow(c, t, full) {
     const i = this.sel.findIndex((s) => s.commit === c.commit), pair = this.sel.length === 2;
-    return h_flex().id(`stack-${c.commit}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
-      .when(i >= 0, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => this.select(c, Boolean(e?.modifiers?.shift), cx))
+    const description = div().flex_1().min_w(0).truncate().text_color(c.description && !c.base ? t.foreground : t.dim).child(c.description || "(no description)");
+    const top = h_flex().w_full().flex_none().gap(8).items_center()
       .when(pair && i >= 0, (e) => e.child(div().w(32).flex_none().text_size(10).text_color(t.accent).child(i === 0 ? "FROM" : "TO")))
       .child(h_flex().flex_none().text_size(11).text_color(t.dim).when(c.at, (e) => e.child(div().text_color(t.accent).child("@ ")))
         .child(div().text_color(t.ansi5).child(c.prefix)).child(c.change.slice(c.prefix.length)))
       .children(c.bookmarks.slice(0, 2).map((b) => chip(b, t)))
       .when(c.bookmarks.length > 2, (e) => e.child(chip(`+${c.bookmarks.length - 2}`, t)))
-      .child(div().flex_1().min_w(0).truncate().text_color(c.description && !c.base ? t.foreground : t.dim).child(c.description || "(no description)"))
+      .child(full ? div().flex_1() : description)
       .when(c.base, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("base")))
       .when(c.conflict, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("conflict")))
       .when(c.empty, (e) => e.child(div().text_size(11).text_color(t.dim).child("∅")))
       .when(c.count > 0, (e) => e.child(div().text_size(11).font_bold().text_color(t.working).child(`~${c.count}`)))
       .when(c.added > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${c.added}`))).when(c.removed > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${c.removed}`)));
+    return v_flex().id(`stack-${c.commit}`).flex_none().px(8).justify_center().rounded(7).cursor_pointer()
+      .h(rowHeight(full))
+      .when(i >= 0, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => this.select(c, Boolean(e?.modifiers?.shift), cx))
+      .child(top)
+      .when(full, (e) => e.child(h_flex().w_full().pl(pair && i >= 0 ? 40 : 0).child(description)));
   }
 
   renderJj(cx) {
@@ -545,8 +555,8 @@ export default class Changes extends View {
         .when(Boolean(ck), (e) => e.child(div().id("changes-refresh").flex_none().h(24).px(6).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).tooltip("Refresh").on_click((_e, cx) => this.request(SNAPSHOT, cx)).child(svg("mods/jj-changes/refresh.svg").size(14).text_color(t.muted)))))
       .when(Boolean(this.editingBase), (e) => e.child(this.basePicker(t)))
       .when(Boolean(this.error), (e) => e.child(small(this.error, t.ansi1).py(6).border_b(1).border_color(t.border)))
-      .when(this.stack.length > 0, (e) => e.child(div().flex_none().h(Math.min(this.stack.length, 6) * 28 + 12).relative().border_b(1).border_color(t.border)
-        .child(v_flex().id("changes-stack").absolute().inset_0().overflow_y_scroll().p(6).children(this.stack.map((c) => this.stackRow(c, t))))
+      .when(this.stack.length > 0, (e) => e.child(div().flex_none().h(Math.min(this.stack.length, 6) * (rowHeight(this.fullRows) + (this.fullRows ? 1 : 0)) + 12).relative().border_b(1).border_color(t.border)
+        .child(v_flex().id("changes-stack").absolute().inset_0().overflow_y_scroll().p(6).children(this.stack.flatMap((c, n) => [...(this.fullRows && n ? [div().flex_none().h(1).mx(8).bg(t.border)] : []), this.stackRow(c, t, this.fullRows)])))
         .child(Scrollbar.vertical("changes-stack").absolute().inset_0())))
       .when(this.stack.length >= STACK_LIMIT, (e) => e.child(small(`Showing the newest ${STACK_LIMIT} changes`, t.dim)))
       .when(pair, (e) => e.child(small("Edits made after FROM, up to TO. FROM's own edits are excluded.", t.dim)))
