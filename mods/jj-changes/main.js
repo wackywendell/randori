@@ -528,6 +528,7 @@ export default class Changes extends View {
       .when(c.base, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("base")))
       .when(c.conflict, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("conflict")))
       .when(c.empty, (e) => e.child(div().text_size(11).text_color(t.dim).child("∅")))
+      .when(c.count > 0, (e) => e.child(div().text_size(11).font_bold().text_color(t.working).child(`~${c.count}`)))
       .when(c.added > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${c.added}`))).when(c.removed > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${c.removed}`)));
   }
 

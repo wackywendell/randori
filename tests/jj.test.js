@@ -118,7 +118,7 @@ test('readStack lists @ and then trunk() as the base when @ sits on it', async t
   const { main } = fixture(t);
   const stack = await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io);
   assert.equal(stack.length, 2);
-  assert.deepEqual({ ...stack[0], commit: '', change: '', prefix: '' }, { commit: '', change: '', prefix: '', description: '', empty: true, conflict: false, at: true, bookmarks: [], base: false, added: 0, removed: 0, files: [] });
+  assert.deepEqual({ ...stack[0], commit: '', change: '', prefix: '' }, { commit: '', change: '', prefix: '', description: '', empty: true, conflict: false, at: true, bookmarks: [], base: false, count: 0, added: 0, removed: 0, files: [] });
   assert.deepEqual([stack[1].base, stack[1].at, stack[1].bookmarks, 'added' in stack[1]], [true, false, ['master'], false]);
 });
 
@@ -135,14 +135,17 @@ test('readStack shows change IDs of at least idLength characters, split at the s
 test('readStack lists a stack newest first, with files only for @', async t => {
   const { main } = fixture(t);
   for (const n of ['one', 'two', 'three']) { writeFileSync(path.join(main, n), `${n}\n`); jj(main, 'commit', '--quiet', '-m', n); }
+  writeFileSync(path.join(main, 'one'), 'uno\ndos\n'); writeFileSync(path.join(main, 'two'), '');
+  jj(main, 'commit', '--quiet', '-m', 'both');
   writeFileSync(path.join(main, 'a'), 'one\n');
   await snapshot(main, null, io);
   const stack = await readStack(main, null, DEFAULT_BASE, DEFAULT_ID_LENGTH, io);
-  assert.deepEqual(stack.slice(0, 4).map(c => c.description), ['', 'three', 'two', 'one']);
-  assert.deepEqual(stack.map(c => c.base), [false, false, false, false, true]);
+  assert.deepEqual(stack.slice(0, 5).map(c => c.description), ['', 'both', 'three', 'two', 'one']);
+  assert.deepEqual(stack.map(c => c.base), [false, false, false, false, false, true]);
   assert.deepEqual(stack[0].files, [{ path: 'a', status: 'M', added: 0, removed: 1 }]);
-  assert.equal(stack.slice(1).some(c => 'files' in c), false);
-  assert.deepEqual(stack.slice(1, 4).map(c => c.added), [1, 1, 1]);
+  assert.equal(stack.slice(1).some(c => 'files' in c || 'lines' in c), false);
+  // Files changed and line totals, from one diff.stat() a row, or @'s file list.
+  assert.deepEqual(stack.slice(0, 5).map(c => [c.count, c.added, c.removed]), [[1, 0, 1], [2, 2, 2], [1, 1, 0], [1, 1, 0], [1, 1, 0]]);
 });
 
 test('readStack stops at the cap', async t => {

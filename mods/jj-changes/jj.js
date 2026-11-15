@@ -78,7 +78,9 @@ const quote = (text) => `"${text.replace(/[\\"]/g, "\\$&")}"`;
 const fields = (idLength) => `"commit" => commit_id, "change" => change_id.shortest(${idLength}),
     "description" => description.first_line(), "empty" => empty,
     "conflict" => conflict, "at" => current_working_copy, "bookmarks" => bookmarks`;
-const STATS = `"added" => diff.stat().total_added(), "removed" => diff.stat().total_removed()`;
+// Each file's "added removed" from one diff.stat(), which jj computes again
+// on every call. `parse` turns them, or `@`'s file list, into count and totals.
+const STATS = `"lines" => diff.stat().files().map(|f| stringify(f.lines_added() ++ " " ++ f.lines_removed()))`;
 
 // One JSON line with a change's files.
 export const CHANGE_TEMPLATE = `json({"files" => ${FILE_LIST}}) ++ "\\n"`;
@@ -87,7 +89,7 @@ export const CHANGE_TEMPLATE = `json({"files" => ${FILE_LIST}}) ++ "\\n"`;
 // commit of thousands of files.
 export function stackTemplate(base, idLength) {
   const isBase = `self.contained_in(${quote(`::(${base})`)})`;
-  return `if(current_working_copy, json({${fields(idLength)}, "base" => ${isBase}, ${STATS}, "files" => ${FILE_LIST}}),
+  return `if(current_working_copy, json({${fields(idLength)}, "base" => ${isBase}, "files" => ${FILE_LIST}}),
     if(${isBase}, json({${fields(idLength)}, "base" => true}), json({${fields(idLength)}, "base" => false, ${STATS}}))) ++ "\\n"`;
 }
 export const DEFAULT_BASE = "trunk()";
@@ -102,6 +104,13 @@ const fail = (r, what) => new Error(r.stderr.trim() || `${what} exited ${r.code}
 const parse = (line) => {
   const change = JSON.parse(line);
   if (change.files) change.files = change.files.map((f) => JSON.parse(f));
+  const lines = change.lines?.map((l) => l.split(" ").map(Number)) ?? (change.at ? change.files?.map((f) => [f.added, f.removed]) : null);
+  if (lines) {
+    change.count = lines.length;
+    change.added = lines.reduce((n, [a]) => n + a, 0);
+    change.removed = lines.reduce((n, [, r]) => n + r, 0);
+    delete change.lines;
+  }
   if (change.change) { change.prefix = change.change.prefix; change.change = change.change.prefix + change.change.rest; }
   // Git's own remote mirrors the local bookmarks.
   if (change.bookmarks) change.bookmarks = change.bookmarks.filter((b) => b.remote !== "git").map((b) => (b.remote ? `${b.name}@${b.remote}` : b.name));
@@ -120,7 +129,7 @@ export async function snapshot(root, on, io) {
 }
 
 // The stack from `base` to `@`, newest first: { commit, change, prefix,
-// description, empty, conflict, at, bookmarks, base, added, removed }, with
+// description, empty, conflict, at, bookmarks, base, count, added, removed }, with
 // `files` on `@`.
 export async function readStack(root, on, base, idLength, io) {
   const out = await jj(root, on, ["--ignore-working-copy", "log", "--no-graph", "--limit", String(STACK_LIMIT), "-r", stackRevset(base), "-T", stackTemplate(base, idLength)], io);

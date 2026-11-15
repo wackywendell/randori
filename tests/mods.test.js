@@ -589,11 +589,11 @@ test('jj-tabs offers the Files and Changes panels', () => {
 const panelLayout = (hidden = false, active = 'changes') => ({ type: 'row', children: [{ id: 'panel', type: 'column', hidden, children: [
   { id: 'panel-body', type: 'stack', active, children: [{ id: 'files', type: 'block', content: { mod: 'files' } }, { id: 'changes', type: 'block', content: { mod: 'jj-changes' } }] }] }] });
 const PANEL_STACK = [
-  { commit: 'c1', change: { prefix: 'a', rest: 'aaaaa' }, description: '', empty: false, conflict: false, at: true, bookmarks: [], base: false, added: 2, removed: 1,
+  { commit: 'c1', change: { prefix: 'a', rest: 'aaaaa' }, description: '', empty: false, conflict: false, at: true, bookmarks: [], base: false,
     files: [{ path: 'src/a.js', status: 'M', added: 2, removed: 1 }] },
-  { commit: 'c2', change: { prefix: 'bb', rest: 'bbbb' }, description: 'two', empty: false, conflict: false, at: false, added: 1, removed: 0,
+  { commit: 'c2', change: { prefix: 'bb', rest: 'bbbb' }, description: 'two', empty: false, conflict: false, at: false, lines: ['1 0'],
     bookmarks: [{ name: 'feat' }, { name: 'feat', remote: 'git' }, { name: 'feat', remote: 'origin' }, { name: 'wip' }], base: false },
-  { commit: 'c3', change: { prefix: 'c', rest: 'ccccc' }, description: 'one', empty: false, conflict: true, at: false, bookmarks: [], base: false, added: 4, removed: 0 },
+  { commit: 'c3', change: { prefix: 'c', rest: 'ccccc' }, description: 'one', empty: false, conflict: true, at: false, bookmarks: [], base: false, lines: ['3 0', '1 0'] },
   { commit: 'c4', change: { prefix: 'd', rest: 'ddddd' }, description: 'start', empty: false, conflict: false, at: false, bookmarks: [{ name: 'master' }], base: true },
 ];
 const isSnap = c => c.cmd === 'jj' && c.args.join(' ') === 'util snapshot';
@@ -649,6 +649,9 @@ test('showing the panel snapshots and reads the stack, with the files of @', asy
   for (const w of ['main', '@ ', 'a', 'aaaaa', 'two', 'conflict', 'a.js', 'diff', 'trunk()', 'feat', 'feat@origin', '+1', 'start', 'base']) assert.ok(text.includes(w), `${w} in ${text}`);
   assert.equal(text.includes('wip') || text.some(w => w.endsWith('@git')), false, text.join(','));
   assert.ok(text.some(w => w.startsWith('updated ')));
+  // Files changed, then line totals: @'s from its file list, other rows' from jj's per-file lines.
+  const row = c => words(byId(h.render(), `stack-${c}`)).filter(w => /^[~+−]\d/.test(w));
+  assert.deepEqual([row('c1'), row('c2'), row('c3'), row('c4')], [['~1', '+2', '−1'], ['+1', '~1', '+1'], ['~2', '+4'], []]);
   assert.match(h.calls.find(isStack).args.at(-1), /change_id\.shortest\(6\)/);
 });
 
