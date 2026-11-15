@@ -65,7 +65,9 @@ export default class Changes extends View {
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.baseInput = InputState.new({ placeholder: DEFAULT_BASE });
     this.baseInput.on("change", (_e, cx) => {
-      this.baseText = this.baseInput.value().trim();
+      const value = this.baseInput.value();
+      if (value === this.baseFilled) return; // the picker's own fill
+      this.baseFilled = null; this.baseOwn = value; this.baseText = value.trim();
       this.baseAt = this.baseText && this.baseMatches().length ? 0 : -1;
       cx.notify();
     });
@@ -218,7 +220,7 @@ export default class Changes extends View {
     this.editingBase = !this.editingBase;
     if (!this.editingBase) return cx.notify();
     const { root, on } = this.ck, base = baseOf(root);
-    this.baseText = ""; this.baseAt = -1; this.baseNames = null; this.baseError = null;
+    this.baseText = ""; this.baseOwn = base; this.baseFilled = base; this.baseAt = -1; this.baseNames = null; this.baseError = null;
     this.baseInput.set_value(base);
     this.baseInput.set_selected_range({ start: 0, end: base.length });
     this.baseInput.focus();
@@ -235,17 +237,30 @@ export default class Changes extends View {
     return (this.baseNames ?? []).filter((n) => !text || n.toLowerCase().includes(text));
   }
 
-  // Enter takes the highlighted bookmark, else the typed revset. Tab copies
-  // the highlighted bookmark into the input to edit.
+  // As in a browser's address bar: ↑ and ↓ put the highlighted bookmark in
+  // the input to apply or edit, and past either end put back what was typed.
+  // The first match typing highlights is filled before either key moves on.
+  // Escape puts back what was typed, then closes. Enter takes the highlighted
+  // bookmark, else the input's text.
   baseKey(e, cx) {
     const shown = this.baseMatches(), n = shown.length;
-    if (e.key === "escape") this.editingBase = false;
+    if (e.key === "escape" && this.baseInput.value() !== this.baseOwn) this.fillBase(-1, shown);
+    else if (e.key === "escape") this.editingBase = false;
     else if (e.key === "enter") return this.setBase(this.baseAt >= 0 ? shown[this.baseAt] : this.baseInput.value(), cx);
-    else if ((e.key === "down" || e.key === "up") && n) this.baseAt = e.key === "down" ? (this.baseAt + 1) % n : (this.baseAt <= 0 ? n - 1 : this.baseAt - 1);
-    else if (e.key === "tab" && this.baseAt >= 0) { this.baseInput.set_value(shown[this.baseAt]); this.baseText = shown[this.baseAt]; this.baseAt = 0; }
+    else if ((e.key === "down" || e.key === "up") && this.baseAt >= 0 && this.baseInput.value() !== shown[this.baseAt]) this.fillBase(this.baseAt, shown);
+    else if (e.key === "down" && n) this.fillBase(this.baseAt + 1 < n ? this.baseAt + 1 : -1, shown);
+    else if (e.key === "up" && n) this.fillBase(this.baseAt > -1 ? this.baseAt - 1 : n - 1, shown);
     else return;
     cx.stop_propagation();
     cx.notify();
+  }
+
+  // Highlights row `i` and shows it in the input, or with -1 what was typed.
+  fillBase(i, shown) {
+    const text = i >= 0 ? shown[i] : this.baseOwn;
+    this.baseAt = i; this.baseFilled = text;
+    this.baseInput.set_value(text);
+    this.baseInput.set_selected_range({ start: text.length, end: text.length });
   }
 
   // Click selects one change, Shift-click adds a second to diff the pair.
@@ -495,7 +510,7 @@ export default class Changes extends View {
       .children(shown.map((name, i) => div().id(`changes-base-${name}`).h(24).flex_none().px(8).flex().items_center().rounded(6).truncate().text_size(12).cursor_pointer()
         .when(i === this.baseAt, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.setBase(name, cx)).child(name)))
       .when(Boolean(empty), (e) => e.child(div().px(8).py(4).text_size(11).text_color(this.baseError ? t.ansi1 : t.dim).child(empty)))
-      .child(div().px(8).pt(2).text_size(10).text_color(t.dim).child("↑↓ | Tab to edit | Enter to apply | <empty> for trunk()"));
+      .child(div().px(8).pt(2).text_size(10).text_color(t.dim).child("↑↓ to pick and edit | Enter to apply | <empty> for trunk()"));
   }
 
   // The stack, newest first, ending with the change it starts from, marked

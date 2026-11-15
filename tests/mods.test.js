@@ -691,7 +691,7 @@ test('the base picker lists the newest bookmarks, filters as you type and keeps 
   assert.equal(lastBase(h), '@ | ((trunk()).. & first_ancestors(@)) | heads(::@ & ::(trunk()))');
 });
 
-test('the base picker takes a typed revset, a bookmark copied with Tab and edited, a click, and Escape', async () => {
+test('the base picker takes a typed revset, fills the input as ↑↓ move like an address bar, takes a click, and Escape', async () => {
   const h = panel('/r/main', BOOKMARKS);
   await shown(h);
   click(h, 'changes-base');
@@ -700,10 +700,27 @@ test('the base picker takes a typed revset, a bookmark copied with Tab and edite
   pick(h, 'enter');
   await h.drain();
   assert.equal(lastBase(h), '@ | ((main-).. & first_ancestors(@)) | heads(::@ & ::(main-))');
+  // ↓ fills the input and keeps the list; past the end it puts back what was typed.
   click(h, 'changes-base');
   await h.drain();
-  h.inputs[1].emit('change', 'feat');
-  pick(h, 'tab');
+  h.inputs[1].emit('change', 'ma');
+  assert.ok(byId(h.render(), 'changes-base-main').calls.bg, 'typing highlights the first match');
+  pick(h, 'down');
+  assert.equal(h.inputs[1].value(), 'main', 'the first ↓ fills the highlighted match');
+  pick(h, 'down');
+  assert.equal(h.inputs[1].value(), 'main@origin');
+  assert.ok(byId(h.render(), 'changes-base-main'), 'the fill leaves the list as typed');
+  pick(h, 'down');
+  assert.equal(h.inputs[1].value(), 'ma');
+  pick(h, 'up');
+  assert.equal(h.inputs[1].value(), 'main@origin');
+  // Escape first puts back what was typed, leaving the picker open.
+  pick(h, 'escape');
+  assert.equal(h.inputs[1].value(), 'ma');
+  assert.ok(byId(h.render(), 'changes-base-picker'));
+  // A filled bookmark, edited, applies as typed.
+  h.inputs[1].emit('change', 'fe');
+  pick(h, 'up');
   assert.equal(h.inputs[1].value(), 'feat/x');
   h.inputs[1].emit('change', 'feat/x-');
   pick(h, 'enter');
@@ -711,8 +728,6 @@ test('the base picker takes a typed revset, a bookmark copied with Tab and edite
   assert.equal(lastBase(h), '@ | ((feat/x-).. & first_ancestors(@)) | heads(::@ & ::(feat/x-))');
   click(h, 'changes-base');
   await h.drain();
-  pick(h, 'down'); pick(h, 'down');
-  assert.ok(byId(h.render(), 'changes-base-main@origin').calls.bg);
   click(h, 'changes-base-feat/x');
   await h.drain();
   assert.deepEqual(bases(h), { '/r/main': 'feat/x' });

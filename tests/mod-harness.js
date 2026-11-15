@@ -57,7 +57,7 @@ export function load(name, data = {}) {
     View: class {}, div: element, v_flex: element, h_flex: element, svg: element, image: element,
     InputState: { new: ({ value = '' } = {}) => {
       const on = {};
-      const input = { value: () => value, set_value(next) { value = next; }, set_selected_range() {}, on(event, body) { on[event] = body; }, focus() {},
+      const input = { value: () => value, set_value(next) { value = next; on.change?.({}, cx); }, set_selected_range() {}, on(event, body) { on[event] = body; }, focus() {},
         emit(event, next) { if (next !== undefined) value = next; on[event]?.({}, cx); } };
       inputs.push(input);
       return input;
