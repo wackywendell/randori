@@ -31,7 +31,7 @@ Rename the standalone reference layout to `layouts/jj.json` and make `jj-tabs` l
 
 1. **Rename Reference Layout from `jj-tui` to `jj` and Drop `layouts/jj-tui.svg`:**
    Rename `layouts/jj-tui.json` to `layouts/jj.json`, delete `layouts/jj-tui.svg`, and omit the optional `"preview"` field (matching Herdr's shipped `main.json` so Herdr's Settings screen renders its native theme-aware layout wireframe) across the repository (`Justfile`, `README.md`, `scripts/app-trial.js`, `tests/mods.test.js`, and `design/`).
-2. **Derive Panel Buttons and `syncPanel` Allowlist from `panel-body` in `layout()`:**
+2. **Derive Panel Buttons from `panel-body` in `layout()`:**
    `jj-tabs` already inspects `const body = find(root, "panel-body")` on every render. Instead of hardcoding only `"files"` and `"changes"`, `jj-tabs` will inspect `body?.children ?? []`:
    - Built-in panel IDs (`"files"` and `"changes"`) keep their existing default labels (`"Files"`, `"Changes"`), icons (`"mods/files/file.svg"`, `"mods/changes/changes.svg"`), and `shared("workspace.panels")` toggle compatibility.
    - Any additional non-hidden block child in `panel-body` is automatically included in the enabled panel list and rendered as a `panelButton` in stack order, reading its display label from `child.content?.props?.label` (falling back to a capitalized `child.id`) and an optional `child.content?.props?.icon` (which may be an `.svg` asset path, a Unicode symbol/character, or omitted entirely).
@@ -43,7 +43,7 @@ Rename the standalone reference layout to `layouts/jj.json` and make `jj-tabs` l
 ## Goals
 
 - Name `randori`'s reference layout `layouts/jj.json` (`"name": "jj"`), reflecting that it is Herdr's standard layout with `jj` mods enabled.
-- Allow any layout using `jj-tabs` to mount additional panel mods in `panel-body` solely by adding a child block to the layout JSON, with full per-space panel memory in `syncPanel`.
+- Allow any layout using `jj-tabs` to mount additional panel mods in `panel-body` solely by adding a child block to the layout JSON. The open panel stays open as you switch spaces and tabs, as in Herdr's own tab bar, so no panel state is kept per space.
 - Preserve 100% backward compatibility with Herdr's `shared("workspace.panels")` setting for the built-in `"files"` and `"changes"` panels.
 - Keep `randori` completely agnostic of specific external mod packages; all composition happens through standard `herdr-app` layout nodes and block `props`.
 - Maintain low complexity: ~15 lines of pure helper logic in `mods/jj-tabs/main.js`, covered by unit tests in `tests/mods.test.js`.
@@ -58,7 +58,7 @@ Rename the standalone reference layout to `layouts/jj.json` and make `jj-tabs` l
 
 ### Failure Boundaries
 
-- **Missing `panel-body` or `panel` node in layout:** If a layout omits `panel` or `panel-body`, `jj-tabs` renders zero panel buttons and `syncPanel` is a no-op (existing behavior preserved).
+- **Missing `panel-body` or `panel` node in layout:** If a layout omits `panel` or `panel-body`, `jj-tabs` renders zero panel buttons and runs no layout command (existing behavior preserved).
 - **Missing block `props`:** If a custom child in `panel-body` omits `content.props.label` or `content.props.icon`, `jj-tabs` falls back deterministically to capitalizing `child.id` and rendering the button without an icon (or rendering `icon` as a text/Unicode glyph if it does not end in `.svg`).
 
 ### Non-Goals
@@ -121,10 +121,9 @@ function panelItems(body, enabledBuiltins = ["files", "changes"]) {
 
 During `Tabs.render()`:
 1. Compute `const panels = panel && body ? panelItems(body, shared("workspace.panels") ?? ["files", "changes"]) : [];`.
-2. Pass `panels.map(p => p.id)` to `this.syncPanel(space, panel, body, panels.map(p => p.id))` (which returns immediately when `!space || !panel || !body || !Array.isArray(body.children) || body.children.length === 0`) so `syncPanel` remembers and restores any panel present in `panel-body` per space.
-3. In `panelButton(id, label, icon)`, render `svg(icon).size(14)` when `icon` ends with `".svg"`, render `div().text_size(12).child(icon)` when `icon` is a non-empty symbol/glyph string, and omit the icon child when `icon` is `null`. Render `.children(panels.map(p => panelButton(p.id, p.label, p.icon)))` after the `+` new-tab button.
+2. In `panelButton(id, label, icon)`, render `svg(icon).size(14)` when `icon` ends with `".svg"`, render `div().text_size(12).child(icon)` when `icon` is a non-empty symbol/glyph string, and omit the icon child when `icon` is `null`. Render `.children(panels.map(p => panelButton(p.id, p.label, p.icon)))` after the `+` new-tab button.
 
-When `body.children` contains only `files` and `changes` (as in `layouts/jj.json`), `panelItems` produces the exact same two buttons and respects `shared("workspace.panels")`. When a layout adds another block to `panel-body`, `jj-tabs` automatically renders its toggle button in the order declared in `panel-body.children` and includes its `id` in per-space panel persistence.
+When `body.children` contains only `files` and `changes` (as in `layouts/jj.json`), `panelItems` produces the exact same two buttons and respects `shared("workspace.panels")`. When a layout adds another block to `panel-body`, `jj-tabs` automatically renders its toggle button in the order declared in `panel-body.children`.
 
 ### 3. Layout-Driven Menu Slots in `mods/jj-tabs/main.js`
 
@@ -159,7 +158,8 @@ In `layouts/jj.json`, both default to `"jj-menu"` and `"jj-new-menu"` with zero 
 2. **Modify `./mods/jj-tabs/main.js`**:
    - **What changes:**
      - Add `panelItems(body, enabledBuiltins)` (and export it for direct unit testing) to derive the active layout's panel list from `body?.children ?? []`: filtering built-in `"files"` and `"changes"` against `shared("workspace.panels") ?? ["files", "changes"]`, automatically including any additional non-hidden child block in `panel-body`, and reading `child.content?.props?.label` (fallback: capitalized `child.id`) and optional `child.content?.props?.icon` (`.svg` asset path, Unicode symbol string, or `null`).
-     - Pass `panels.map(p => p.id)` to `this.syncPanel(space, panel, body, panels.map(p => p.id))` and render `.children(panels.map(p => panelButton(p.id, p.label, p.icon)))`.
+     - Render `.children(panels.map(p => panelButton(p.id, p.label, p.icon)))`.
+     - Keep no per-space panel memory. Switching spaces or tabs runs no `layout.show`, `layout.hide` or `layout.select`, so whichever panel is open stays open, as in Herdr.
      - Resolve the right-click context menu mod via `props()?.menu ?? root?.terminal_menu ?? "jj-menu"` and the `+` new-tab menu mod via `props()?.newMenu ?? "jj-new-menu"`.
    - **Why:** Allows any layout using `jj-tabs` to add, remove, or reorder panel mods in `panel-body` and customize menu mods purely through layout JSON without forking `jj-tabs`.
 
@@ -170,7 +170,7 @@ In `layouts/jj.json`, both default to `"jj-menu"` and `"jj-new-menu"` with zero 
 4. **Modify `./tests/mods.test.js` and `./scripts/app-trial.js`**:
    - **What changes:**
      - Update layout path references in `./tests/mods.test.js` and `./scripts/app-trial.js` from `layouts/jj-tui.json` / `jj-tui` to `layouts/jj.json` / `jj`.
-     - Add unit tests in `./tests/mods.test.js` verifying that `jj-tabs` renders custom `panel-body` child blocks with their `props.label` and `props.icon`, persists and restores custom panel selection per space in `syncPanel` even when `shared("workspace.panels")` is `["files", "changes"]`, and respects `terminal_menu` / `props().newMenu` overrides.
+     - Add unit tests in `./tests/mods.test.js` verifying that `jj-tabs` renders custom `panel-body` child blocks with their `props.label` and `props.icon`, runs no layout command when switching spaces, and respects `terminal_menu` / `props().newMenu` overrides.
    - **Why:** Verifies backward compatibility with `layouts/jj.json` and tests layout-driven composition with third-party panels and menus.
 
 5. **Modify `./README.md` and `./design/jj-workspace-lifecycle.md`**:

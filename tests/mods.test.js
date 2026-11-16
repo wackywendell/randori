@@ -648,7 +648,7 @@ test('panelItems derives buttons from panel-body, gating built-ins on workspace.
   ]);
 });
 
-test('jj-tabs renders zero panel buttons and makes syncPanel a no-op when panel, panel-body, or panel-body.children is missing or empty', () => {
+test('jj-tabs renders zero panel buttons and runs nothing when panel, panel-body, or panel-body.children is missing or empty', () => {
   const panelIds = tree => nodes(tree).map(n => n.calls.id?.[0]).filter(id => id?.startsWith('panel-'));
   const layouts = [
     { id: 'root', type: 'row', children: [{ id: 'tabs', type: 'block', content: { mod: 'jj-tabs' } }] },
@@ -669,12 +669,10 @@ test('jj-tabs renders zero panel buttons and makes syncPanel a no-op when panel,
     });
     assert.deepEqual(panelIds(h.render()), []);
     assert.deepEqual(h.actions, []);
-    assert.deepEqual(plain(h.view.panels), {});
     s1.active = false;
     s2.active = true;
     assert.deepEqual(panelIds(h.render()), []);
     assert.deepEqual(h.actions, []);
-    assert.deepEqual(plain(h.view.panels), {});
   }
 });
 
@@ -706,7 +704,7 @@ test('jj-tabs offers the Files and Changes panels and renders custom panel-body 
   ]);
 });
 
-test('jj-tabs syncPanel remembers and restores a custom panel per space when workspace.panels is ["files", "changes"]', () => {
+test('jj-tabs leaves the open panel as it is when switching spaces, as Herdr does', () => {
   const panels = [
     { id: 'files', type: 'block', content: { mod: 'files' } },
     { id: 'changes', type: 'block', content: { mod: 'jj-changes' } },
@@ -723,22 +721,13 @@ test('jj-tabs syncPanel remembers and restores a custom panel per space when wor
     layout: tabsLayout({ panelHidden: false, activePanel: 'diff', panels }),
     shared: { 'workspace.panels': ['files', 'changes'] },
   });
-  h.render();
+  for (const layout of [tabsLayout({ panelHidden: false, activePanel: 'diff', panels }), tabsLayout({ panelHidden: true, activePanel: 'files', panels })]) {
+    h.state.layout = layout;
+    h.render();
+    [s1.active, s2.active] = [s2.active, s1.active];
+    h.render();
+  }
   assert.deepEqual(h.actions, []);
-  s1.active = false;
-  s2.active = true;
-  h.render();
-  assert.deepEqual(plain(h.actions), [{ name: 'layout.hide', args: { id: 'panel' } }]);
-  h.actions.length = 0;
-  h.state.layout = tabsLayout({ panelHidden: true, activePanel: 'files', panels });
-  h.render();
-  s2.active = false;
-  s1.active = true;
-  h.render();
-  assert.deepEqual(plain(h.actions), [
-    { name: 'layout.select', args: { stack: 'panel-body', child: 'diff' } },
-    { name: 'layout.show', args: { id: 'panel' } },
-  ]);
 });
 
 test('jj-tabs resolves tab context menu and new-tab menu from props and layout.terminal_menu', () => {
