@@ -156,7 +156,7 @@ Each mod starts as a `mod.clone` of the shipped mod it replaces, so it keeps Her
 | `jj-new-menu`  | `new-menu`  | jj spaces get New and Open workspace in place of New and Open worktree. Git spaces keep the shipped entries.                                      |
 | `jj-tabs`      | `tabs`      | The + button and a tab's right-click open the jj menus. The Changes button stays hidden until Stage 2.                                            |
 
-This repository's `jj-tui` layout mounts Herdr's own `agents` mod in the sidebar. From Stage 2 it puts `jj-changes` in the right panel stack's `changes` entry, which the tab bar's Changes button opens. The shipped `changes` mod is never mounted, so its Git poller never runs in jj checkouts.
+This repository's `jj` layout (`layouts/jj.json`) mounts Herdr's own `agents` mod in the sidebar. From Stage 2 it puts `jj-changes` in the right panel stack's `changes` entry, which the tab bar's Changes button opens. The shipped `changes` mod is never mounted, so its Git poller never runs in jj checkouts.
 
 Colors come from Herdr's theme. Status text and secondary labels use `dim` and `muted`. The status line's changed file count is bold in `working`, Herdr's color for agents at work, so edits in `@` stand out. Lines added use `ansi2` and lines removed use `ansi1`, the colors the shipped sidebar uses for commits ahead and behind and the shipped Changes panel uses for diff lines. Errors use `blocked`. Controls use the component library's lists, `Scrollbar`, `Input`, `Checkbox` and `Button`.
 
@@ -297,7 +297,7 @@ Settings are props on the `jj-spaces` block in whichever layout shows the sideba
 }
 ```
 
-This repository's `jj-tui` layout uses these defaults. Installing copies it into `~/.config/herdr-app/layouts/`, replacing an edited copy. A personal layout kept elsewhere, such as in dotfiles and linked in, keeps its own settings, such as `links` for `AGENTS.local.md` and `mise.toml`.
+This repository's `jj` layout uses these defaults. Installing copies it into `~/.config/herdr-app/layouts/`, replacing an edited copy. A personal layout kept elsewhere, such as in dotfiles and linked in, keeps its own settings, such as `links` for `AGENTS.local.md` and `mise.toml`.
 
 ### Stages
 
@@ -573,7 +573,7 @@ if(current_working_copy,
 - Type. Mod, existing copy of `tabs`.
 - Change. Keep the + and right-click overlays on `jj-new-menu` and `jj-menu` and the panel list `["files"]`. Confirm the copy matches the current shipped `tabs` apart from these three lines.
 
-#### 10. `layouts/jj-tui.json` (Modify)
+#### 10. `layouts/jj.json` (Modify)
 
 - Type. Layout.
 - Change. Mount `agents` in place of `jj-agents`. Give the `jj-spaces` block the default props from the Settings section.
@@ -609,7 +609,7 @@ if(current_working_copy,
 #### 16. `Justfile`, `scripts/check-mods.js` (Modify)
 
 - Type. Task configuration.
-- Change. Remove `build` and the Cargo steps. `test` runs `node --test tests/*.test.js`. `verify` runs `test`, `check-mods` and `node --check` on every script and mod file. `bench` runs `node scripts/bench.js`. Add `install`, copying `mods/jj-*` and `layouts/jj-tui.*` into `${HERDR_APP_HOME:-~/.config/herdr-app}`.
+- Change. Remove `build` and the Cargo steps. `test` runs `node --test tests/*.test.js`. `verify` runs `test`, `check-mods` and `node --check` on every script and mod file. `bench` runs `node scripts/bench.js`. Add `install-mods` and `install`, copying `mods/jj-*` and `layouts/jj.json` into `${HERDR_APP_HOME:-~/.config/herdr-app}`.
 - Change. `scripts/check-mods.js` also fails when the `identity()`, `joinPath()` and `visible()` source in any mod's `jj.js` differs from `mods/jj-spaces/jj.js`.
 
 #### 17. `.tool-versions`, `.envrc`, `.gitignore` (Modify)
@@ -668,7 +668,7 @@ json({"commit" => commit_id, "change" => change_id.short(),
 - Change. On open, run the `open` action's `workspace list` read in `main` and record each listed workspace's name, matched by root, and its root, `main`, the machine and the space's ID. Enter runs the Finish section's steps on the checked names not yet removed. Step 2 runs `terminal.kill {terminal}` for each terminal in `terminals()` inside a checked root, waits up to 10,000 ms for them to leave `terminals()`, then runs `space.close {id, confirmed: true}` when the recorded space has no terminals and `pane.close {pane}` for any remaining pane showing an ended terminal. Step 3 runs `jj workspace remove <name>` in `main`, one name at a time, with a 600,000 ms timeout, and marks each name removed.
 - Change. The first failure stops the run and shows its message beside the name.
 
-#### 23. `mods/jj-menu/main.js`, `mods/jj-tabs/main.js`, `layouts/jj-tui.json` (Modify)
+#### 23. `mods/jj-menu/main.js`, `mods/jj-tabs/main.js`, `layouts/jj.json` (Modify)
 
 - Type. Mods and layout.
 - Change. `jj-menu` adds Finish workspace for spaces with a terminal in a linked workspace. `jj-tabs` restores the panel list `["files", "changes"]`. The layout adds a `changes` entry to `panel-body` mounting `jj-changes`.

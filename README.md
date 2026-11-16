@@ -8,16 +8,16 @@ The mods are copies of Herdr 0.1.15's shipped mods with jj added. `jj-spaces` co
 
 ```sh
 just install
-herdr-app do layout.switch '{"name":"jj-tui"}'
+herdr-app do layout.switch '{"name":"jj"}'
 ```
 
-`just install` copies each `mods/jj-*` folder and `layouts/jj-tui.json` and `layouts/jj-tui.svg` into `${HERDR_APP_HOME:-~/.config/herdr-app}`, replacing earlier copies of those project-owned names. It leaves Herdr's shipped mods and layouts unchanged. Switch back with `herdr-app do layout.switch '{"name":"main"}'`.
+`just install` copies each `mods/jj-*` folder and `layouts/jj.json` into `${HERDR_APP_HOME:-~/.config/herdr-app}`, replacing earlier copies of those project-owned names. `just install-mods` copies only the `mods/jj-*` folders, for custom layouts that mount them directly. Both leave Herdr's shipped mods and layouts unchanged. Switch back with `herdr-app do layout.switch '{"name":"main"}'`.
 
 The layout mounts Herdr's own `agents` list, the Files panel and the `jj-changes` panel. Key bindings for the agents list are the shipped `agents` mod's.
 
 ## Settings
 
-Settings are props on blocks of the installed `layouts/jj-tui.json`. New workspace reads the `jj-spaces` block's props each time it runs, and the Changes panel reads the `jj-changes` block's props each time it reads the stack.
+Settings are props on blocks of the installed `layouts/jj.json`. New workspace reads the `jj-spaces` block's props each time it runs, and the Changes panel reads the `jj-changes` block's props each time it reads the stack.
 
 | Prop        | Default                            | Meaning                                                                                                                 |
 | ----------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -26,6 +26,8 @@ Settings are props on blocks of the installed `layouts/jj-tui.json`. New workspa
 | `miseTrust` | `true`                             | Run `mise trust` on each linked mise configuration file, when `mise --version` succeeds.                               |
 | `idLength`  | `6`                                | On the `jj-changes` block, the fewest characters the Changes panel shows of a change ID.                               |
 | `rows`      | `"full"`                           | On the `jj-changes` block, `"full"` puts each change's description on a second line under its ID, bookmarks and counts. `"compact"` keeps each change on one line. |
+
+In custom layouts using `jj-tabs`, the tab bar discovers panel toggle buttons from the `panel-body` stack's non-hidden child blocks. The built-in `files` and `changes` panels follow `workspace.panels`, while any additional block is shown in stack order using `content.props.label` (defaulting to its capitalized `id`) and optional `content.props.icon` (an `.svg` path or a symbol string). Tab right-clicks open the `jj-tabs` block's `props.menu`, `terminal_menu` at the layout root, or `"jj-menu"`, and the `+` button opens `props.newMenu` or `"jj-new-menu"`.
 
 ## New and Open workspace
 

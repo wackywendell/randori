@@ -50,10 +50,9 @@ if (command === 'prepare') {
   await fs.writeFile(path.join(app, 'settings.json'), JSON.stringify({ core, telemetry: false, sounds: { enabled: false } }));
   for (const name of await fs.readdir('mods')) await fs.cp(path.join('mods', name), path.join(app, 'mods', name), { recursive: true });
   // The panel block mounts trial-changes, jj-changes with the trial's selection.
-  const layout = await fs.readFile('layouts/jj-tui.json', 'utf8');
+  const layout = await fs.readFile('layouts/jj.json', 'utf8');
   assert.ok(layout.includes('"mod": "jj-changes"'));
-  await fs.writeFile(path.join(app, 'layouts/jj-tui.json'), layout.replace('"mod": "jj-changes"', '"mod": "trial-changes"'));
-  await fs.copyFile('layouts/jj-tui.svg', path.join(app, 'layouts/jj-tui.svg'));
+  await fs.writeFile(path.join(app, 'layouts/jj.json'), layout.replace('"mod": "jj-changes"', '"mod": "trial-changes"'));
   // trial-launcher opens the dialog request.json names. trial-new is
   // jj-workspace with the name typed in and Enter pressed, so no key
   // automation touches the display.
@@ -241,7 +240,7 @@ if (command === 'run') {
 } else if (command === 'status') {
   console.log(execute(config.binary, ['status']));
 } else if (command === 'resources') {
-  appCommand('layout.switch', { name: 'jj-tui' });
+  appCommand('layout.switch', { name: 'jj' });
   execute('jj', ['git', 'init', '--quiet', main]);
   for (const [key, value] of [['user.name', 'Fixture'], ['user.email', 'fixture@example.invalid'], ['signing.behavior', 'drop']]) execute('jj', ['config', 'set', '--repo', key, value], main);
   await fs.writeFile(path.join(main, 'file'), 'one\ntwo\n');

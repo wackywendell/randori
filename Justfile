@@ -13,11 +13,18 @@ verify: test check-mods
 bench:
     node scripts/bench.js
 
-# Copies the mods and layout into the Herdr app home.
-install:
+# Copies the jj mods into the Herdr app home.
+install-mods:
     #!/usr/bin/env sh
     set -eu
     dest="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
-    mkdir -p "$dest/mods" "$dest/layouts"
+    mkdir -p "$dest/mods"
     for m in mods/jj-*; do rm -rf "$dest/$m"; cp -R "$m" "$dest/mods/"; done
-    cp layouts/jj-tui.json layouts/jj-tui.svg "$dest/layouts/"
+
+# Copies the mods and layout into the Herdr app home.
+install: install-mods
+    #!/usr/bin/env sh
+    set -eu
+    dest="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+    mkdir -p "$dest/layouts"
+    cp layouts/jj.json "$dest/layouts/"

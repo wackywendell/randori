@@ -189,6 +189,5 @@
     "name": "main",
     "version": "0.1.14"
   },
-  "preview": "layouts/jj-tui.svg",
   "terminal_menu": "jj-menu"
 }

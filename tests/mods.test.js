@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { load, byId, words, nodes } from './mod-harness.js';
 
 const ok = stdout => ({ code: 0, stdout, stderr: '' });
@@ -571,18 +572,196 @@ test('the New menu opens jj-workspace from a jj checkout', async () => {
 // Layout
 
 test('the layout mounts Herdr\u2019s agents list and no Git poller, with settings on jj-spaces', () => {
-  const layout = JSON.parse(readFileSync(new URL('../layouts/jj-tui.json', import.meta.url)));
+  const layout = JSON.parse(readFileSync(new URL('../layouts/jj.json', import.meta.url)));
   const blocks = [];
   const walk = node => { if (node.content?.mod) blocks.push(node.content); (node.children ?? []).forEach(walk); };
   walk(layout);
   const mods = blocks.map(b => b.mod);
   for (const m of ['jj-spaces', 'agents', 'jj-tabs', 'jj-changes']) assert.ok(mods.includes(m), m);
   assert.equal(mods.includes('changes'), false);
+  assert.equal('preview' in layout, false);
   assert.deepEqual(blocks.find(b => b.mod === 'jj-spaces').props, { directory: '~/.herdr/worktrees/{repo}/{name}', links: [], miseTrust: true });
 });
 
-test('jj-tabs offers the Files and Changes panels', () => {
-  assert.match(readFileSync(new URL('../mods/jj-tabs/main.js', import.meta.url), 'utf8'), /const enabled = shared\("workspace.panels"\) \?\? \["files", "changes"\];/);
+function loadPanelItems() {
+  const src = readFileSync(new URL('../mods/jj-tabs/main.js', import.meta.url), 'utf8')
+    .replace(/^import .*;\n/gm, '')
+    .replace('export default class ', 'class ')
+    .replace(/^export /gm, '');
+  return vm.runInNewContext(`${src}\npanelItems`, { View: class {}, ScrollHandle: { new: () => ({}) } });
+}
+
+function tabsLayout({ panelHidden = true, activePanel = 'files', panels, terminalMenu, tabProps } = {}) {
+  const children = panels ?? [
+    { id: 'files', type: 'block', content: { mod: 'files' } },
+    { id: 'changes', type: 'block', content: { mod: 'jj-changes' } },
+  ];
+  return {
+    id: 'root',
+    type: 'row',
+    ...(terminalMenu !== undefined ? { terminal_menu: terminalMenu } : {}),
+    children: [
+      { id: 'tabs', type: 'block', content: { mod: 'jj-tabs', ...(tabProps ? { props: tabProps } : {}) } },
+      {
+        id: 'panel',
+        type: 'column',
+        hidden: panelHidden,
+        children: [{ id: 'panel-body', type: 'stack', active: activePanel, children }],
+      },
+    ],
+  };
+}
+
+function tabsWith(data = {}) {
+  return load('jj-tabs', {
+    spaces: [{ id: 's1', active: true, tabs: [{ id: 't1', name: 'shell', active: true }] }],
+    panes: [{ pane: 'p1', tab: 't1', terminal: 'term1', program: { shell: true } }],
+    layout: tabsLayout(),
+    ...data,
+  });
+}
+
+test('panelItems derives buttons from panel-body, gating built-ins on workspace.panels and including custom blocks', () => {
+  const panelItems = loadPanelItems();
+  assert.deepEqual(plain(panelItems(null, ['files', 'changes'])), []);
+  assert.deepEqual(plain(panelItems({}, ['files', 'changes'])), []);
+  assert.deepEqual(plain(panelItems({ children: [] }, ['files'])), []);
+  const body = {
+    children: [
+      { id: 'files', type: 'block', content: { mod: 'files' } },
+      { id: 'changes', type: 'block', content: { mod: 'jj-changes' } },
+      { id: 'diff', type: 'block', content: { mod: 'diff-panel', props: { label: 'Diff', icon: '≋' } } },
+      { id: 'notes', type: 'block', content: { mod: 'notes' } },
+      { id: 'graph', type: 'block', content: { mod: 'graph', props: { label: 'Graph', icon: 'mods/graph/g.svg' } } },
+      { id: 'constructor', type: 'block', content: { mod: 'ctor' } },
+      { id: 'toString', type: 'block', content: { mod: 'tostr', props: { label: 'ToString' } } },
+      { id: 'secret', type: 'block', hidden: true, content: { mod: 'secret', props: { label: 'Secret' } } },
+    ],
+  };
+  assert.deepEqual(plain(panelItems(body, ['files'])), [
+    { id: 'files', label: 'Files', icon: 'mods/files/file.svg' },
+    { id: 'diff', label: 'Diff', icon: '≋' },
+    { id: 'notes', label: 'Notes', icon: null },
+    { id: 'graph', label: 'Graph', icon: 'mods/graph/g.svg' },
+    { id: 'constructor', label: 'Constructor', icon: null },
+    { id: 'toString', label: 'ToString', icon: null },
+  ]);
+});
+
+test('jj-tabs renders zero panel buttons and makes syncPanel a no-op when panel, panel-body, or panel-body.children is missing or empty', () => {
+  const panelIds = tree => nodes(tree).map(n => n.calls.id?.[0]).filter(id => id?.startsWith('panel-'));
+  const layouts = [
+    { id: 'root', type: 'row', children: [{ id: 'tabs', type: 'block', content: { mod: 'jj-tabs' } }] },
+    { id: 'root', type: 'row', children: [{ id: 'tabs', type: 'block', content: { mod: 'jj-tabs' } }, { id: 'panel', type: 'column', hidden: false, children: [] }] },
+    tabsLayout({ panelHidden: false, activePanel: 'files', panels: [] }),
+  ];
+  for (const layout of layouts) {
+    const s1 = { id: 's1', active: true, tabs: [{ id: 't1', name: 'shell', active: true }] };
+    const s2 = { id: 's2', active: false, tabs: [{ id: 't2', name: 'shell', active: true }] };
+    const h = tabsWith({
+      spaces: [s1, s2],
+      panes: [
+        { pane: 'p1', tab: 't1', terminal: 'term1', program: { shell: true } },
+        { pane: 'p2', tab: 't2', terminal: 'term2', program: { shell: true } },
+      ],
+      layout,
+      shared: { 'workspace.panels': ['files', 'changes'] },
+    });
+    assert.deepEqual(panelIds(h.render()), []);
+    assert.deepEqual(h.actions, []);
+    assert.deepEqual(plain(h.view.panels), {});
+    s1.active = false;
+    s2.active = true;
+    assert.deepEqual(panelIds(h.render()), []);
+    assert.deepEqual(h.actions, []);
+    assert.deepEqual(plain(h.view.panels), {});
+  }
+});
+
+test('jj-tabs offers the Files and Changes panels and renders custom panel-body blocks', () => {
+  const panels = [
+    { id: 'files', type: 'block', content: { mod: 'files' } },
+    { id: 'changes', type: 'block', content: { mod: 'jj-changes' } },
+    { id: 'diff', type: 'block', content: { mod: 'diff-panel', props: { label: 'Diff', icon: '≋' } } },
+    { id: 'notes', type: 'block', content: { mod: 'notes' } },
+    { id: 'graph', type: 'block', content: { mod: 'graph', props: { label: 'Graph', icon: 'mods/graph/g.svg' } } },
+  ];
+  const h = tabsWith({
+    layout: tabsLayout({ panels }),
+    shared: { 'workspace.panels': ['files', 'changes'] },
+  });
+  const tree = h.render();
+  assert.deepEqual(words(byId(tree, 'panel-files')), ['Files']);
+  assert.deepEqual(words(byId(tree, 'panel-changes')), ['Changes']);
+  assert.deepEqual(words(byId(tree, 'panel-diff')), ['≋', 'Diff']);
+  assert.equal(byId(tree, 'panel-diff')._children[0].calls.text_size[0], 12);
+  assert.deepEqual(words(byId(tree, 'panel-notes')), ['Notes']);
+  assert.equal(byId(tree, 'panel-notes')._children.length, 1);
+  assert.deepEqual(words(byId(tree, 'panel-graph')), ['Graph']);
+  assert.equal(byId(tree, 'panel-graph')._children[0].calls.size[0], 14);
+  byId(tree, 'panel-diff').handlers.on_click({}, h.cx);
+  assert.deepEqual(plain(h.actions), [
+    { name: 'layout.select', args: { stack: 'panel-body', child: 'diff' } },
+    { name: 'layout.show', args: { id: 'panel' } },
+  ]);
+});
+
+test('jj-tabs syncPanel remembers and restores a custom panel per space when workspace.panels is ["files", "changes"]', () => {
+  const panels = [
+    { id: 'files', type: 'block', content: { mod: 'files' } },
+    { id: 'changes', type: 'block', content: { mod: 'jj-changes' } },
+    { id: 'diff', type: 'block', content: { mod: 'diff-panel', props: { label: 'Diff', icon: '≋' } } },
+  ];
+  const s1 = { id: 's1', active: true, tabs: [{ id: 't1', name: 'shell', active: true }] };
+  const s2 = { id: 's2', active: false, tabs: [{ id: 't2', name: 'shell', active: true }] };
+  const h = tabsWith({
+    spaces: [s1, s2],
+    panes: [
+      { pane: 'p1', tab: 't1', terminal: 'term1', program: { shell: true } },
+      { pane: 'p2', tab: 't2', terminal: 'term2', program: { shell: true } },
+    ],
+    layout: tabsLayout({ panelHidden: false, activePanel: 'diff', panels }),
+    shared: { 'workspace.panels': ['files', 'changes'] },
+  });
+  h.render();
+  assert.deepEqual(h.actions, []);
+  s1.active = false;
+  s2.active = true;
+  h.render();
+  assert.deepEqual(plain(h.actions), [{ name: 'layout.hide', args: { id: 'panel' } }]);
+  h.actions.length = 0;
+  h.state.layout = tabsLayout({ panelHidden: true, activePanel: 'files', panels });
+  h.render();
+  s2.active = false;
+  s1.active = true;
+  h.render();
+  assert.deepEqual(plain(h.actions), [
+    { name: 'layout.select', args: { stack: 'panel-body', child: 'diff' } },
+    { name: 'layout.show', args: { id: 'panel' } },
+  ]);
+});
+
+test('jj-tabs resolves tab context menu and new-tab menu from props and layout.terminal_menu', () => {
+  const h1 = tabsWith({ layout: tabsLayout() });
+  const t1 = h1.render();
+  byId(t1, 'tab-t1').handlers['on_mouse_down:right']({}, h1.cx);
+  byId(t1, 'tab-new').handlers.on_click({}, h1.cx);
+  assert.deepEqual(h1.overlays.map(o => o.mod), ['jj-menu', 'jj-new-menu']);
+
+  const h2 = tabsWith({ layout: tabsLayout({ terminalMenu: 'root-menu' }) });
+  const t2 = h2.render();
+  byId(t2, 'tab-t1').handlers['on_mouse_down:right']({}, h2.cx);
+  byId(t2, 'tab-new').handlers.on_click({}, h2.cx);
+  assert.deepEqual(h2.overlays.map(o => o.mod), ['root-menu', 'jj-new-menu']);
+
+  const h3 = tabsWith({
+    layout: tabsLayout({ terminalMenu: 'root-menu' }),
+    props: { menu: 'prop-menu', newMenu: 'prop-new-menu' },
+  });
+  const t3 = h3.render();
+  byId(t3, 'tab-t1').handlers['on_mouse_down:right']({}, h3.cx);
+  byId(t3, 'tab-new').handlers.on_click({}, h3.cx);
+  assert.deepEqual(h3.overlays.map(o => o.mod), ['prop-menu', 'prop-new-menu']);
 });
 
 // The changes panel, shown in the panel stack beside Files.
