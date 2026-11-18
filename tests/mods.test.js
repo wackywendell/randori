@@ -211,6 +211,21 @@ test('a narrow sidebar finds checkouts but reads no status lines', async () => {
   assert.ok(h.calls.some(isLog));
 });
 
+test('a space you are not on ends with a filled mark when its agents need you and a hollow one while they work', async () => {
+  for (const layout of [sidebar(), sidebar({ size: { px: 100 } })]) {
+    const h = spacesWith([['s1', '/g'], ['s2', '/g'], ['s3', '/g'], ['s4', '/g'], ['s5', '/g']], world(), { layout });
+    const status = { s1: 'working', s2: 'blocked', s3: 'done', s4: 'working', s5: 'idle' };
+    h.state.spaces = h.state.spaces.map(s => ({ ...s, status: status[s.id], active: s.id === 's4' }));
+    await settle(h);
+    const marks = id => row(h, id).filter(w => w === '\u25cf' || w === '\u25cb');
+    assert.deepEqual(marks('s1'), ['\u25cb']);
+    assert.deepEqual(marks('s2'), ['\u25cf']);
+    assert.deepEqual(marks('s3'), ['\u25cf']);
+    assert.deepEqual(marks('s4'), [], 'the shown space has no mark');
+    assert.deepEqual(marks('s5'), []);
+  }
+});
+
 test('status reads run one at a time', async () => {
   let inFlight = 0, most = 0;
   const w = world(async (cmd, args) => {

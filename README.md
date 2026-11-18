@@ -1,6 +1,6 @@
 # Randori
 
-Randori is six JavaScript mods and one layout that give each jj workspace its own space in Herdr. A linked workspace's space sits under its main checkout's space, every jj space shows a status line with its nearest bookmark and its changes in `@`, and a Changes panel shows the stack and opens its diffs in a pane beside your terminal. Herdr runs the mods, and no separate program is needed.
+Randori is six JavaScript mods and one layout that give each jj workspace its own space in Herdr. A linked workspace's space sits under its main checkout's space, every jj space shows a status line with its nearest bookmark and its changes in `@`, a space you aren't on ends with `●` when its agents need you or `○` while they work, and a Changes panel shows the stack and opens its diffs in a pane beside your terminal. Herdr runs the mods, and no separate program is needed.
 
 The mods are copies of Herdr 0.1.15's shipped mods with jj added. `jj-spaces` comes from `spaces`, `jj-workspace` from `worktree`, `jj-menu` from `menu`, `jj-new-menu` from `new-menu`, `jj-tabs` from `tabs` and `jj-changes` from `changes`. Folders outside jj keep the shipped Git behavior. The [jj workspace lifecycle design](design/jj-workspace-lifecycle.md) explains the architecture and the staged plan. [Contributor guidance](AGENTS.md) covers project goals and development rules.
 

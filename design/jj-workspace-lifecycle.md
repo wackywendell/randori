@@ -149,7 +149,7 @@ Each mod starts as a `mod.clone` of the shipped mod it replaces, so it keeps Her
 
 | Project mod    | Copied from | What changes                                                                                                                                       |
 | -------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `jj-spaces`    | `spaces`    | Repository identity comes from jj, with the shipped Git check as fallback. jj spaces show a status line in place of a branch. Right-click opens `jj-menu`. |
+| `jj-spaces`    | `spaces`    | Repository identity comes from jj, with the shipped Git check as fallback. jj spaces show a status line in place of a branch. Spaces you aren't on show their agents' state in the wide sidebar too, as a hollow mark while they work. Right-click opens `jj-menu`. |
 | `jj-changes`   | `changes`   | jj checkouts get the stack, two-change selection and jj data, with no timer, no file watch and no commit bar. Git-only repositories keep the shipped Git behavior. |
 | `jj-workspace` | `worktree`  | New, Open and Finish workspace dialogs for jj spaces, with the worktree dialog's layout, input, filtered list, key hints and busy spinner.        |
 | `jj-menu`      | `menu`      | jj spaces get New, Open and Finish workspace where the shipped menu shows its worktree entries. Git spaces keep the shipped worktree entries.     |
