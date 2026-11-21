@@ -2,7 +2,7 @@
 
 Randori is six JavaScript mods and one layout that give each jj workspace its own space in Herdr. A linked workspace's space sits under its main checkout's space, every jj space shows a status line with its nearest bookmark and its changes in `@`, a space you aren't on ends with `●` when its agents need you or `○` while they work, and a Changes panel shows the stack and opens its diffs in a pane beside your terminal. Herdr runs the mods, and no separate program is needed.
 
-The mods are copies of Herdr 0.1.15's shipped mods with jj added. `jj-spaces` comes from `spaces`, `jj-workspace` from `worktree`, `jj-menu` from `menu`, `jj-new-menu` from `new-menu`, `jj-tabs` from `tabs` and `jj-changes` from `changes`. Folders outside jj keep the shipped Git behavior. The [jj workspace lifecycle design](design/jj-workspace-lifecycle.md) explains the architecture and the staged plan. [Contributor guidance](AGENTS.md) covers project goals and development rules.
+The mods are copies of Herdr 0.1.15's shipped mods with jj added. `jj-spaces` comes from `spaces`, `jj-workspace` from `worktree`, `jj-menu` from `menu`, `jj-new-menu` from `new-menu`, `jj-tabs` from `tabs` and `jj-changes` from `changes`. Folders outside jj keep the shipped Git behavior. The [jj workspace lifecycle design](design/jj-workspace-lifecycle.md) and [jj workspace dialogs and menus design](design/jj-workspace-dialog.md) explain the architecture and UX contracts. [Contributor guidance](AGENTS.md) covers project goals and development rules.
 
 ## Install
 
@@ -29,13 +29,25 @@ Settings are props on blocks of the installed `layouts/jj.json`. New workspace r
 
 In custom layouts using `jj-tabs`, the tab bar discovers panel toggle buttons from the `panel-body` stack's non-hidden child blocks. The built-in `files` and `changes` panels follow `workspace.panels`, while any additional block is shown in stack order using `content.props.label` (defaulting to its capitalized `id`) and optional `content.props.icon` (an `.svg` path or a symbol string). The open panel stays open as you switch spaces and tabs, as in Herdr. Tab right-clicks open the `jj-tabs` block's `props.menu`, `terminal_menu` at the layout root, or `"jj-menu"`, and the `+` button opens `props.newMenu` or `"jj-new-menu"`.
 
-## New and Open workspace
+## New and Open jj workspace
 
-Right-click a jj space, or open the tab bar's + menu from a jj checkout, and choose New workspace… or Open workspace….
+Right-click a jj space, open the tab bar's `+` menu from a space with any jj checkout, and choose `New jj workspace…` or `Open jj workspace…`. You can also bind a key in `~/.config/herdr-app/keys.json` to open the dialog directly:
 
-New workspace asks for a name and shows the folder it will use and what the checkout starts from. A name matching a local bookmark starts on that bookmark. Any other name starts from the current checkout's parent, jj's default. Enter makes the folder's parent, runs `jj workspace add`, links each `links` path that exists in the main checkout and is absent from the new one, trusts linked mise files, and opens a space on the new checkout. jj's error stays in the dialog when it refuses. A skipped or failed link shows one notification naming each path, and the space still opens.
+```json
+{
+  "global": {
+    "cmd-shift-n": "mod.open:jj-workspace"
+  }
+}
+```
 
-Open workspace lists the repository's workspaces, main checkout first, filtered as you type. Enter selects the space already on that workspace, or opens a new one. A workspace created before jj 0.38 has no recorded folder and shows as unavailable.
+`New` and `Open` share one `jj workspace` dialog (`560x480`). Press `Tab` or `Shift+Tab` (or click `New` or `Open` in the header) to switch views while keeping your typed text and chosen repository.
+
+- On open, the dialog probes only the target space's folders and lists every jj repository found there in tab order, highlighting the focused pane's repository first. A trailing row (`Repositories in N other spaces`) expands lazily to repositories open in other spaces (including remote machines) and stays expanded across `Tab` switches during that dialog session.
+- In `New`, `↑` and `↓` move through repositories only, while typing sets the workspace name and shows the filled destination folder and start revision. A name matching a local bookmark starts on that bookmark; any other name starts from the chosen checkout's parent (`@-`). If the typed name already exists in the chosen repository, the detail line says so and `Enter` (or `Shift+Enter`) opens that workspace without running `jj workspace add`.
+- In `Open`, workspaces are grouped by repository (main checkout first) and filtered as you type. Workspaces already open in a dedicated space show `open`, and those open in a tab of another space show `open in <space>`. Workspaces created before jj 0.38 record no folder and show as `unavailable`.
+- `Enter` selects an existing terminal pane working in that checkout (preferring a dedicated space, else switching to the matching space and tab) or opens a new nested space. `Shift+Enter` opens a new tab in the target space whenever the chosen repository lives on the target space's machine (naming a main-checkout tab after the repository name); for a repository on a different machine, `Shift+Enter` leaves the dialog open with an inline error.
+- Creating a workspace makes the parent folder, runs `jj workspace add`, links each `links` path present in the main checkout and absent from the new checkout, runs `mise trust` on linked mise files when `mise` is available, and opens the new space or tab. jj's error stays in the dialog when it refuses; skipped or failed links appear in one `New jj workspace` warning notification while the space or tab still opens.
 
 ## Status lines
 
@@ -67,19 +79,21 @@ The panel edits the stack with one jj command per click, and shows jj's error wh
 
 When both changes have descriptions, squash joins them with a blank line, the text jj's editor would start with. The base row has no buttons, and its menu only copies its ID. `↓` is left off the change above the base.
 
-## Finish workspace
+## Finish jj workspace
 
-Finish workspace, in the menu of a space with a terminal in a linked workspace, removes workspaces and their folders. Close stays as it is and deletes nothing.
+`Finish jj workspace` removes linked workspaces and their folders. It appears in a tab's right-click menu when any terminal pane in that tab works in a linked jj workspace, and in a space's right-click menu when any terminal pane in that space works in a linked jj workspace. Ordinary `Close` stays non-destructive.
 
-The dialog lists each linked workspace a terminal of the space works in, with its folder, in tab order. The first is checked. Space checks or unchecks the selected row, and the arrow keys move between rows. Under a checked workspace, a line names any other space with a terminal there, since those terminals end too.
+- From a tab right-click, the window lists only that tab's linked workspaces, all checked.
+- From a space right-click, the window lists every linked workspace across all repositories in the space (labeled `<repo> / <workspace>` when multiple repositories appear), with only the active tab's linked workspaces checked (zero checked if the active tab is outside any linked workspace, in which case `Enter` is a no-op).
+- `Space` toggles the selected row and arrow keys move between rows. Under every checked row, a line names every individual terminal that will end with its tab, other space, `parked`, or `child of <parent>` context.
 
-Enter runs three steps on the checked workspaces.
+`Enter` runs three steps on the checked workspaces.
 
-1. It confirms jj still lists each one at its folder, then runs `jj status` in each. That snapshots edits and fails on a held lock, a stale workspace or a missing folder. A held lock fails after 10 seconds.
-2. It ends every terminal working in those folders, including parked ones, and waits up to 10 seconds for them to stop. Herdr closes their panes, and a space with none left.
-3. It runs `jj workspace remove` for one workspace at a time.
+1. Check. It reads `jj workspace list` once per checked repository, confirms each workspace still maps to its folder, refuses any checked folder containing another known workspace root, and runs `jj status` (10 s timeout) in each checked checkout.
+2. Verify and end terminals. It re-evaluates the affected terminals immediately before killing and refuses if any new terminal appeared after preview (asking you to review and press `Enter` again). Otherwise it kills every direct terminal in the checked checkouts and waits up to 10 seconds for them to stop (Herdr Core ends non-outliving child terminals). It closes the target space only when no panes of any kind remain outside the ended terminals, and closes any remaining panes showing ended terminals.
+3. Remove. It runs `jj workspace remove` sequentially from each checked workspace's own main checkout.
 
-Edits jj tracks stay in the repository, in the workspace's last change. Files jj does not track, including ignored files, are deleted with the folder. The first failure stops Finish and shows its message beside the workspace's name, and nothing after it runs. Enter then starts again with the workspaces not yet removed. The dialog is a window, so it stays open while its space closes, and closes when every checked workspace is removed.
+Edits jj tracks stay in the repository, in the workspace's last change. Files jj does not track, including ignored files, are deleted with the folder. The first failure stops Finish and shows its message beside the workspace's name, and nothing after it runs. `Enter` then starts again with the workspaces not yet removed. The dialog is a window overlay, so it stays open while its space closes, and closes once every checked workspace is removed.
 
 ## Develop and verify
 
@@ -101,6 +115,6 @@ just bench
 - The tested versions are jj 0.47.1 and Herdr 0.1.15 on macOS. One hand-run trial covered a Linux remote machine. Herdr on Linux is untested.
 - Install the mods only where the Herdr app runs. A remote machine needs `jj` on the `PATH` its herdr-core starts with, which can differ from your login shell's. Hunk and mise there are optional. A folder inside a jj checkout where `jj` cannot start shows `no jj`, with the reason in its tooltip.
 - On another machine the status line refreshes after agent turns and every 30 seconds, and the Changes panel only when shown or when you press refresh. jj commands you run there show up then.
-- The native trial covers New and Open workspace, nesting and a status line refresh after an operation. The Changes panel's native trial covers showing it, the snapshot of an unrecorded edit, a FROM and TO pair, the reread after a jj operation the pair opening whole in Hunk in a split pane, a second file moving that window to it, `q` closing it and the next click opening a new one. The trial selects the pair and the file from a test subclass, so clicks are covered by fake tests only. The `jj diff` pane used without Hunk, and replacing a pane, are covered by fake tests only. The refresh after an agent's turn is covered by fake tests only. Finish's native trial covers a space with one workspace, one workspace of a space with two, and a held lock with its retry, each choosing workspaces from a test subclass. Its key presses and checkbox clicks are covered by fake tests only.
+- The native trial (`scripts/app-trial.js`) covers `jj-workspace` New and Open, nesting, status line refresh after an operation, Changes panel snapshots, pairs, Hunk diff panes, and Finish across single-workspace, two-workspace, and held-lock retry flows. Because the trial drives `trial-new`, `trial-finish`, and `trial-changes` through subclass methods rather than native keyboard events, interactive keyboard routing (`cmd-shift-n` via `mod.open:jj-workspace`, `Tab`/`Shift+Tab` inside `gpui-base` `Input`, `Shift+Enter`, arrow scrolling, checkbox clicks, hover buttons, and right-click menu clicks) and visual layout of the unified dialog and tab-scoped Finish are covered by fake Node tests (`tests/mods.test.js`) and require a manual pass inside an isolated trial window to verify natively. The `jj diff` pane used without Hunk, replacing a pane, and refresh after an agent's turn are covered by fake tests only.
 - The stack actions are covered by fixture tests and by checking their jj commands in a disposable repository. The hover buttons, the right-click menu and the Enter key in the describe textarea have not been tried in the app.
 - jj 0.47.1 brings a workspace up to date when another workspace rewrites its `@`, so no test produces a real `stale` error.

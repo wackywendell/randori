@@ -252,31 +252,11 @@ A view is visible when its block and every block above it lack `hidden: true`, a
 
 ### New and Open workspace
 
-The New workspace dialog has one input for the name, a line showing the filled folder and what the checkout starts from, and the key hints `↵ create · esc cancel`. It loads the repository's local bookmark names once when it opens. On Enter it runs these steps in the current checkout.
-
-1. Make the name safe for a folder, as Herdr's worktree mod does with branch names, and fill the `directory` setting's `{repo}` with the main checkout's folder name and `{name}` with the safe name.
-2. Make the directory's parent folder with `mkdir -p`, since jj makes only the last folder. Run `jj workspace add --name <name> <directory>`, adding `-r <name>` when a local bookmark of that name exists. jj refuses `--ignore-working-copy` on this command, so it snapshots the current checkout first. Any other name starts from the current checkout's parent, jj's default. When jj refuses, its error stays in the dialog and nothing else runs.
-3. For each path in the `links` setting that exists in the main checkout, create its parent folder and link it into the new checkout with `ln -s` and an absolute target. A path that already exists in the new checkout, as a file, folder or link, because the start revision tracks it, is left as it is.
-4. When the `miseTrust` setting is on and `mise --version` succeeds, run `mise trust` on each file step 3 linked whose name is `mise.toml`, `.mise.toml`, `mise.<env>.toml` or `.mise.<env>.toml`, or that sits under `.mise/`, `mise/` or `.config/mise/`.
-5. Open a space with `space.new {folder, machine}` and no name, so it takes its name from the checkout folder.
-
-When step 3 or 4 fails, or skips a path, the space still opens, and one notification names each path and the reason.
-
-The Open workspace dialog lists the repository's workspaces from `jj --ignore-working-copy workspace list` with their folders, filtered as you type, marks those already open in a space, and selects that space or opens a new one. A workspace created before jj 0.38 records no folder, and the list shows it as unavailable.
+Updated by [jj workspace dialogs and menus](./jj-workspace-dialog.md). New and Open now share one `560x480` `jj workspace` dialog switched with `Tab` / `Shift+Tab`, supporting multi-repository target-space discovery, lazy expansion to other spaces, direct opening of existing names from New, `mod.open:jj-workspace` key binding via `mod.json`'s `overlay` declaration, `Enter` jumping to existing spaces or secondary tabs, and `Shift+Enter` opening a same-machine new tab in the target space. Creation still follows the same path templating, `mkdir -p`, `jj workspace add`, `links` symlinking, and `mise trust` mechanics.
 
 ### Finish workspace
 
-The space menu offers Finish workspace for a jj space with a terminal in a linked workspace.
-
-The dialog lists every linked workspace in which a terminal of the space works, with its folder, in tab order. The workspace of the space's first terminal comes first when it is linked, and is checked. Otherwise the first linked workspace is checked. The others are unchecked. Under each checked workspace, a line names any other space with a terminal in that checkout, since those terminals end too. The text says "Ends the terminals working in the checked folders and deletes the folders. Edits jj tracks stay in the repository. Files jj does not track, including ignored files, are deleted." The key hints are `space check · ↵ finish · esc cancel`.
-
-When it opens, the dialog runs `jj --ignore-working-copy workspace list` from the main checkout and records each listed workspace's name, matched by folder, the main checkout, the machine and the space's ID. Enter runs three steps on the checked workspaces.
-
-1. Check. Run `jj --ignore-working-copy workspace list` from the main checkout and confirm each checked name still has its recorded folder. Then run `jj status` in each checked checkout, which snapshots it and fails on a stale workspace or a missing checkout. jj waits on a held lock without limit, so `jj status` is stopped after 10 seconds.
-2. End terminals. Run `terminal.kill` for every terminal in `terminals()` whose folder is inside a checked checkout, which covers panes, parked terminals and workers. Wait up to 10 seconds for `terminals()` to stop listing them. When the recorded space has no terminals left, close it with `space.close {id, confirmed: true}`. Close any other pane still showing an ended terminal with `pane.close`.
-3. Remove. Run `jj workspace remove <name>` from the main checkout for one checked workspace at a time, with the ten-minute timeout Herdr's worktree mod gives `git worktree remove`. The dialog marks each name as it is removed.
-
-The first failure stops Finish and shows its message beside the workspace's name. Failures include jj's errors from the check, "Terminal <name> in <folder> did not stop." from step 2, and jj's error from step 3. Enter then starts again from step 1 with the names not yet removed. A name jj no longer lists stops step 1 with "jj no longer lists <name>. Its folder <folder> remains.", and Finish takes no further action on it. The dialog is a window overlay, so it stays open after its space closes.
+Updated by [jj workspace dialogs and menus](./jj-workspace-dialog.md). `Finish jj workspace` is available from both tab right-click menus (scoped to that tab's linked workspaces, all checked) and sidebar space right-click menus (multi-repository checklist across the space, pre-checking the active tab's linked workspaces). Before confirmation it names every individual terminal in each checked checkout (including parent-owned child terminals), re-verifies against the previewed set immediately before killing, refuses overlapping checkout roots, preserves non-terminal mod panes when deciding whether to close the target space, and runs `jj workspace remove` sequentially from each row's own main checkout.
 
 In the native trial, Herdr closed each killed terminal's pane, and the space once it had no panes, about half a second after `terminal.kill` and before `terminals()` stopped listing the terminal. The `space.close` and `pane.close` calls in step 2 then find nothing to close, and cover a pane that stays. A held lock ended Finish with the timeout error from `exec` beside the workspace, and every space stayed open.
 

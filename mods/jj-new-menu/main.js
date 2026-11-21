@@ -1,5 +1,5 @@
-// A copy of Herdr's `new-menu`. In a jj checkout the worktree rows read New
-// and Open workspace and open `jj-workspace`.
+// A copy of Herdr's `new-menu`. In a space with any jj checkout the worktree
+// rows read New and Open jj workspace and open `jj-workspace`.
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
@@ -8,6 +8,19 @@ import { identity } from "./jj.js";
 
 // The last agents each machine reported, shown at once while knownAgents() checks again.
 const KNOWN = "new-menu.agents";
+
+// Unique folders in a space: pane folders in tab order, then space.folder.
+function folders(s, all = panes()) {
+  if (!s) return [];
+  const out = [];
+  const seen = new Set();
+  const add = (dir) => { if (dir && !seen.has(dir)) { seen.add(dir); out.push(dir); } };
+  for (const c of s.tabs ?? []) {
+    for (const p of all) if (p.tab === c.id && p.cwd) add(p.cwd);
+  }
+  add(s.folder);
+  return out;
+}
 
 function shortcut(name) {
   const k = keys().find(b => b.section === "global" && b.action === name);
@@ -28,18 +41,35 @@ function shortcut(name) {
 
 export default class NewMenu extends View {
   init(_props, cx) {
-    const machine = spaces().find(s => s.active)?.machine;
+    const space = spaces().find(s => s.active);
+    const machine = space?.machine;
     const where = machine ?? "";
     this.agents = shared(KNOWN)?.[where] ?? [];
     this.handle = cx.focus_handle();
     this.handle.focus();
-    // The focused pane's folder: { jj } once known, the rows wait until then.
-    this.folder = panes().find(p => p.focused)?.cwd;
-    this.checkout = this.folder ? undefined : { jj: false };
-    if (this.folder) cx.spawn(async cx => {
-      const id = await identity(this.folder, machine, { exec, readTextFile });
-      if (id.error) console.log(`jj-new-menu: ${this.folder}: ${id.message}`);
-      this.checkout = { jj: Boolean(id.jj) };
+    const allPanes = panes();
+    const focusedDir = allPanes.find(p => p.focused)?.cwd || null;
+    this.folder = focusedDir;
+    const dirs = [...new Set([...(focusedDir ? [focusedDir] : []), ...folders(space, allPanes)])];
+    this.checkout = dirs.length ? undefined : { jj: false };
+    if (dirs.length) cx.spawn(async cx => {
+      const results = await Promise.all(dirs.map(async dir => ({ dir, id: await identity(dir, machine, { exec, readTextFile }) })));
+      let jjDir = null;
+      let focusedErr = false;
+      for (const { dir, id } of results) {
+        if (id.error) {
+          console.log(`jj-new-menu: ${dir}: ${id.message}`);
+          if (dir === focusedDir) focusedErr = true;
+        }
+        if (id.jj && (!jjDir || dir === focusedDir)) jjDir = dir;
+      }
+      if (jjDir) {
+        this.folder = jjDir;
+        this.checkout = { jj: true };
+      } else {
+        this.folder = focusedDir;
+        this.checkout = { jj: focusedErr };
+      }
       cx.notify();
     });
     cx.spawn(async cx => {
@@ -81,7 +111,7 @@ export default class NewMenu extends View {
         .when(this.failed || this.agents.length === 0, el => el.child(div().px(9).py(6).text_color(t.dim).child(this.failed ? "Could not check installed agents" : "Checking installed agents…"))))
       .child(div().h(1).mx(4).my(5).bg(t.border))
       .child(this.row("space", div().w(14).child("+"), "New space", () => run("space.new"), shortcut("space.new")))
-      .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "New workspace…" : "New worktree…", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: this.folder, action: "new" } }), "", Boolean(space) && known))
-      .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "Open workspace\u2026" : "Open worktree\u2026", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }), "", Boolean(space) && known));
+      .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "New jj workspace\u2026" : "New worktree\u2026", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", ...(jj ? { width: 560, height: 480 } : { width: 460, height: 280 }), props: { space: space?.id, folder: this.folder, action: "new" } }), jj ? shortcut("mod.open:jj-workspace") : "", Boolean(space) && known))
+      .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "Open jj workspace\u2026" : "Open worktree\u2026", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }), "", Boolean(space) && known));
   }
 }

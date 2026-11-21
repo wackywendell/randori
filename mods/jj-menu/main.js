@@ -3,9 +3,10 @@
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args];
 // a command "worktree" opens the worktree dialog instead.
 //
-// A copy of Herdr's `menu`. A jj space gets New and Open workspace, which
+// A copy of Herdr's `menu`. A jj space gets New and Open jj workspace, which
 // open `jj-workspace`, where the shipped menu shows its worktree entries.
-// Finish workspace shows when a terminal of the space is in a linked workspace.
+// Finish jj workspace shows on spaces and tabs when a terminal is in a linked
+// jj workspace.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
@@ -18,12 +19,17 @@ function place(s) {
   return panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }
 
-// Whether any terminal of the space works in a linked jj workspace.
-async function linked(s) {
-  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
-  const folders = new Set(panes().filter((p) => tabs.has(p.tab) && p.terminal && p.cwd).map((p) => p.cwd));
-  const ids = await Promise.all([...folders].map((f) => identity(f, s.machine, { exec, readTextFile })));
-  return ids.some((id) => id.linked);
+// Unique folders in a space: pane folders in tab order, then space.folder.
+function folders(s, all = panes()) {
+  if (!s) return [];
+  const out = [];
+  const seen = new Set();
+  const add = (dir) => { if (dir && !seen.has(dir)) { seen.add(dir); out.push(dir); } };
+  for (const c of s.tabs ?? []) {
+    for (const p of all) if (p.tab === c.id && p.cwd) add(p.cwd);
+  }
+  add(s.folder);
+  return out;
 }
 
 // A space's checkout: "main" (a repo's own), "linked" (a worktree), or null.
@@ -74,13 +80,14 @@ function items(p, git, jj, linked) {
       return [
         ["Rename", "tab.rename", { id: tg.id }],
         ["New tab", "tab.new", { space: tg.space }],
+        ...(linked ? [["Finish jj workspace", "jj-workspace", { space: tg.space, tab: tg.id, action: "finish" }]] : []),
         ["Close", "tab.close", { id: tg.id }],
       ];
     case "space":
       return [
         ["Rename", "space.rename", { id: tg.id }],
-        ...(jj ? [["New workspace", "jj-workspace", { space: tg.id, folder: jj, action: "new" }], ["Open workspace", "jj-workspace", { space: tg.id, folder: jj, action: "open" }]] : []),
-        ...(jj && linked ? [["Finish workspace", "jj-workspace", { space: tg.id, folder: jj, action: "finish" }]] : []),
+        ...(jj ? [["New jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "new" }], ["Open jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "open" }]] : []),
+        ...(jj && linked ? [["Finish jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "finish" }]] : []),
         ...(git && !jj ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" && !jj ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
         ["Close", "space.close", { id: tg.id }],
@@ -119,18 +126,38 @@ export default class Menu extends View {
     this.handle = cx.focus_handle();
     this.handle.focus();
     const p = props();
-    const space = p?.tab === "space" && spaces().find((s) => s.id === p.target?.id);
-    const folder = space && place(space);
-    if (folder)
-      cx.spawn(async (cx) => {
-        // The shipped Git probe runs only where jj says there is no jj repo.
-        const id = await identity(folder, space.machine, { exec, readTextFile });
-        if (id.error) console.log(`jj-menu: ${folder}: ${id.message}`);
-        if (id.jj) this.jj = folder;
-        if (id.jj) this.linked = await linked(space);
-        else if (!id.error) this.git = await checkout(folder, space.machine).catch(() => null);
-        cx.notify();
-      });
+    if (p?.tab === "space") {
+      const space = spaces().find((s) => s.id === p.target?.id);
+      const allPanes = panes();
+      const dirs = space ? folders(space, allPanes) : [];
+      if (dirs.length)
+        cx.spawn(async (cx) => {
+          const tabs = new Set((space.tabs ?? []).map((c) => c.id));
+          const termDirs = new Set(allPanes.filter((x) => tabs.has(x.tab) && x.terminal && x.cwd).map((x) => x.cwd));
+          const primary = place(space);
+          const results = await Promise.all(dirs.map(async (dir) => ({ dir, id: await identity(dir, space.machine, { exec, readTextFile }) })));
+          let anyError = false;
+          for (const { dir, id } of results) {
+            if (id.error) { anyError = true; console.log(`jj-menu: ${dir}: ${id.message}`); }
+            if (id.jj && (!this.jj || dir === primary)) this.jj = dir;
+            if (id.linked && termDirs.has(dir)) this.linked = true;
+          }
+          if (!this.jj && !anyError && primary) this.git = await checkout(primary, space.machine).catch(() => null);
+          cx.notify();
+        });
+    } else if (p?.tab === "tab") {
+      const space = spaces().find((s) => s.id === p.target?.space);
+      const tabDirs = [...new Set(panes().filter((x) => x.tab === p.target?.id && x.terminal && x.cwd).map((x) => x.cwd))];
+      if (tabDirs.length)
+        cx.spawn(async (cx) => {
+          const results = await Promise.all(tabDirs.map(async (dir) => ({ dir, id: await identity(dir, space?.machine, { exec, readTextFile }) })));
+          for (const { dir, id } of results) {
+            if (id.error) console.log(`jj-menu: ${dir}: ${id.message}`);
+            if (id.linked) this.linked = true;
+          }
+          cx.notify();
+        });
+    }
   }
 
   choose(i, cx) {
@@ -138,7 +165,7 @@ export default class Menu extends View {
     if (!it) return;
     closeOverlay(props()?.overlay);
     if (it[1] === "jj-workspace" && it[2].action === "finish") openOverlay({ mod: "jj-workspace", kind: "window", width: 520, height: 360, props: it[2] });
-    else if (it[1] === "jj-workspace") openOverlay({ mod: "jj-workspace", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
+    else if (it[1] === "jj-workspace") openOverlay({ mod: "jj-workspace", kind: "dialog", width: 560, height: 480, props: it[2] });
     else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
   }

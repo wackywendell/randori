@@ -65,7 +65,7 @@ export default class TrialLauncher extends View {
     if (!own) return;
     cx.spawn(async () => {
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
-      const size = r.action === 'open' ? { width: 560, height: 480 } : r.action === 'finish' ? { width: 520, height: 360 } : { width: 460, height: 280 };
+      const size = r.action === 'finish' ? { width: 520, height: 360 } : { width: 560, height: 480 };
       const mod = r.action === 'new' ? 'trial-new' : r.action === 'finish' ? 'trial-finish' : 'jj-workspace';
       openOverlay({ mod, kind: r.action === 'finish' ? 'window' : 'dialog', ...size, props: { space: r.space, folder: r.folder, action: r.action } });
       closeOverlay(own);
@@ -80,10 +80,11 @@ export default class TrialNew extends Workspace {
     super.init(p, cx);
     cx.spawn(async (cx) => {
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
-      while (this.repo === undefined) await new Promise((done) => cx.timer.after(100, done));
+      while (!this.ready) await new Promise((done) => cx.timer.after(100, done));
       this.text = r.name;
-      await writeTextFile(appHome() + '/new-plan.json', JSON.stringify(this.repo ? this.planned() : { error: this.error }), null);
-      await this.work(cx);
+      const repo = this.current()?.repo;
+      await writeTextFile(appHome() + '/new-plan.json', JSON.stringify(repo ? this.planned(repo) : { error: this.error }), null);
+      if (repo) await this.work(repo, cx);
       if (this.error) await writeTextFile(appHome() + '/new-error.txt', this.error, null);
     });
   }
@@ -99,7 +100,7 @@ export default class TrialFinish extends Workspace {
     this.timeline = [];
     this.runs = 0;
     cx.spawn(async (cx) => {
-      while (this.repo === undefined) await new Promise((done) => cx.timer.after(100, done));
+      while (!this.ready) await new Promise((done) => cx.timer.after(100, done));
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
       if (r.check) for (const w of this.rows) w.checked = r.check.includes(w.name);
       cx.notify();
@@ -374,7 +375,7 @@ if (command === 'run') {
     execute('jj', ['workspace', 'add', '--quiet', '--name', name, workspace(name)], main);
     ids[name] = appCommand('space.new', { folder: workspace(name) }).space;
   }
-  appCommand('tab.new', { space: ids.review, folder: workspace('nesting') });
+  appCommand('tab.new', { space: ids.review, folder: workspace('nesting'), focus: false });
   await fs.writeFile(path.join(root, 'finish.json'), JSON.stringify(ids));
   console.log(JSON.stringify(ids));
 } else if (command === 'finish') {

@@ -289,8 +289,16 @@ test('right-click opens jj-menu', async () => {
 
 // jj-workspace
 
-function dialog(action, over, data = {}) {
-  const w = world(over);
+function dialog(action, over = () => undefined, data = {}) {
+  const w = world((cmd, args, opts) => {
+    const answer = over(cmd, args, opts);
+    if (answer !== undefined) return answer;
+    if (cmd === 'jj' && args.includes('workspace') && args.includes('list')) {
+      const main = opts.cwd === '/o' ? '/o' : '/r/main';
+      return ok(JSON.stringify({ name: 'default', root: main }) + '\n');
+    }
+    if (cmd === 'jj' && args.includes('bookmark') && args.includes('list')) return ok('');
+  });
   const h = load('jj-workspace', { spaces: [space('s1', '/r/main'), space('s2', '/r/w1')], panes: [pane('s1', '/r/main'), pane('s2', '/r/w1')],
     props: { space: 's1', folder: '/r/main', action, overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile, ...data });
   h.calls = w.calls;
@@ -391,9 +399,168 @@ test('Open workspace opens a space on a workspace no space shows', async () => {
 });
 
 test('a folder outside jj says so', async () => {
-  const h = dialog('new', undefined, { props: { space: 's1', folder: '/g', action: 'new' } });
+  const h = dialog('new', undefined, { spaces: [space('s1', '/g')], panes: [pane('s1', '/g')], props: { space: 's1', folder: '/g', action: 'new', overlay: 'o1' } });
   await h.drain();
   assert.ok(words(h.render()).some(x => x.includes('/g is not in a jj repository.')));
+});
+
+test('New and Open discover multiple repos in tab order, highlight the focused repo, and preserve repo across Tab filter misses', async () => {
+  const wsMain = [{ name: 'default', root: '/r/main' }, { name: 'bench-fix', root: '/r/bench-fix' }];
+  const wsOther = [{ name: 'default', root: '/o' }];
+  const h = dialog('new', (cmd, args, opts) => {
+    if (args.includes('workspace') && args.includes('list')) return listed(opts.cwd === '/o' ? wsOther : wsMain);
+    if (args.includes('bookmark')) return ok('');
+    if (cmd === 'mkdir') return ok('');
+    if (args.includes('add')) return ok('');
+  }, {
+    spaces: [{ id: 's1', name: 'mix', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1' }, { id: 'k2', active: true }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/o' }],
+    focused: { space: 's1', tab: 'k2', pane: 'p2' },
+    props: { overlay: 'o1' },
+  });
+  await h.drain();
+  // Both repos discovered in tab order (main, o), with focused repo `o` selected.
+  assert.deepEqual(plain(h.view.repos.map(r => r.name)), ['main', 'o']);
+  assert.equal(h.view.current().repo.name, 'o');
+  // Type a name that exists ONLY in `main`, Tab to Open (filters out `o`), Tab back to New: `o` stays chosen.
+  h.inputs[0].emit('change', 'bench-fix');
+  key(h, 'tab');
+  assert.equal(h.view.view, 'open');
+  assert.ok(words(h.render()).includes('bench-fix'));
+  assert.equal(h.view.current().repo.name, 'main');
+  key(h, 'tab');
+  assert.equal(h.view.view, 'new');
+  assert.equal(h.view.current().repo.name, 'o');
+  assert.ok(h.view.scroll.scrolled.length > 0);
+  // Up/Down changes repo and records scroll_to_item; return to `o` and submit creates in `/o`.
+  key(h, 'up');
+  assert.equal(h.view.current().repo.name, 'main');
+  key(h, 'down');
+  assert.equal(h.view.current().repo.name, 'o');
+  h.inputs[0].emit('submit');
+  await h.drain();
+  const add = h.calls.find(c => c.cmd === 'jj' && c.args.includes('add'));
+  assert.equal(add.cwd, '/o');
+  assert.ok(add.args.includes('/home/u/.herdr/worktrees/o/bench-fix'));
+});
+
+test('New opens an existing workspace directly without running jj workspace add, and whereOpen jumps to secondary tabs', async () => {
+  const wsMain = [{ name: 'default', root: '/r/main' }, { name: 'w1', root: '/r/w1' }];
+  const h = dialog('new', (cmd, args) => {
+    if (args.includes('workspace') && args.includes('list')) return listed(wsMain);
+    if (args.includes('bookmark')) return ok('');
+  }, {
+    spaces: [
+      { id: 's1', name: 'main', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }, { id: 'k2', name: 'w1-tab' }] },
+    ],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' },
+    ],
+    focused: { space: 's1', tab: 'k1', pane: 'p1' },
+    props: { overlay: 'o1' },
+  });
+  await h.drain();
+  h.inputs[0].emit('change', 'w1');
+  assert.ok(words(h.render()).some(x => x.includes('w1 already exists in main')));
+  // Open view badges the secondary tab with "open in main".
+  key(h, 'tab');
+  assert.ok(words(h.render()).includes('open in main'));
+  key(h, 'tab');
+  // Enter in New opens the existing workspace by jumping to s1 + k2, never calling jj workspace add.
+  h.inputs[0].emit('submit');
+  await h.drain();
+  assert.equal(h.calls.some(c => c.args.includes('add')), false);
+  assert.deepEqual(plain(h.actions), [{ name: 'space.select', args: { id: 's1' } }, { name: 'tab.select', args: { id: 'k2' } }]);
+});
+
+test('lazy expansion probes other spaces (including remote $HOME), enforces same-machine Shift+Enter, and handles non-jj spaces', async () => {
+  const h = dialog('new', (cmd, args, opts) => {
+    if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
+    if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root' && opts.on === 'retriever') return ok('/rem/streams\n');
+    if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: opts.on === 'retriever' ? '/rem/streams' : '/r/main' }]);
+    if (args.includes('bookmark')) return ok('');
+    if (cmd === 'mkdir' || args.includes('add')) return ok('');
+  }, {
+    spaces: [
+      { id: 's1', name: 'local-a', active: false, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
+      { id: 's2', name: 'active-other', active: true, machine: null, folder: '/g', tabs: [{ id: 'k2', active: true }] },
+      { id: 's3', name: 'remote-s', active: false, machine: 'retriever', folder: '/rem/streams', tabs: [{ id: 'k3', active: true }] },
+    ],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/g' },
+      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/streams' },
+    ],
+    props: { space: 's1', folder: '/r/main', action: 'new', overlay: 'o1' },
+    readTextFile: async p => (p === '/r/main/.jj/repo/store/type' || p === '/rem/streams/.jj/repo/store/type') ? 'git' : Promise.reject(new Error('no file')),
+  });
+  await h.drain();
+  // Other spaces were NOT probed upfront.
+  assert.equal(h.calls.some(c => c.on === 'retriever'), false);
+  // Inactive target space shows "(tab in local-a)" hint.
+  assert.ok(words(h.render()).some(x => x.includes('(tab in local-a)')));
+  // Shift+Enter on same-machine main checkout in Open opens a tab named after the repo ("main", not "default").
+  key(h, 'tab');
+  h.inputs[0].emit('submit', undefined, { shift: true });
+  await h.drain();
+  assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/r/main', name: 'main' } });
+
+  // Switch back to New, move to expand row, press Enter -> discovers remote repo.
+  h.actions.length = 0;
+  key(h, 'tab');
+  key(h, 'down');
+  assert.equal(h.view.current().kind, 'more');
+  key(h, 'enter');
+  await h.drain();
+  assert.ok(h.view.repos.some(r => r.name === 'streams' && r.on === 'retriever'));
+  assert.equal(h.view.current().repo.name, 'streams');
+  // Shift+Enter on remote repo shows inline error and opens nothing.
+  h.inputs[0].emit('change', 'remote-wt');
+  h.inputs[0].emit('submit', undefined, { shift: true });
+  await h.drain();
+  assert.ok(words(h.render()).some(x => x.includes('Tabs in this space cannot open a workspace on retriever.')));
+  assert.deepEqual(h.actions, []);
+  // Enter creates on retriever using remote $HOME (/home/bits).
+  h.inputs[0].emit('submit');
+  await h.drain();
+  assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/bits/.herdr/worktrees/streams/remote-wt', machine: 'retriever' } });
+});
+
+test('non-jj space with other spaces shows notice + expand row, and identity error keeps sibling repo usable', async () => {
+  const h = dialog('new', (cmd, args, opts) => {
+    if (cmd === 'jj' && args.includes('root') && opts.cwd === '/bad') return fail('Error: broken toml');
+    if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: '/o' }]);
+    if (args.includes('bookmark')) return ok('');
+  }, {
+    spaces: [
+      { id: 's1', name: 'mixed', active: true, machine: null, folder: '/bad', tabs: [{ id: 'k1', active: true }, { id: 'k2' }] },
+      { id: 's2', name: 'plain', active: false, machine: null, folder: '/g', tabs: [{ id: 'k3' }] },
+    ],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/bad' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/o' },
+      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/g' },
+    ],
+    props: { overlay: 'o1' },
+  });
+  await h.drain();
+  const text = words(h.render());
+  assert.ok(text.includes('Error: broken toml'));
+  assert.equal(h.view.repos.map(r => r.name).join(','), 'o');
+
+  // Pure non-jj space with another space shows notice and expand row; expanding with no jj repos reports none found.
+  const h2 = dialog('new', undefined, {
+    spaces: [space('s1', '/g'), space('s2', '/g')],
+    panes: [pane('s1', '/g'), pane('s2', '/g')],
+    props: { overlay: 'o1' },
+  });
+  await h2.drain();
+  assert.ok(words(h2.render()).includes('No jj repositories in this space.'));
+  assert.ok(words(h2.render()).includes('Repositories in 1 other space'));
+  key(h2, 'enter');
+  await h2.drain();
+  assert.ok(words(h2.render()).includes('No jj repositories found in other spaces.'));
 });
 
 // Finish: space s1 has a tab in w1 and a tab in w2, space s2 a terminal in
@@ -420,18 +587,131 @@ async function ended(h) {
 const runs = (h, name) => plain(h.actions.filter(a => a.name === name).map(a => a.args));
 const jjLines = h => h.calls.filter(c => c.cmd === 'jj' && !c.args.includes('root')).map(c => `${c.cwd}: ${c.args.join(' ')}`);
 
-test('Finish lists the space\u2019s linked workspaces in tab order, checks the first and names other spaces that end', async () => {
+test('Finish lists the space\u2019s linked workspaces in tab order, checks the active tab and names every terminal that ends', async () => {
   const h = finishing();
   await h.drain();
   const text = words(h.render());
   assert.ok(text.indexOf('w1') < text.indexOf('w2'));
   assert.equal(byId(h.render(), 'finish-check-0').calls.checked[0], true);
   assert.equal(byId(h.render(), 'finish-check-1').calls.checked[0], false);
-  assert.ok(text.includes('Its terminals in nesting end too.'));
+  assert.ok(text.includes('Ends t1 (tab 1), t3 (space nesting), t4 (parked).'));
   assert.ok(text.some(x => x.includes('Files jj does not track, including ignored files, are deleted.')));
   key(h, 'down'); key(h, 'space');
   assert.equal(byId(h.render(), 'finish-check-1').calls.checked[0], true);
   assert.deepEqual(h.actions, []);
+});
+
+test('Finish from a tab right-click lists only that tab\u2019s linked workspaces (all checked), names TabInfo tabs and parent-owned children', async () => {
+  const h = dialog('finish', (cmd, args) => args.includes('list') ? listed() : args[0] === 'status' || args.includes('remove') ? ok('') : undefined, {
+    spaces: [{ id: 's1', name: 'work', active: true, machine: null, folder: '/r/main',
+      tabs: [{ id: 'k1', name: '1', named: false, index: 1 }, { id: 'k2', name: '2', named: false, index: 2, active: true }, { id: 'k3', name: 'logs', named: true, index: 3 }] }],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+      { pane: 'p2a', tab: 'k2', terminal: 't2a', cwd: '/r/w1' },
+      { pane: 'p2b', tab: 'k2', terminal: 't2b', cwd: '/r/w2' },
+      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/r/w1' },
+    ],
+    terminals: [
+      { address: 't1', cwd: '/r/main' },
+      { address: 't2a', name: 'agent-a', cwd: '/r/w1' },
+      { address: 't2b', cwd: '/r/w2' },
+      { address: 't3', cwd: '/r/w1' },
+      { address: 't4', name: 'sub', cwd: '/r/main', parent: 't2a' },
+    ],
+    props: { space: 's1', tab: 'k2', action: 'finish', overlay: 'o1' },
+  });
+  await h.drain();
+  const text = words(h.render());
+  assert.deepEqual(plain(h.view.rows.map(r => [r.name, r.checked])), [['w1', true], ['w2', true]]);
+  assert.ok(text.includes('Ends agent-a (tab 2), t3 (logs), sub (child of agent-a).'));
+  assert.ok(text.includes('Ends t2b (tab 2).'));
+});
+
+test('Finish handles multi-repo spaces, active-tab pre-check, zero-checked no-op, drift refusal, nested refusal, and mod panes', async () => {
+  const roots = { ...ROOTS, '/o-w1': '/o-w1', '/r/w1/nested': '/r/w1/nested' };
+  const files = { ...FILES, '/o-w1/.jj/repo': '../../o/.jj/repo', '/r/w1/nested/.jj/repo': '../../../main/.jj/repo' };
+  const wsR = [...WS, { name: 'nested', root: '/r/w1/nested' }];
+  const wsO = [{ name: 'default', root: '/o' }, { name: 'ow1', root: '/o-w1' }];
+
+  // 1. Multi-repo sidebar Finish: active tab is /o-w1 -> only ow1 pre-checked, removes from /o.
+  let arrived = false;
+  const h = load('jj-workspace', {
+    spaces: [{ id: 's1', name: 'multi', active: true, machine: null, folder: '/r/main',
+      tabs: [{ id: 'k1', name: '1', named: false, index: 1 }, { id: 'k2', name: '2', named: false, index: 2, active: true }, { id: 'k3', name: 'diff', named: true, index: 3 }] }],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/o-w1' },
+      { pane: 'p3', tab: 'k3', mod: 'jj-changes' }, // non-terminal mod pane prevents space.close
+    ],
+    terminals: [{ address: 't1', cwd: '/r/w1' }, { address: 't2', cwd: '/o-w1' }],
+    props: { space: 's1', action: 'finish', overlay: 'o1' },
+    exec: async (cmd, args, opts = {}) => {
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return roots[opts.cwd] ? ok(`${roots[opts.cwd]}\n`) : fail('no jj');
+      if (args.includes('workspace') && args.includes('list')) return listed(opts.cwd === '/o' ? wsO : wsR);
+      if (args[0] === 'status') {
+        if (!arrived && opts.cwd === '/o-w1') {
+          arrived = true;
+          h.state.terminals.push({ address: 't9', name: 'late', cwd: '/o-w1' });
+        }
+        return ok('');
+      }
+      if (args.includes('remove')) return ok('');
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h.drain();
+  assert.equal(h.view.multiRepo, true);
+  assert.deepEqual(plain(h.view.rows.map(r => [r.repoName, r.name, r.checked])), [['main', 'w1', false], ['o', 'ow1', true]]);
+  assert.ok(words(h.render()).includes('o / ow1'));
+
+  // Drift refusal: t9 appeared during `jj status` before kill -> refuses and kills nothing.
+  key(h, 'enter');
+  await h.drain();
+  assert.ok(words(h.render()).some(x => x.includes('New terminal late appeared.')));
+  assert.deepEqual(runs(h, 'terminal.kill'), []);
+
+  // Re-rendered preview now includes t9 -> next Enter kills both t2 and t9, keeps s1 open (mod pane p3 survives), removes from /o.
+  key(h, 'enter');
+  await h.drain();
+  assert.deepEqual(runs(h, 'terminal.kill'), [{ terminal: 't2' }, { terminal: 't9' }]);
+  await ended(h);
+  assert.deepEqual(runs(h, 'space.close'), []);
+  assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
+
+  // 2. Overlapping checkout-root refusal: /r/w1 contains /r/w1/nested -> refuses before status/kill.
+  const h2 = load('jj-workspace', {
+    spaces: [{ id: 's1', name: 'nest', active: true, machine: null, folder: '/r/w1', tabs: [{ id: 'k1', active: true }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1' }],
+    terminals: [{ address: 't1', cwd: '/r/w1' }],
+    props: { space: 's1', action: 'finish', overlay: 'o1' },
+    exec: async (cmd, args, opts = {}) => {
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return roots[opts.cwd] ? ok(`${roots[opts.cwd]}\n`) : fail('no jj');
+      if (args.includes('workspace') && args.includes('list')) return listed(wsR);
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h2.drain();
+  key(h2, 'enter');
+  await h2.drain();
+  assert.ok(words(h2.render()).includes('w1 contains workspace nested. Finish nested first.'));
+  assert.deepEqual(h2.actions, []);
+
+  // 3. Active tab outside linked workspace -> zero checked, Enter is a no-op.
+  const h3 = dialog('finish', (cmd, args) => args.includes('list') ? listed() : undefined, {
+    spaces: [{ id: 's1', name: 'main', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }, { id: 'k2' }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' }],
+    terminals: [{ address: 't1', cwd: '/r/main' }, { address: 't2', cwd: '/r/w1' }],
+    props: { space: 's1', action: 'finish', overlay: 'o1' },
+  });
+  await h3.drain();
+  assert.deepEqual(plain(h3.view.rows.map(r => r.checked)), [false]);
+  h3.calls.length = 0;
+  key(h3, 'enter');
+  await h3.drain();
+  assert.deepEqual(h3.calls, []);
+  assert.deepEqual(h3.actions, []);
 });
 
 test('Finish stops before ending anything when jj status fails', async () => {
@@ -532,36 +812,84 @@ test('Finish stops when jj no longer lists a checked workspace', async () => {
 
 // Menus
 
-test('a jj space\u2019s menu offers New and Open workspace in place of worktrees', async () => {
+test('a jj space\u2019s menu offers New and Open jj workspace in place of worktrees at 560x480', async () => {
   const w = world();
-  const h = load('jj-menu', { spaces: [space('s1', '/r/main')], panes: [pane('s1', '/r/main')], props: { tab: 'space', target: { id: 's1' } },
+  const h = load('jj-menu', { spaces: [space('s1', '/r/main')], panes: [pane('s1', '/r/main')], props: { tab: 'space', target: { id: 's1' }, overlay: 'm1' },
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
   const text = words(h.render());
-  assert.ok(text.includes('New workspace') && text.includes('Open workspace'));
+  assert.ok(text.includes('New jj workspace') && text.includes('Open jj workspace'));
   assert.equal(text.includes('New worktree'), false);
   assert.equal(w.calls.some(c => c.cmd === 'git'), false);
+  h.view.choose(1, h.cx);
+  assert.deepEqual(plain(h.overlays.at(-1)), { mod: 'jj-workspace', kind: 'dialog', width: 560, height: 480, props: { space: 's1', folder: '/r/main', action: 'new' } });
 });
 
-test('a space with a terminal in a linked workspace offers Finish workspace in a window', async () => {
+test('a space with a terminal in a linked workspace offers Finish jj workspace in a window, even when tab 1 is outside jj', async () => {
   const w = world();
-  const h = load('jj-menu', { spaces: [{ ...space('s1', '/r/main'), tabs: [{ id: 's1-tab' }, { id: 'k2' }] }],
-    panes: [pane('s1', '/r/main'), { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' }], props: { tab: 'space', target: { id: 's1' }, overlay: 'm1' },
+  const h = load('jj-menu', { spaces: [{ ...space('s1', '/g'), tabs: [{ id: 's1-tab' }, { id: 'k2' }] }],
+    panes: [pane('s1', '/g'), { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' }], props: { tab: 'space', target: { id: 's1' }, overlay: 'm1' },
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
   const list = words(h.render());
-  assert.ok(list.includes('Finish workspace'));
-  h.view.choose(list.filter(x => ['Rename', 'New workspace', 'Open workspace', 'Finish workspace', 'Close'].includes(x)).indexOf('Finish workspace'), h.cx);
+  assert.ok(list.includes('New jj workspace') && list.includes('Finish jj workspace'));
+  h.view.choose(list.filter(x => ['Rename', 'New jj workspace', 'Open jj workspace', 'Finish jj workspace', 'Close'].includes(x)).indexOf('Finish jj workspace'), h.cx);
   assert.equal(h.overlays.at(-1).kind, 'window');
-  assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1', folder: '/r/main', action: 'finish' });
+  assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1', folder: '/r/w1', action: 'finish' });
+
+  // space.folder pointing to a linked checkout without any terminal pane in it must NOT offer Finish jj workspace.
+  const h2 = load('jj-menu', { spaces: [{ ...space('s1', '/r/w1'), tabs: [{ id: 's1-tab' }] }],
+    panes: [pane('s1', '/r/main')], props: { tab: 'space', target: { id: 's1' } },
+    exec: w.exec, readTextFile: w.readTextFile });
+  await h2.drain();
+  assert.equal(words(h2.render()).includes('Finish jj workspace'), false);
 });
 
-test('a space only in the main checkout offers no Finish workspace', async () => {
+test('a space only in the main checkout offers no Finish jj workspace', async () => {
   const w = world();
   const h = load('jj-menu', { spaces: [space('s1', '/r/main')], panes: [pane('s1', '/r/main')], props: { tab: 'space', target: { id: 's1' } },
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
-  assert.equal(words(h.render()).includes('Finish workspace'), false);
+  assert.equal(words(h.render()).includes('Finish jj workspace'), false);
+});
+
+test('a tab right-click menu offers Finish jj workspace only for linked tabs, including remote spaces', async () => {
+  // Local linked tab: Finish jj workspace appears before Close and opens window with { space, tab, action: 'finish' }.
+  const w1 = world();
+  const h1 = load('jj-menu', {
+    spaces: [{ id: 's1', name: 'work', machine: null, folder: '/r/main', tabs: [{ id: 'k1' }, { id: 'k2' }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' }],
+    props: { tab: 'tab', target: { id: 'k2', space: 's1' }, overlay: 'm1' },
+    exec: w1.exec, readTextFile: w1.readTextFile,
+  });
+  await h1.drain();
+  const items1 = words(h1.render());
+  assert.ok(items1.includes('Finish jj workspace'));
+  assert.ok(items1.indexOf('Finish jj workspace') < items1.indexOf('Close'));
+  h1.view.choose(2, h1.cx);
+  assert.deepEqual(plain(h1.overlays.at(-1)), { mod: 'jj-workspace', kind: 'window', width: 520, height: 360, props: { space: 's1', tab: 'k2', action: 'finish' } });
+
+  // Main-checkout tab: no Finish jj workspace.
+  const h2 = load('jj-menu', {
+    spaces: [{ id: 's1', name: 'work', machine: null, folder: '/r/main', tabs: [{ id: 'k1' }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' }],
+    props: { tab: 'tab', target: { id: 'k1', space: 's1' }, overlay: 'm1' },
+    exec: w1.exec, readTextFile: w1.readTextFile,
+  });
+  await h2.drain();
+  assert.equal(words(h2.render()).includes('Finish jj workspace'), false);
+
+  // Remote linked tab: passes space.machine ('retriever') to identity().
+  const w3 = world();
+  const h3 = load('jj-menu', {
+    spaces: [{ id: 's9', name: 'rem', machine: 'retriever', folder: '/r/w1', tabs: [{ id: 'k9' }] }],
+    panes: [{ pane: 'p9', tab: 'k9', terminal: 't9', cwd: '/r/w1' }],
+    props: { tab: 'tab', target: { id: 'k9', space: 's9' }, overlay: 'm1' },
+    exec: w3.exec, readTextFile: w3.readTextFile,
+  });
+  await h3.drain();
+  assert.ok(words(h3.render()).includes('Finish jj workspace'));
+  assert.equal(w3.calls[0].on, 'retriever');
 });
 
 test('a space outside jj keeps the shipped menu', async () => {
@@ -569,19 +897,43 @@ test('a space outside jj keeps the shipped menu', async () => {
   const h = load('jj-menu', { spaces: [space('s1', '/g')], panes: [pane('s1', '/g')], props: { tab: 'space', target: { id: 's1' } },
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
-  assert.equal(words(h.render()).includes('New workspace'), false);
+  assert.equal(words(h.render()).includes('New jj workspace'), false);
   assert.ok(w.calls.some(c => c.cmd === 'git'));
 });
 
-test('the New menu opens jj-workspace from a jj checkout', async () => {
-  const w = world();
-  const h = load('jj-new-menu', { spaces: [{ ...space('s1', '/r/main'), active: true }], panes: [{ ...pane('s1', '/r/main'), focused: true }],
-    props: { overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile });
+test('the New menu opens jj-workspace at 560x480 with shortcut hint, probes sibling folders, and keeps Git worktree at 460x280', async () => {
+  const w = world((cmd, args, opts) => cmd === 'jj' && args.includes('root') && opts.cwd === '/bad' ? fail('Error: bad toml') : undefined);
+  const h = load('jj-new-menu', {
+    spaces: [{ ...space('s1', '/r/main'), active: true, tabs: [{ id: 'k1' }, { id: 'k2' }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/bad', focused: true }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/main' }],
+    keys: [{ section: 'global', action: 'mod.open:jj-workspace', keys: 'cmd-shift-n' }],
+    props: { overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile,
+  });
   await h.drain();
-  assert.ok(words(h.render()).includes('New workspace\u2026'));
+  assert.ok(words(h.render()).includes('New jj workspace\u2026'));
+  assert.ok(words(byId(h.render(), 'worktree')).includes('\u21e7\u2318N'));
   byId(h.render(), 'worktree').handlers.on_click({}, h.cx);
-  assert.deepEqual(h.overlays.at(-1).mod, 'jj-workspace');
-  assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1', folder: '/r/main', action: 'new' });
+  assert.deepEqual(plain(h.overlays.at(-1)), { mod: 'jj-workspace', kind: 'dialog', width: 560, height: 480, props: { space: 's1', folder: '/r/main', action: 'new' } });
+
+  // Focused pane with no cwd (e.g. mod pane) still finds sibling jj checkout.
+  const h2 = load('jj-new-menu', {
+    spaces: [{ ...space('s1', '/r/main'), active: true, tabs: [{ id: 'k1' }, { id: 'k2' }] }],
+    panes: [{ pane: 'p1', tab: 'k1', mod: 'jj-changes', focused: true }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/main' }],
+    props: { overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile,
+  });
+  await h2.drain();
+  assert.ok(words(h2.render()).includes('New jj workspace\u2026'));
+
+  // Non-jj space preserves Git worktree at 460x280.
+  const h3 = load('jj-new-menu', {
+    spaces: [{ ...space('s1', '/g'), active: true }],
+    panes: [{ ...pane('s1', '/g'), focused: true }],
+    props: { overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile,
+  });
+  await h3.drain();
+  assert.ok(words(h3.render()).includes('New worktree\u2026'));
+  byId(h3.render(), 'worktree').handlers.on_click({}, h3.cx);
+  assert.deepEqual(plain(h3.overlays.at(-1)), { mod: 'worktree', kind: 'dialog', width: 460, height: 280, props: { space: 's1', folder: '/g', action: 'new' } });
 });
 
 // Layout

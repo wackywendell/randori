@@ -59,7 +59,7 @@ export function load(name, data = {}) {
     InputState: { new: ({ value = '' } = {}) => {
       const on = {};
       const input = { value: () => value, set_value(next) { value = next; on.change?.({}, cx); }, set_selected_range() {}, on(event, body) { on[event] = body; }, focus() {},
-        emit(event, next) { if (next !== undefined) value = next; on[event]?.({}, cx); } };
+        emit(event, next, payload = {}) { if (next !== undefined) value = next; on[event]?.(payload, cx); } };
       inputs.push(input);
       return input;
     } },
@@ -71,13 +71,13 @@ export function load(name, data = {}) {
       return area;
     } },
     Textarea: { new: element }, Popover: { new: id => element().id(id) },
-    Input: { new: element }, ScrollHandle: { new: () => ({ scroll_to_item() {} }) }, Scrollbar: { vertical: element }, Checkbox: { new: id => element().id(id) },
+    Input: { new: element }, ScrollHandle: { new: () => { const scrolled = []; return { scrolled, scroll_to_item(i) { scrolled.push(i); } }; } }, Scrollbar: { vertical: element }, Checkbox: { new: id => element().id(id) },
     // Every row of a virtual list, as if all were on screen.
     v_virtual_list: (id, count, height, key, rows) => element().id(id).children(rows({ start: 0, end: count })),
     agents: () => state.agents, terminals: () => state.terminals, spaces: () => state.spaces,
     panes: () => state.panes, machines: () => state.machines, props: () => state.props,
     focused: () => state.focused, layout: () => state.layout, window: () => ({ active: state.active, platform: 'macos' }),
-    keys: () => [], settings: () => ({ zoom: 1 }), theme: () => new Proxy({}, { get: () => '#8899aa' }),
+    keys: () => state.keys ?? [], settings: () => ({ zoom: 1 }), theme: () => new Proxy({}, { get: () => '#8899aa' }),
     home: () => state.home, appHome: () => `${state.home}/.config/herdr-app`,
     shared: key => shared.get(key), setShared: (key, value) => shared.set(key, value), setAgentOrder() {},
     run: (name, args) => actions.push({ name, args }),
