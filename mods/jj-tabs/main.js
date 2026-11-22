@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings, props } from "herdr";
+import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings, props } from "herdr";
 
 const BUILTIN_PANELS = Object.freeze({
   __proto__: null,
@@ -87,6 +87,9 @@ export default class Tabs extends View {
       ? Math.max(10, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
+    const changesShown = Boolean(panel && !panel.hidden && body?.active === "changes");
+    if (changesShown && !this.changesShown) setShared("jj-changes:opened", (shared("jj-changes:opened") ?? 0) + 1);
+    this.changesShown = changesShown;
     const panels = panel && body ? panelItems(body, shared("workspace.panels") ?? ["files", "changes"]) : [];
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;

@@ -53,7 +53,7 @@ function spacesWith(list, w = world(), data = {}) {
   h.calls = w.calls;
   return h;
 }
-async function settle(h) { await h.advance(250); await h.advance(250); }
+async function settle(h) { h.render(); await h.drain(); h.render(); await h.drain(); }
 const row = (h, id) => words(byId(h.render(), `space-${id}`));
 
 test('a jj space shows its nearest bookmark and the changes in @', async () => {
@@ -119,9 +119,11 @@ test('an agent turn ending in a space’s active tab snapshots that tab’s chec
   await settle(h);
   h.calls.length = 0;
   h.state.panes[1].status = 'working';
-  await h.advance(250);
+  h.render();
+  await h.drain();
   h.state.panes[1].status = 'idle';
-  await h.advance(250);
+  h.render();
+  await h.drain();
   const logs = h.calls.filter(isLog);
   assert.deepEqual(logs.map(c => [c.cwd, c.args.includes('--ignore-working-copy')]), [['/o', false]]);
 });
@@ -143,9 +145,11 @@ test('an agent turn ending snapshots only its own space', async () => {
   await settle(h);
   h.calls.length = 0;
   h.state.panes[0].status = 'working';
-  await h.advance(250);
+  h.render();
+  await h.drain();
   h.state.panes[0].status = 'idle';
-  await h.advance(250);
+  h.render();
+  await h.drain();
   const logs = h.calls.filter(isLog);
   assert.equal(logs.length, 1);
   assert.equal(logs[0].cwd, '/r/main');
@@ -1457,20 +1461,23 @@ test('Refresh snapshots and an operation rereads the stack without one', async (
   assert.equal(h.calls.filter(isStack).length, 1);
 });
 
-test('a hidden panel starts nothing and snapshots once when shown again', async () => {
+test('a hidden panel starts nothing and snapshots once when shown again (without a polling timer)', async () => {
   const h = panel('/r/main', () => undefined, { layout: panelLayout(false, 'files') });
   await shown(h);
   assert.equal(h.calls.some(c => isSnap(c) || isStack(c)), false);
   await h.fire('/r/main/.jj/repo/op_heads/heads');
   assert.equal(h.calls.some(c => isSnap(c) || isStack(c)), false);
+  // Showing the panel triggers checkShown via render() immediately (no timer).
   h.state.layout = panelLayout();
-  await h.advance(1000);
+  h.render();
+  await h.drain();
   assert.equal(h.calls.filter(isSnap).length, 1);
   assert.equal(h.calls.filter(isStack).length, 1);
-  h.state.layout = panelLayout(true);
-  await h.advance(1000);
-  h.state.layout = panelLayout();
-  await h.advance(1000);
+  // Even when Herdr skips render() while hidden, jj-tabs bumping jj-changes:opened
+  // triggers a fresh snapshot on re-open.
+  h.shared.set('jj-changes:opened', 1);
+  h.render();
+  await h.drain();
   assert.equal(h.calls.filter(isSnap).length, 2);
 });
 

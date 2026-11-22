@@ -86,8 +86,7 @@ export default class Changes extends View {
     this.stack = []; this.sel = []; this.want = 0; this.gen = 0; this.watching = new Set();
     this.hunk = {}; // machine -> Hunk runs there
     this.diffShows = {}; // tab -> commit IDs its Hunk diff pane shows
-    // Only reads the layout: being shown again snapshots and reads once.
-    cx.timer.every(1000, (cx) => this.checkShown(cx));
+    this.opened = shared("jj-changes:opened") ?? 0;
   }
 
   // Sends the focused folder to jj's code or the shipped Git code, once its
@@ -131,8 +130,14 @@ export default class Changes extends View {
 
   checkShown(cx) {
     const shown = visible(layout(), "jj-changes");
-    if (shown && !this.shown && this.mode === "jj") { this.shown = true; this.request(SNAPSHOT, cx); }
+    const opened = shared("jj-changes:opened") ?? 0;
+    if (shown && (!this.shown || opened !== this.opened) && this.mode === "jj") {
+      this.shown = true;
+      this.opened = opened;
+      this.request(SNAPSHOT, cx);
+    }
     this.shown = shown;
+    this.opened = opened;
   }
 
   // jj rewrites op_heads/heads after every operation, in any workspace.

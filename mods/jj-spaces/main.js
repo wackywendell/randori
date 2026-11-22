@@ -98,13 +98,16 @@ export default class Spaces extends View {
     this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
     for (const state of Object.values(this.reconnecting)) state.busy = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    this.settleTimer = null;
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
-    // Refresh only when the refs could have changed (see `due`).
-    cx.timer.every(250, (cx) => this.checkNew(cx));
+    // Event-driven via render(cx) for space/tab/pane/layout changes; 30 s
+    // fallback covers unwatched/remote repos, Git repos, and hidden sidebar.
+    this.checkNew(cx);
+    cx.timer.every(JJ_FALLBACK, (cx) => this.checkNew(cx));
   }
 
-  checkNew(cx) {
+  checkNew(cx, fromRender = false) {
     // A hidden sidebar starts no command, and looks at everything once shown again.
     if (!visible(layout(), "jj-spaces")) { this.hidden = true; return; }
     const now = Date.now();
@@ -121,7 +124,14 @@ export default class Spaces extends View {
     this.probePanes(sp, ps, cx);
     if (due.size) this.refreshGit(due, cx);
     this.runJj(cx);
-    if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
+    const settling = sp.some((s) => !this.shown.has(s.id)) || Boolean(this.ordering);
+    if (settling && !this.settleTimer) {
+      this.settleTimer = cx.timer.after(250, (cx) => {
+        this.settleTimer = null;
+        this.checkNew(cx);
+      });
+    }
+    if (!fromRender && (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now))) cx.notify();
   }
 
   // Places whose git could have changed: new ones (a new space, a cd), where a
@@ -161,16 +171,16 @@ export default class Spaces extends View {
       if (ready && this.ready[m.name] === false) for (const k of keys) if (JSON.parse(k)[0] === m.name) due.add(k);
       this.ready[m.name] = ready;
     }
-    if (window().active) {
+    if (window()?.active) {
       for (const k of keys) {
         const g = this.git[k];
         if (g?.jj) {
-          // jj follows op_heads; only unwatched repos are read on a timer.
-          if (this.unwatched.has(g.repo) && now - (this.checked[k] ?? 0) > JJ_FALLBACK) this.queue(k, false);
+          // jj follows op_heads; only unwatched repos are read on the 30 s fallback.
+          if (this.unwatched.has(g.repo) && now - (this.checked[k] ?? 0) >= JJ_FALLBACK - 1000) this.queue(k, false);
           continue;
         }
         const asks = this.git[k] || this.unsure.has(k);
-        if (asks && !this.folded.has(JSON.parse(k)[0]) && now - (this.checked[k] ?? 0) > FALLBACK) due.add(k);
+        if (asks && !this.folded.has(JSON.parse(k)[0]) && now - (this.checked[k] ?? 0) >= FALLBACK - 1000) due.add(k);
       }
     }
     return due;
@@ -630,7 +640,8 @@ export default class Spaces extends View {
       .when(marked(w), (el) => el.child(mark(w, t).absolute().right(5))));
   }
 
-  render() {
+  render(cx) {
+    this.checkNew(cx, true);
     const t = theme();
     const collapsed = narrow();
     const palette = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];
