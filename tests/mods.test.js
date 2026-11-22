@@ -387,15 +387,25 @@ test('a failed jj workspace add shows jj\u2019s error and opens nothing', async 
   assert.deepEqual(h.actions, []);
 });
 
-test('Open workspace lists the main checkout first, lands on another workspace, and selects a space already on one', async () => {
-  const list = [{ name: 'w1', root: '/r/w1' }, { name: 'default', root: '/r/main' }, { name: 'old', root: '' }];
+test('Open workspace recovers pre-0.38 default from repo.main, keeps unrecorded linked workspaces unavailable, lands on another workspace, and selects open space', async () => {
+  const list = [{ name: 'w1', root: '/r/w1' }, { name: 'default', root: null }, { name: 'old', root: null }];
   const h = dialog('open', (cmd, args) => args.includes('list') ? ok(list.map(x => JSON.stringify(x)).join('\n')) : undefined);
   await h.drain();
   const text = words(h.render());
   assert.ok(text.indexOf('default') < text.indexOf('w1'));
-  assert.ok(text.includes('main'));
+  assert.ok(text.includes('root'));
   assert.ok(text.includes('unavailable'));
-  // Already in /r/main (default), so initial selection skips default and lands on w1.
+  // `default` recovered repo.main (/r/main) instead of becoming unavailable; `old` stays unavailable.
+  const def = h.view.repos[0].list.find(w => w.name === 'default');
+  const old = h.view.repos[0].list.find(w => w.name === 'old');
+  assert.equal(def.path, '/r/main');
+  assert.equal(def.main, true);
+  assert.equal(old.path, '');
+  // Filtering across a workspace with root: null (pre-jj 0.38) does not throw.
+  h.inputs[0].emit('change', 'w1');
+  assert.equal(h.view.current().ws.name, 'w1');
+  h.inputs[0].emit('change', '');
+  // Already in /r/main (default), so unpinned empty input skips default and lands on w1.
   assert.equal(h.view.current().ws.name, 'w1');
   byId(h.render(), 'wt-2').handlers.on_click({}, h.cx);
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.select', args: { id: 's2' } });
@@ -415,7 +425,7 @@ test('a folder outside jj says so', async () => {
   assert.ok(words(h.render()).some(x => x.includes('/g is not in a jj repo.')));
 });
 
-test('unified list discovers multiple repos, filters matches above + New, handles empty + New no-op, and creates in chosen repo', async () => {
+test('unified list puts focused repo first, filters matches above + New, handles empty + New scoping, and creates in chosen repo', async () => {
   const wsMain = [{ name: 'default', root: '/r/main' }, { name: 'fix-tests', root: '/r/fix-tests' }];
   const wsOther = [{ name: 'default', root: '/o' }];
   const h = dialog('new', (cmd, args, opts) => {
@@ -430,15 +440,18 @@ test('unified list discovers multiple repos, filters matches above + New, handle
     props: { overlay: 'o1' },
   });
   await h.drain();
-  // Both repos discovered in tab order (main, o).
-  assert.deepEqual(plain(h.view.repos.map(r => r.name)), ['main', 'o']);
-  // Empty + New workspace is a no-op on Enter.
-  const createIdx = h.view.picks().findIndex(e => e.kind === 'create' && e.repo.name === 'o');
-  h.view.at = createIdx;
+  // Focused repo `o` is placed first, then sibling `main`.
+  assert.deepEqual(plain(h.view.repos.map(r => r.name)), ['o', 'main']);
+  // Enter on empty "+ New workspace" for `o` fills `o/` into the input; second Enter with empty name is a no-op.
+  const createRow = h.view.picks().find(e => e.kind === 'create' && e.repo.name === 'o');
+  h.view.selectedKey = createRow.key;
+  h.inputs[0].emit('submit');
+  assert.equal(h.inputs[0].value(), 'o/');
   h.inputs[0].emit('submit');
   await h.drain();
   assert.deepEqual(h.actions, []);
-  // Partial match ("fix"): existing `fix-tests` is highlighted on top, `+ New "fix"` sits right below it.
+  // Partial match ("fix"): `o`'s `+ New` was pinned, so unpin to verify unpinned ranking puts `fix-tests` on top.
+  h.view.selectedKey = null;
   h.inputs[0].emit('change', 'fix');
   assert.equal(h.view.current().kind, 'ws');
   assert.equal(h.view.current().ws.name, 'fix-tests');
@@ -474,7 +487,6 @@ test('exact match hides + New and opens existing workspace directly, and whereOp
     props: { overlay: 'o1' },
   });
   await h.drain();
-  assert.ok(words(h.render()).includes('open in main'));
   h.inputs[0].emit('change', 'w1');
   // Exact match hides + New; only w1 remains.
   assert.deepEqual(plain(h.view.picks().map(e => e.kind)), ['ws']);
@@ -484,64 +496,168 @@ test('exact match hides + New and opens existing workspace directly, and whereOp
   assert.deepEqual(plain(h.actions), [{ name: 'space.select', args: { id: 's1' } }, { name: 'tab.select', args: { id: 'k2' } }]);
 });
 
-test('lazy expansion probes other spaces (including remote $HOME), prevents Enter double-fire, keeps filter, and enforces same-machine Shift+Enter', async () => {
-  const h = dialog('new', (cmd, args, opts) => {
+test('background discovery loads other spaces (sidebar order) and disk repos (jj MRU), keeps focus in current space, and supports ghost/completion', async () => {
+  const diskFiles = {
+    '/r/main/.jj/repo/store/type': 'git',
+    '/rem/streams/.jj/repo/store/type': 'git',
+    '/home/u/.dotfiles/.jj/repo/store/type': 'git',
+    '/home/u/.herdr/worktrees/main/w1/.jj/repo': '/r/main/.jj/repo',
+    '/home/u/dd/dd-source/.jj/repo/store/type': 'git',
+    '/home/u/dd/alpha/.jj/repo/store/type': 'git',
+  };
+  let releaseDotfiles;
+  const h = dialog('new', async (cmd, args, opts) => {
     if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
-    if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root' && opts.on === 'retriever') return ok('/rem/streams\n');
-    if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: opts.on === 'retriever' ? '/rem/streams' : '/r/main' }]);
+    if (cmd === 'sh' && !opts.on) {
+      // Verify configured `repos` folders and worktrees base are passed to the disk scan.
+      assert.ok(args.includes('/home/u/.herdr/worktrees'));
+      assert.ok(args.includes('/home/u/dd'));
+      return ok('100\t/home/u/.herdr/worktrees/main/w1\n200\t/home/u/dd/alpha\n500\t/home/u/dd/dd-source\n');
+    }
+    if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
+      if (opts.on === 'retriever') return ok('/rem/streams\n');
+      if (opts.cwd === '/home/u/.dotfiles') {
+        // Delay s2 (`.dotfiles`) so s3 (`streams`) resolves FIRST, proving sidebar order wins over async race!
+        await new Promise((r) => { releaseDotfiles = r; });
+        return ok('/home/u/.dotfiles\n');
+      }
+      if (opts.cwd === '/home/u/dd/dd-source') return ok('/home/u/dd/dd-source\n');
+      if (opts.cwd === '/home/u/dd/alpha') return ok('/home/u/dd/alpha\n');
+    }
+    if (args.includes('workspace') && args.includes('list')) {
+      if (opts.on === 'retriever') return listed([{ name: 'default', root: '/rem/streams' }]);
+      if (opts.cwd === '/home/u/.dotfiles') return listed([{ name: 'default', root: '/home/u/.dotfiles' }]);
+      if (opts.cwd === '/home/u/dd/dd-source') return listed([{ name: 'default', root: '/home/u/dd/dd-source' }]);
+      if (opts.cwd === '/home/u/dd/alpha') return listed([{ name: 'default', root: '/home/u/dd/alpha' }]);
+      return listed([{ name: 'default', root: '/r/main' }]);
+    }
     if (args.includes('bookmark')) return ok('');
     if (cmd === 'mkdir' || args.includes('add')) return ok('');
   }, {
+    layout: sidebar({}, { repos: ['~/dd'] }),
     spaces: [
       { id: 's1', name: 'local-a', active: false, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
-      { id: 's2', name: 'active-other', active: true, machine: null, folder: '/g', tabs: [{ id: 'k2', active: true }] },
+      { id: 's2', name: 'active-other', active: true, machine: null, folder: '/home/u/.dotfiles', tabs: [{ id: 'k2', active: true }] },
       { id: 's3', name: 'remote-s', active: false, machine: 'retriever', folder: '/rem/streams', tabs: [{ id: 'k3', active: true }] },
     ],
     panes: [
       { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
-      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/g' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/home/u/.dotfiles' },
       { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/streams' },
     ],
     props: { space: 's1', folder: '/r/main', overlay: 'o1' },
-    readTextFile: async p => (p === '/r/main/.jj/repo/store/type' || p === '/rem/streams/.jj/repo/store/type') ? 'git' : Promise.reject(new Error('no file')),
+    readTextFile: async p => p in diskFiles ? diskFiles[p] : Promise.reject(new Error('no file')),
   });
   await h.drain();
-  // Other spaces were NOT probed upfront.
-  assert.equal(h.calls.some(c => c.on === 'retriever'), false);
-  // Shift+Enter on same-machine main checkout opens a tab named after the repo ("main", not "default").
-  h.view.at = 0;
+  releaseDotfiles?.();
+  await h.drain();
+  // Deterministic order:
+  // 1. current space (`main`)
+  // 2. other spaces in pure sidebar order (`.dotfiles` before `streams`, even though `streams` resolved first!)
+  // 3. disk repos in jj MRU order (`dd-source` mtime 500 before `alpha` mtime 200), deduplicating worktree `w1`.
+  assert.deepEqual(plain(h.view.repos.map(r => [r.name, r.source])), [
+    ['main', 'space'],
+    ['.dotfiles', 'other'],
+    ['streams', 'other'],
+    ['dd-source', 'disk'],
+    ['alpha', 'disk'],
+  ]);
+  assert.equal(h.calls.some(c => c.cwd === '/home/u/.herdr/worktrees/main/w1'), false);
+  // Default selection stays on `main`'s New workspace (never jumps down to Other spaces!).
+  assert.equal(h.view.current().repo.name, 'main');
+  assert.equal(h.view.current().kind, 'create');
+
+  // Inactive target space shows "(tab in local-a)" hint; Shift+Enter opens a tab named "main".
+  h.view.selectedKey = h.view.picks()[0].key;
   assert.ok(words(h.render()).some(x => x.includes('(tab in local-a)')));
   h.inputs[0].emit('submit', undefined, { shift: true });
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/r/main', name: 'main' } });
 
-  // Type a name, move to "2 other spaces", trigger submit + bubbled key("enter") synchronously -> expands once and does NOT close!
+  // Unpinned typing `.dotf` (prefix) floats `.dotfiles` with `New workspace` FIRST and renders inline `iles/` ghost suffix (no `.dotfiles/` pill or Tab hint).
+  h.view.selectedKey = null;
   h.actions.length = 0;
   h.overlays.length = 0;
-  h.inputs[0].emit('change', 'remote-wt');
-  const moreIdx = h.view.picks().findIndex(e => e.kind === 'more');
-  assert.ok(moreIdx >= 0);
-  h.view.at = moreIdx;
+  h.inputs[0].emit('change', '.dotf');
+  assert.equal(h.view.current().repo.name, '.dotfiles');
+  assert.equal(h.view.current().kind, 'create');
+  const preWords = words(h.render());
+  assert.ok(preWords.includes('iles/'));
+  assert.equal(preWords.includes('.dotfiles/'), false);
+  assert.equal(preWords.includes('\u21e5'), false);
+
+  // Pinning `default` under `.dotfiles` survives typing (`i`), disappears cleanly on `x`,
+  // and re-attaches when backspacing back to `.dotfi`! Also stays on `default` across `right`.
+  key(h, 'down');
+  assert.equal(h.view.current().kind, 'ws');
+  assert.equal(h.view.current().ws.name, 'default');
+  h.inputs[0].emit('change', '.dotfi');
+  assert.equal(h.view.current().kind, 'ws');
+  assert.equal(h.view.current().ws.name, 'default');
+  h.inputs[0].emit('change', '.dotfix');
+  assert.equal(h.view.current().kind, 'create');
+  assert.equal(h.view.current().name, '.dotfix');
+  h.inputs[0].emit('change', '.dotfi');
+  assert.equal(h.view.current().kind, 'ws');
+  assert.equal(h.view.current().ws.name, 'default');
+  h.inputs[0].set_selected_range({ start: 2, end: 2 });
+  key(h, 'right');
+  assert.equal(h.inputs[0].value(), '.dotfi');
+  h.inputs[0].set_selected_range({ start: 6, end: 6 });
+  key(h, 'right');
+  assert.equal(h.inputs[0].value(), '.dotfiles/');
+  assert.equal(h.view.current().kind, 'ws');
+  assert.equal(h.view.current().ws.name, 'default');
+
+  // Scrolling off `.dotfiles` to a non-matching repo (`main` under Create elsewhere) hides the ghost
+  // and `right` does not hijack back to `.dotfiles`.
+  h.view.selectedKey = null;
+  h.inputs[0].emit('change', '.dotf');
+  key(h, 'down'); // .dotfiles/default
+  key(h, 'down'); // main / New ".dotf"
+  assert.equal(h.view.current().repo.name, 'main');
+  assert.equal(h.view.ghost(), null);
+  h.inputs[0].set_selected_range({ start: 5, end: 5 });
+  key(h, 'right');
+  assert.equal(h.inputs[0].value(), '.dotf');
+  assert.equal(h.view.current().repo.name, 'main');
+
+  // Typing `/` on `.dotfiles`'s `New workspace` auto-completes `.dotfiles/` and keeps `New workspace` at row 0.
+  h.view.selectedKey = null;
+  h.inputs[0].emit('change', 'dotf');
+  assert.ok(words(h.render()).includes(' \u2192 .dotfiles/'));
+  h.inputs[0].emit('change', 'dotf/');
+  assert.equal(h.inputs[0].value(), '.dotfiles/');
+  assert.equal(h.view.current().kind, 'create');
+  assert.equal(h.view.current().repo.name, '.dotfiles');
+  assert.equal(h.view.picks()[0].kind, 'create');
+
+  // Typing `fix` after `.dotfiles/` highlights New "fix" in `.dotfiles`, and submit + bubbled Enter only creates once!
+  h.inputs[0].emit('change', '.dotfiles/fix');
+  assert.equal(h.view.current().kind, 'create');
+  assert.equal(h.view.current().name, 'fix');
   h.inputs[0].emit('submit');
   key(h, 'enter'); // simulates GPUI bubbling Enter after Input submit
   await h.drain();
-  assert.deepEqual(h.overlays, []);
-  assert.deepEqual(h.actions, []);
-  assert.ok(h.view.repos.some(r => r.name === 'streams' && r.on === 'retriever'));
-  assert.equal(h.view.current().kind, 'create');
-  assert.equal(h.view.current().repo.name, 'streams');
-  // Shift+Enter on remote repo shows inline error and opens nothing.
+  const dotAdd = h.calls.filter(c => c.cmd === 'jj' && c.args.includes('add'));
+  assert.equal(dotAdd.length, 1);
+  assert.equal(dotAdd[0].cwd, '/home/u/.dotfiles');
+  assert.ok(dotAdd[0].args.includes('--name') && dotAdd[0].args.includes('fix'));
+  assert.ok(dotAdd[0].args.includes('/home/u/.herdr/worktrees/.dotfiles/fix'));
+
+  // Remote `streams/remote-wt`: Shift+Enter refuses cross-machine tab; Enter creates on retriever using remote $HOME.
+  h.actions.length = 0;
+  h.inputs[0].emit('change', 'streams/remote-wt');
   h.inputs[0].emit('submit', undefined, { shift: true });
   await h.drain();
   assert.ok(words(h.render()).some(x => x.includes('Tabs in this space cannot open a workspace on retriever.')));
   assert.deepEqual(h.actions, []);
-  // Enter creates on retriever using remote $HOME (/home/bits).
   h.inputs[0].emit('submit');
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/bits/.herdr/worktrees/streams/remote-wt', machine: 'retriever' } });
 });
 
-test('non-jj space with other spaces shows notice + expand row, and identity error keeps sibling repo usable', async () => {
+test('non-jj space shows notice when no repos exist anywhere, and identity error keeps sibling repo usable', async () => {
   const h = dialog('new', (cmd, args, opts) => {
     if (cmd === 'jj' && args.includes('root') && opts.cwd === '/bad') return fail('Error: broken toml');
     if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: '/o' }]);
@@ -563,18 +679,14 @@ test('non-jj space with other spaces shows notice + expand row, and identity err
   assert.ok(text.includes('Error: broken toml'));
   assert.equal(h.view.repos.map(r => r.name).join(','), 'o');
 
-  // Pure non-jj space with another space shows notice and expand row; expanding with no jj repos reports none found.
+  // Pure non-jj spaces with no disk repos reports not in a jj repo.
   const h2 = dialog('new', undefined, {
     spaces: [space('s1', '/g'), space('s2', '/g')],
     panes: [pane('s1', '/g'), pane('s2', '/g')],
     props: { overlay: 'o1' },
   });
   await h2.drain();
-  assert.ok(words(h2.render()).includes('No jj repo in this space.'));
-  assert.ok(words(h2.render()).includes('1 other space'));
-  key(h2, 'enter');
-  await h2.drain();
-  assert.ok(words(h2.render()).includes('No jj repos in other spaces.'));
+  assert.ok(words(h2.render()).some(x => x.includes('/g is not in a jj repo.')));
 });
 
 // Finish: space s1 has a tab in w1 and a tab in w2, space s2 a terminal in
@@ -591,12 +703,13 @@ function finishing(over = () => undefined) {
   return h;
 }
 const key = (h, k) => byId(h.render(), 'worktree').handlers.on_key_down({ key: k }, h.cx);
-// Ends the killed terminals, as the core would, and lets Finish see it.
+// Ends the killed terminals, as the core would, and re-renders as Herdr does.
 async function ended(h) {
   const killed = new Set(h.actions.filter(a => a.name === 'terminal.kill').map(a => a.args.terminal));
   h.state.terminals = h.state.terminals.filter(t => !killed.has(t.address));
   h.state.panes = h.state.panes.filter(p => !killed.has(p.terminal));
-  await h.advance(200);
+  h.render();
+  await h.drain();
 }
 const runs = (h, name) => plain(h.actions.filter(a => a.name === name).map(a => a.args));
 const jjLines = h => h.calls.filter(c => c.cmd === 'jj' && !c.args.includes('root')).map(c => `${c.cwd}: ${c.args.join(' ')}`);
@@ -760,7 +873,8 @@ test('Finish closes panes still showing an ended terminal', async () => {
   key(h, 'enter');
   await h.drain();
   h.state.terminals = h.state.terminals.filter(t => !['t1', 't3', 't4'].includes(t.address));
-  await h.advance(200);
+  h.render();
+  await h.drain();
   assert.deepEqual(runs(h, 'pane.close'), [{ pane: 'p1' }, { pane: 'p3' }]);
   assert.deepEqual(runs(h, 'space.close'), []);
 });
@@ -774,7 +888,8 @@ test('Finish closes the space once none of its terminals are left and removes on
   assert.deepEqual(runs(h, 'terminal.kill'), [{ terminal: 't1' }, { terminal: 't2' }, { terminal: 't3' }, { terminal: 't4' }]);
   h.state.terminals = h.state.terminals.filter(t => t.address === 't5');
   h.state.panes = h.state.panes.filter(p => p.pane === 'p3');
-  await h.advance(200);
+  h.render();
+  await h.drain();
   assert.deepEqual(runs(h, 'space.close'), [{ id: 's1', confirmed: true }]);
   assert.deepEqual(runs(h, 'pane.close'), [{ pane: 'p3' }]);
   assert.equal(jjLines(h).some(l => l.endsWith('remove w2')), false);
@@ -783,12 +898,24 @@ test('Finish closes the space once none of its terminals are left and removes on
   assert.deepEqual(jjLines(h).filter(l => l.includes('remove')), ['/r/main: workspace remove w1', '/r/main: workspace remove w2']);
 });
 
-test('Finish stops when a terminal is still listed after 10 seconds', async () => {
+test('Finish wakes immediately on render when killed terminal exits, and stops if still listed after 10 seconds', async () => {
+  // Async terminal exit: remains listed after terminal.kill until Herdr removes it and re-renders.
+  const h0 = finishing();
+  await h0.drain();
+  key(h0, 'enter');
+  await h0.drain();
+  assert.equal(jjLines(h0).some(l => l.includes('remove')), false);
+  h0.state.terminals = h0.state.terminals.filter(t => !['t1', 't3', 't4'].includes(t.address));
+  h0.render();
+  await h0.drain();
+  assert.deepEqual(jjLines(h0).filter(l => l.includes('remove')), ['/r/main: workspace remove w1']);
+
+  // Stuck terminal: fails after single 10 s deadline without removing anything.
   const h = finishing();
   await h.drain();
   key(h, 'enter');
   await h.drain();
-  for (let i = 0; i < 50; i++) await h.advance(200);
+  await h.advance(10_000);
   assert.ok(words(h.render()).includes('Terminal t1 in /r/w1/src did not stop.'));
   assert.equal(jjLines(h).some(l => l.includes('remove')), false);
   assert.deepEqual(runs(h, 'space.close'), []);

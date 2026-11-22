@@ -58,8 +58,10 @@ export function load(name, data = {}) {
     View: class {}, div: element, v_flex: element, h_flex: element, svg: element, image: element,
     InputState: { new: ({ value = '' } = {}) => {
       const on = {};
-      const input = { value: () => value, set_value(next) { value = next; on.change?.({}, cx); }, set_selected_range() {}, on(event, body) { on[event] = body; }, focus() {},
-        emit(event, next, payload = {}) { if (next !== undefined) value = next; on[event]?.(payload, cx); } };
+      let sel = { start: value.length, end: value.length };
+      const input = { value: () => value, set_value(next) { value = next; sel = { start: next.length, end: next.length }; on.change?.({}, cx); },
+        selected_range: () => sel, set_selected_range(next) { sel = next; }, on(event, body) { on[event] = body; }, focus() {},
+        emit(event, next, payload = {}) { if (next !== undefined) { value = next; sel = { start: next.length, end: next.length }; } on[event]?.(payload, cx); } };
       inputs.push(input);
       return input;
     } },

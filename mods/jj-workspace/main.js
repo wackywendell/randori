@@ -7,12 +7,76 @@
 // repository's main checkout; Shift+Enter opens a new tab in the target space
 // when on the same machine. Finish runs in a separate 520x360 window.
 
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle, Scrollbar, Checkbox } from "gpui-base";
-import { run, props, closeOverlay, theme, spaces, panes, terminals, exec, home, readTextFile, layout, notify, focused } from "herdr";
-import { identity } from "./jj.js";
+import { run, props, closeOverlay, theme, spaces, panes, terminals, exec, home, readTextFile, layout, notify, focused, shared } from "herdr";
+import { identity, joinPath } from "./jj.js";
 
 const IO = { exec, readTextFile };
+
+const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
+const PROJECT_COLORS = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];
+
+function repoColor(t, r, spaceList, paneList) {
+  const colors = shared("space.colors") ?? {};
+  let id = r.spaceId;
+  if (!id) {
+    const match = spaceList.find((s) => (s.machine ?? null) === (r.on ?? null) && inside(place(s, paneList) || "", r.main));
+    id = match?.id;
+  }
+  let c = id ? colors[id] : null;
+  if (!c) {
+    let h = 0;
+    for (const ch of r.key) h = (h * 31 + ch.charCodeAt(0)) | 0;
+    c = PROJECT_COLORS[Math.abs(h) % PROJECT_COLORS.length];
+  }
+  return c.startsWith("#") ? c : (MARK[c] ?? t[c] ?? t.accent);
+}
+
+const repoInitial = (name) => (name?.match(/[A-Za-z0-9]/)?.[0] ?? name?.[0] ?? "?").toUpperCase();
+
+// Static folder prefix before any {repo}/{name} template placeholder.
+function worktreesBase(directory, userHome) {
+  if (!directory || !userHome) return null;
+  const cut = directory.search(/\{[a-z]+\}/);
+  const raw = (cut >= 0 ? directory.slice(0, cut) : parent(directory)).replace(/\/+$/, "");
+  return raw ? untilde(raw, userHome) : null;
+}
+
+// Fast POSIX glob scan: checks immediate children of configured repo folders
+// and depth 1-2 of the worktrees base for `.jj` without descending into repos.
+// Emits `<mtime>\t<dir>` using each repo's `.jj/repo/op_heads/heads` mtime so
+// disk repositories sort by most recent jj activity.
+const DISK_SCAN = [
+  'wt="$1"; shift',
+  'emit() {',
+  '  p="$1"; h="$p/.jj/repo/op_heads/heads"',
+  '  if [ -f "$p/.jj/repo" ]; then',
+  '    r=$(cat "$p/.jj/repo" 2>/dev/null)',
+  '    case "$r" in /*) h="$r/op_heads/heads" ;; *) h="$p/.jj/$r/op_heads/heads" ;; esac',
+  '  fi',
+  '  m=$(stat -f %m "$h" 2>/dev/null || stat -c %Y "$h" 2>/dev/null || echo 0)',
+  '  printf "%s\\t%s\\n" "$m" "$p"',
+  '}',
+  'if [ -n "$wt" ] && [ -d "$wt" ]; then',
+  '  for a in "$wt"/* "$wt"/.[!.]*; do',
+  '    [ -d "$a" ] || continue',
+  '    if [ -d "$a/.jj" ]; then emit "$a"; continue; fi',
+  '    for b in "$a"/* "$a"/.[!.]*; do',
+  '      [ -d "$b/.jj" ] && emit "$b"',
+  '    done',
+  '  done',
+  'fi',
+  'for root in "$@"; do',
+  '  [ -d "$root" ] || continue',
+  '  [ -d "$root/.jj" ] && emit "$root"',
+  '  for d in "$root"/* "$root"/.[!.]*; do',
+  '    [ -d "$d/.jj" ] && emit "$d"',
+  '  done',
+  'done',
+].join("\n");
+
+const SOURCE_RANK = { space: 0, other: 1, disk: 2 };
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s, all = panes()) {
@@ -35,7 +99,7 @@ function folders(s, all = panes()) {
 }
 
 // The settings on the jj-spaces layout block, over these defaults.
-const DEFAULTS = { directory: "~/.herdr/worktrees/{repo}/{name}", links: [], miseTrust: true };
+const DEFAULTS = { directory: "~/.herdr/worktrees/{repo}/{name}", links: [], miseTrust: true, repos: [] };
 function settings(root = layout()) {
   const find = (node) => node?.content?.mod === "jj-spaces" ? node : (node?.children ?? []).map(find).find(Boolean);
   return { ...DEFAULTS, ...(find(root)?.content?.props ?? {}) };
@@ -86,11 +150,18 @@ async function jj(cwd, args, on, timeout) {
 }
 
 // Every workspace of a repo, the main checkout first: { name, path, main }.
-// A workspace made before jj 0.38 records no folder: its path is "".
+// A workspace made before jj 0.38 records no folder (root: null): recover `default`
+// from repo.main when no other entry claims it; other unrecorded workspaces stay "".
 async function workspaces(repo, on) {
   const r = await jj(repo.root, ["--ignore-working-copy", "workspace", "list", "-T", 'json({"name" => name, "root" => root}) ++ "\\n"'], on);
   if (!r.ok) throw new Error(r.err || "jj workspace list failed.");
-  const list = r.out.split("\n").filter(Boolean).map((l) => JSON.parse(l)).map((w) => ({ name: w.name, path: w.root, main: w.root === repo.main }));
+  const raw = r.out.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const hasMain = raw.some((w) => w.root === repo.main);
+  const list = raw.map((w) => {
+    const recovered = !w.root && !hasMain && w.name === "default" && Boolean(repo.main);
+    const path = recovered ? repo.main : (w.root ?? "");
+    return { name: w.name ?? "", path, main: Boolean(path && path === repo.main) };
+  });
   return list.sort((a, b) => b.main - a.main || a.name.localeCompare(b.name));
 }
 
@@ -117,25 +188,37 @@ export default class Workspace extends View {
     this.homeTasks = new Map();
     this.userHome = this.on ? null : this.homes[""];
     this.finishing = this.p.action === "finish";
+    this.waitingExit = null;
     this.rows = []; // finish: { name, root, main, repoName, checked, removed, error }
     this.multiRepo = false;
     this.confirmed = new Set();
-    this.repos = []; // { key, name, main, checkout, on, other, list, names, error }
+    this.repos = []; // { key, name, main, checkout, on, source: "space" | "other" | "disk", spaceId, list, names, error }
     this.probed = new Set();
     this.focusKey = null;
     this.focusRoot = null;
     this.ready = false;
-    this.expanded = false;
-    this.expanding = false;
+    this.loadingBg = false;
     this.submitted = false;
     this.text = "";
-    this.at = 0;
+    this.at = 0; // finish window cursor
+    this.selectedKey = null; // pinned picker row key; null follows top/initial row
     this.scroll = ScrollHandle.new();
-    this.input = InputState.new({ value: this.text, placeholder: "Name" });
+    this.input = InputState.new({ value: this.text, placeholder: "Name or repo/name" });
     this.input.on("change", (_e, cx) => {
-      this.text = this.input.value();
+      const prev = this.text;
+      const prevCur = this.current();
+      const next = this.input.value();
+      this.text = next;
       this.error = "";
-      this.at = 0;
+      // Typing `/` when the highlighted row's repo matches the prefix auto-completes `<repo>/`.
+      const trimmed = next.trim();
+      if (next.length === prev.length + 1 && next.endsWith("/") && trimmed.indexOf("/") === trimmed.length - 1) {
+        const rp = trimmed.slice(0, -1).toLowerCase();
+        if (rp && prevCur?.repo && (prevCur.repo.name ?? "").toLowerCase().includes(rp) && trimmed !== `${prevCur.repo.name}/`) {
+          this.completeRepo(prevCur.repo, cx);
+          return;
+        }
+      }
       this.scrollCurrent();
       cx.notify();
     });
@@ -149,8 +232,8 @@ export default class Workspace extends View {
     this.input.on("focus", (_e, cx) => { this.inputFocused = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.inputFocused = false; cx.notify(); });
     this.handle = cx.focus_handle();
-    this.handle.focus();
-    if (!this.finishing) this.input.focus();
+    if (this.finishing) this.handle.focus();
+    else this.input.focus();
     this.busy = false;
     this.error = "";
     this.repo = undefined; // finish: undefined loading, null error, { main, name } ready
@@ -168,11 +251,10 @@ export default class Workspace extends View {
         const focusDir = this.focusFolder(s);
         this.folder = focusDir || (this.on ? await this.homeOf(this.on) : this.homes[""]);
         const targetList = s ? [s] : [];
-        await this.probe(targetList, false, focusDir, cx);
-        this.at = this.initialIndex();
+        await this.probe(targetList, "space", focusDir, cx);
+        this.sortRepos();
         this.scrollCurrent();
-        this.handle.focus();
-        cx.timer.after(100, () => this.input.focus());
+        this.loadBackground(cx);
       } catch (error) {
         console.log(`jj-workspace: ${error?.message ?? error}`);
         if (this.finishing) this.repo = null;
@@ -241,100 +323,173 @@ export default class Workspace extends View {
     cx?.notify();
   }
 
-  // Probes unique (folder, machine) pairs in tab order, deduplicating repos.
-  // When `other` is true, settles and notifies per folder/repo so a slow remote
-  // machine does not stall reachable local spaces.
-  async probe(spaceList, other, focusDir, cx) {
+  // Canonical deterministic repo order:
+  // 1. Current space (focused repo first, then tab order)
+  // 2. Other spaces (pure sidebar order, then tab order)
+  // 3. Disk repositories (most recent jj op_heads mtime first, then alphabetical)
+  sortRepos() {
+    this.repos.sort((a, b) => {
+      const sr = (SOURCE_RANK[a.source] ?? 9) - (SOURCE_RANK[b.source] ?? 9);
+      if (sr !== 0) return sr;
+      if (a.source === "space") {
+        const af = a.key === this.focusKey ? 0 : 1;
+        const bf = b.key === this.focusKey ? 0 : 1;
+        if (af !== bf) return af - bf;
+        return (a.order ?? 0) - (b.order ?? 0);
+      }
+      if (a.source === "other") return (a.order ?? 0) - (b.order ?? 0);
+      if ((b.mtime ?? 0) !== (a.mtime ?? 0)) return (b.mtime ?? 0) - (a.mtime ?? 0);
+      return (a.name ?? "").localeCompare(b.name ?? "", undefined, { sensitivity: "base" });
+    });
+  }
+
+  // Probes unique (folder, machine) pairs in sidebar/tab order, deduplicating repos.
+  // For background sources ("other" / "disk"), settles and notifies per repo while
+  // keeping canonical deterministic ordering regardless of async completion order.
+  async probe(spaceList, source, focusDir, cx) {
     const paneList = panes();
     const pairs = [];
     const batchSeen = new Set();
-    const enqueue = (folder, on) => {
+    const enqueue = (folder, on, spaceId) => {
       if (!folder) return;
       const pk = `${on ?? ""}\0${folder}`;
       if (this.probed.has(pk) || batchSeen.has(pk)) return;
       batchSeen.add(pk);
       this.probed.add(pk);
-      pairs.push({ folder, on: on ?? null });
+      pairs.push({ folder, on: on ?? null, spaceId: spaceId ?? null, order: pairs.length });
     };
     for (const s of spaceList) {
       const on = s.machine ?? null;
-      for (const dir of folders(s, paneList)) enqueue(dir, on);
+      for (const dir of folders(s, paneList)) enqueue(dir, on, s.id ?? null);
     }
-    if (!other && focusDir) enqueue(focusDir, this.spaceMachine);
+    if (source === "space" && focusDir) enqueue(focusDir, this.spaceMachine, this.spaceId);
     if (!pairs.length) return;
 
-    const addFromId = (folder, on, id) => {
+    const addFromId = (folder, on, spaceId, order, id) => {
       if (id.error) {
-        if (!this.error) this.error = id.message;
+        if (source === "space" && !this.error) this.error = id.message;
+        else console.log(`jj-workspace: ${folder}: ${id.message}`);
         return null;
       }
       if (!id.jj || !id.main) return null;
       const key = `${on ?? ""}\0${id.main}`;
       let r = this.repos.find((x) => x.key === key);
       if (!r) {
-        r = { key, name: base(id.main), main: id.main, checkout: id.root, on, other, list: undefined, names: undefined, error: "" };
+        r = { key, name: base(id.main), main: id.main, checkout: id.root, on, source, spaceId, order, mtime: 0, list: undefined, names: undefined, error: "" };
         this.repos.push(r);
-        if (!other && folder === focusDir) { this.focusKey = key; this.focusRoot = id.root; }
+        if (source === "space" && folder === focusDir) { this.focusKey = key; this.focusRoot = id.root; }
+        this.sortRepos();
         return r;
       }
-      if (!other && folder === focusDir) {
+      if (r.source === source && order < (r.order ?? Infinity)) {
+        r.order = order;
+        if (spaceId) r.spaceId = spaceId;
+        this.sortRepos();
+      } else if (!r.spaceId && spaceId) {
+        r.spaceId = spaceId;
+      }
+      if (source === "space" && folder === focusDir) {
         r.checkout = id.root;
         this.focusKey = key;
         this.focusRoot = id.root;
+        this.sortRepos();
       }
       return null;
     };
 
-    if (!other) {
-      const ids = await Promise.all(pairs.map(async ({ folder, on }) => ({ folder, on, id: await identity(folder, on, IO) })));
+    if (source === "space") {
+      const ids = await Promise.all(pairs.map(async ({ folder, on, spaceId, order }) => ({ folder, on, spaceId, order, id: await identity(folder, on, IO) })));
       const added = [];
-      for (const { folder, on, id } of ids) {
-        const r = addFromId(folder, on, id);
+      for (const { folder, on, spaceId, order, id } of ids) {
+        const r = addFromId(folder, on, spaceId, order, id);
         if (r) added.push(r);
       }
       await Promise.all(added.map((r) => this.loadRepo(r)));
       return;
     }
 
-    await Promise.allSettled(pairs.map(async ({ folder, on }) => {
+    await Promise.allSettled(pairs.map(async ({ folder, on, spaceId, order }) => {
       const id = await identity(folder, on, IO);
-      const r = addFromId(folder, on, id);
+      const r = addFromId(folder, on, spaceId, order, id);
       if (r) {
         cx?.notify();
         await this.loadRepo(r, cx);
-      } else if (id.error) {
-        cx?.notify();
       }
     }));
   }
 
-  expand(cx) {
-    if (this.expanded || this.expanding) return;
-    const before = this.repos.length;
-    this.expanding = true;
-    cx.notify();
+  // Background discovery of other spaces, the worktrees folder, and configured
+  // `repos` folders on local disk. Never blocks initial dialog open.
+  loadBackground(cx) {
+    const otherSpaces = this.others();
+    const cfg = settings();
+    const localHome = this.homes[""];
+    const wt = worktreesBase(cfg.directory, localHome);
+    const roots = (Array.isArray(cfg.repos) ? cfg.repos : []).filter((d) => typeof d === "string" && d.trim()).map((d) => untilde(d.trim(), localHome));
+    if (!otherSpaces.length && !wt && !roots.length) return;
+    this.loadingBg = true;
     cx.spawn(async (cx) => {
       try {
-        await this.probe(this.others(), true, null, cx);
-      } catch (error) {
-        console.log(`jj-workspace: ${error?.message ?? error}`);
-        if (!this.error) this.error = String(error?.message ?? error);
+        await Promise.allSettled([
+          otherSpaces.length ? this.probe(otherSpaces, "other", null, cx) : Promise.resolve(),
+          wt || roots.length ? this.scanDisk(wt, roots, cx) : Promise.resolve(),
+        ]);
       } finally {
-        this.expanding = false;
-        this.expanded = true;
-        const p = this.picks();
-        if (this.repos.length > before) {
-          const firstNew = this.repos[before];
-          const idx = p.findIndex((e) => e.repo?.key === firstNew.key);
-          this.at = idx >= 0 ? idx : Math.min(this.at, Math.max(0, p.length - 1));
-          this.scrollCurrent();
-        } else {
-          this.at = Math.min(this.at, Math.max(0, p.length - 1));
-        }
+        this.loadingBg = false;
         cx.notify();
-        this.input.focus();
       }
     });
+  }
+
+  async scanDisk(wt, roots, cx) {
+    let r;
+    try {
+      r = await exec("sh", ["-c", DISK_SCAN, "sh", wt || "", ...roots], { timeout: 5_000 });
+    } catch {
+      return;
+    }
+    if (r.code !== 0 || !r.stdout?.trim()) return;
+    // Parse `<mtime>\t<dir>` (or plain `<dir>`), keeping highest mtime per path.
+    const rawEntries = new Map();
+    for (const line of r.stdout.trim().split("\n")) {
+      if (!line) continue;
+      const tab = line.indexOf("\t");
+      const mtime = tab >= 0 ? (Number(line.slice(0, tab)) || 0) : 0;
+      const dir = tab >= 0 ? line.slice(tab + 1) : line;
+      if (!dir) continue;
+      if (!rawEntries.has(dir) || mtime > rawEntries.get(dir)) rawEntries.set(dir, mtime);
+    }
+    // Resolve linked worktrees via `.jj/repo` pointer file so multiple worktrees
+    // of an already-known repo produce zero extra jj calls.
+    const candidates = new Map();
+    const seenMains = new Set(this.repos.filter((x) => !x.on).map((x) => x.main));
+    for (const [dir, mtime] of rawEntries) {
+      if (seenMains.has(dir)) continue;
+      if (this.repos.some((x) => !x.on && (x.list ?? []).some((w) => w.path === dir))) continue;
+      const ptr = await readTextFile(`${dir}/.jj/repo`).catch(() => null);
+      let target = dir;
+      if (typeof ptr === "string" && ptr.trim()) {
+        const repoDir = joinPath(`${dir}/.jj`, ptr.trim());
+        target = repoDir.replace(/\/\.jj\/repo\/?$/, "");
+      }
+      if (!target || seenMains.has(target)) continue;
+      if (!candidates.has(target) || mtime > candidates.get(target)) candidates.set(target, mtime);
+    }
+    if (!candidates.size) return;
+    await Promise.allSettled([...candidates.entries()].map(async ([folder, mtime]) => {
+      const pk = `\0${folder}`;
+      if (this.probed.has(pk)) return;
+      this.probed.add(pk);
+      const id = await identity(folder, null, IO);
+      if (id.error || !id.jj || !id.main) return;
+      const key = `\0${id.main}`;
+      if (this.repos.some((x) => x.key === key)) return;
+      const repo = { key, name: base(id.main), main: id.main, checkout: id.root, on: null, source: "disk", spaceId: null, order: 0, mtime, list: undefined, names: undefined, error: "" };
+      this.repos.push(repo);
+      this.sortRepos();
+      cx?.notify();
+      await this.loadRepo(repo, cx);
+    }));
   }
 
   close() {
@@ -354,37 +509,92 @@ export default class Workspace extends View {
     return r.list.find((w) => w.name === name) ?? null;
   }
 
+  // Parses `repo/name` when the prefix before the first `/` matches a loaded
+  // repo; otherwise treats the input as an unscoped filter / workspace name
+  // (preserving slashes in names like `feat/auth` when `feat` is not a repo).
+  parseQuery(raw = this.text.trim()) {
+    if (!raw) return { mode: "empty", q: "", name: "", scoped: null };
+    const slash = raw.indexOf("/");
+    if (slash > 0) {
+      const rp = raw.slice(0, slash).toLowerCase();
+      const np = raw.slice(slash + 1);
+      const exact = this.repos.filter((r) => r.name.toLowerCase() === rp);
+      const matched = exact.length ? exact : this.repos.filter((r) => r.name.toLowerCase().includes(rp));
+      if (matched.length) return { mode: "scoped", q: np.toLowerCase(), name: np, scoped: new Set(matched.map((r) => r.key)) };
+    }
+    return { mode: "search", q: raw.toLowerCase(), name: raw, scoped: null };
+  }
+
   items() {
     const out = [];
-    const localRepos = this.repos.filter((r) => !r.other);
-    const otherRepos = this.repos.filter((r) => r.other);
-    const otherCount = this.others().length;
-    const trimmed = this.text.trim();
-    const f = trimmed.toLowerCase();
-    const showHeaders = this.repos.length > 1 || this.expanded;
+    const parsed = this.parseQuery();
+    const bySource = (src) => this.repos.filter((r) => r.source === src);
 
-    const appendGroup = (group, divider) => {
-      const entries = [];
-      for (const r of group) {
-        const ws = (r.list ?? []).filter((w) => !f || `${r.name} ${w.name} ${w.path}`.toLowerCase().includes(f));
-        const showCreate = !r.error && r.names !== undefined && !this.existing(r, trimmed);
-        if (!ws.length && !showCreate && !r.error && r.list !== undefined) continue;
-        if (showHeaders) entries.push({ kind: "header", repo: r });
-        if (r.error) entries.push({ kind: "repo-error", repo: r });
-        else if (r.list === undefined) entries.push({ kind: "repo-loading", repo: r });
-        for (const w of ws) entries.push({ kind: "ws", key: `${r.key}\0${w.name}`, repo: r, ws: w, pick: true });
-        if (showCreate) entries.push({ kind: "create", key: `${r.key}\0+new`, repo: r, pick: true });
-      }
-      if (entries.length) {
-        if (divider) out.push({ kind: "divider", label: divider });
-        out.push(...entries);
-      }
+    const pushRepo = (target, r, ws, createName, showCreate, createFirst = false) => {
+      if (!ws.length && !showCreate && !r.error && r.list !== undefined) return;
+      target.push({ kind: "header", repo: r });
+      if (r.error) target.push({ kind: "repo-error", repo: r });
+      else if (r.list === undefined) target.push({ kind: "repo-loading", repo: r });
+      const createEntry = showCreate ? { kind: "create", key: `${r.key}\0+new`, repo: r, name: createName, pick: true } : null;
+      if (createEntry && createFirst) target.push(createEntry);
+      for (const w of ws) target.push({ kind: "ws", key: `${r.key}\0${w.name}`, repo: r, ws: w, pick: true });
+      if (createEntry && !createFirst) target.push(createEntry);
     };
 
-    appendGroup(localRepos, null);
-    appendGroup(otherRepos, "Other spaces");
-    if (this.expanding) out.push({ kind: "looking" });
-    else if (!this.expanded && otherCount > 0) out.push({ kind: "more", count: otherCount, pick: true });
+    if (parsed.mode === "empty") {
+      const addSection = (src, divider) => {
+        const entries = [];
+        for (const r of bySource(src)) {
+          const showCreate = !r.error && r.names !== undefined;
+          pushRepo(entries, r, r.list ?? [], "", showCreate);
+        }
+        if (entries.length) {
+          if (divider && out.length) out.push({ kind: "divider", label: divider });
+          out.push(...entries);
+        }
+      };
+      addSection("space", null);
+      addSection("other", "Other spaces");
+      addSection("disk", "Repositories");
+      if (this.loadingBg) out.push({ kind: "looking" });
+      return out;
+    }
+
+    if (parsed.mode === "scoped") {
+      for (const r of this.repos) {
+        if (!parsed.scoped.has(r.key)) continue;
+        const ws = (r.list ?? []).filter((w) => !parsed.q || (w.name ?? "").toLowerCase().includes(parsed.q));
+        const showCreate = !r.error && r.names !== undefined && !this.existing(r, parsed.name);
+        pushRepo(out, r, ws, parsed.name, showCreate, !parsed.q);
+      }
+      if (this.loadingBg) out.push({ kind: "looking" });
+      return out;
+    }
+
+    // Search mode: float matching repos (by repo name or workspace name) above
+    // non-matching repos' "+ New <name>" rows.
+    const matched = [];
+    const createElsewhere = [];
+    const q = parsed.q;
+    for (const r of this.repos) {
+      const repoMatch = (r.name ?? "").toLowerCase().includes(q);
+      const wsMatches = (r.list ?? []).filter((w) => (w.name ?? "").toLowerCase().includes(q));
+      if (repoMatch || wsMatches.length) {
+        const ws = repoMatch && !wsMatches.length ? (r.list ?? []) : wsMatches;
+        const createName = repoMatch && !wsMatches.length ? "" : parsed.name;
+        const showCreate = !r.error && r.names !== undefined && (!createName || !this.existing(r, createName));
+        const createFirst = repoMatch && !wsMatches.length;
+        pushRepo(matched, r, ws, createName, showCreate, createFirst);
+      } else if (!r.error && r.names !== undefined && !this.existing(r, parsed.name)) {
+        pushRepo(createElsewhere, r, [], parsed.name, true);
+      }
+    }
+    out.push(...matched);
+    if (createElsewhere.length) {
+      if (matched.length) out.push({ kind: "divider", label: "Create elsewhere" });
+      out.push(...createElsewhere);
+    }
+    if (this.loadingBg) out.push({ kind: "looking" });
     return out;
   }
 
@@ -392,37 +602,49 @@ export default class Workspace extends View {
     return list.filter((e) => e.pick);
   }
 
-  // Initial selection: prefer the first available workspace in the focused repo
-  // that isn't the checkout we're already sitting in, else any other workspace,
-  // else the focused repo's "+ New" row, else 0.
-  initialIndex() {
-    const p = this.picks();
+  // Default row when nothing is pinned and input is empty: stay within the
+  // current space (first other workspace in the focused repo, else the focused
+  // repo's "New workspace", else another workspace / "New workspace" in this
+  // space). Only fall back to other spaces/disk repos if this space has no jj repo.
+  initialIndex(p = this.picks()) {
     if (!p.length) return 0;
     const isOtherWs = (e) => e.kind === "ws" && Boolean(e.ws.path) && (!this.focusRoot || e.ws.path !== this.focusRoot);
     if (this.focusKey) {
       const i = p.findIndex((e) => e.repo?.key === this.focusKey && isOtherWs(e));
       if (i >= 0) return i;
-    }
-    const anyOther = p.findIndex(isOtherWs);
-    if (anyOther >= 0) return anyOther;
-    if (this.focusKey) {
       const c = p.findIndex((e) => e.kind === "create" && e.repo?.key === this.focusKey);
       if (c >= 0) return c;
     }
-    return 0;
+    const spaceOther = p.findIndex((e) => e.repo?.source === "space" && isOtherWs(e));
+    if (spaceOther >= 0) return spaceOther;
+    const spaceCreate = p.findIndex((e) => e.repo?.source === "space" && e.kind === "create");
+    if (spaceCreate >= 0) return spaceCreate;
+    const anyOther = p.findIndex(isOtherWs);
+    return anyOther >= 0 ? anyOther : 0;
   }
 
-  current() {
-    const p = this.picks();
-    if (p.length) return p[Math.min(this.at, p.length - 1)];
-    return undefined;
+  // Single selection invariant: if the user pinned a row (`selectedKey`) and it
+  // is currently visible in `picks`, stay on it; if hidden (or unpinned), act
+  // as row 0 (or initialIndex when empty) while keeping `selectedKey` intact so
+  // backspacing brings the pinned row right back.
+  resolve(picks = this.picks()) {
+    if (!picks.length) return -1;
+    if (this.selectedKey) {
+      const i = picks.findIndex((e) => e.key === this.selectedKey);
+      if (i >= 0) return i;
+    }
+    return this.text.trim() ? 0 : this.initialIndex(picks);
+  }
+
+  current(picks = this.picks()) {
+    const i = this.resolve(picks);
+    return i >= 0 ? picks[i] : undefined;
   }
 
   scrollCurrent() {
     const list = this.items();
-    const picks = this.picks(list);
-    if (!picks.length) return;
-    const cur = picks[Math.min(this.at, picks.length - 1)];
+    const cur = this.current(this.picks(list));
+    if (!cur) return;
     const idx = list.indexOf(cur);
     if (idx >= 0) this.scroll.scroll_to_item(idx);
   }
@@ -430,12 +652,44 @@ export default class Workspace extends View {
   move(delta) {
     const p = this.picks();
     if (!p.length) return;
-    this.at = (Math.min(this.at, p.length - 1) + delta + p.length) % p.length;
+    const cur = Math.max(0, this.resolve(p));
+    this.selectedKey = p[(cur + delta + p.length) % p.length].key;
     this.scrollCurrent();
   }
 
+  // Inline ghost completion always follows the highlighted row's repo, never a
+  // hidden separate match. Only appears when the highlighted repo actually matches
+  // the typed query (before `/`). Prefix matches show the remainder (`.dotf` -> `iles/`);
+  // mid-string matches show ` → .dotfiles/`.
+  ghost() {
+    const raw = this.text;
+    if (!raw || raw.length >= 40 || raw !== raw.trim() || raw.includes("/")) return null;
+    const repo = this.current()?.repo;
+    if (!repo) return null;
+    const q = raw.toLowerCase();
+    if (!(repo.name ?? "").toLowerCase().includes(q)) return null;
+    const suffix = repo.name.toLowerCase().startsWith(q)
+      ? `${repo.name.slice(raw.length)}/`
+      : ` \u2192 ${repo.name}/`;
+    return { repo, typed: raw, suffix, fill: `${repo.name}/` };
+  }
+
+  // Fills `<repo>/` into the input; `resolve()` naturally keeps `selectedKey`
+  // highlighted if visible or falls back to row 0.
+  completeRepo(r, cx) {
+    if (!r) return;
+    const next = `${r.name}/`;
+    this.text = next;
+    this.input.set_value(next);
+    this.input.set_selected_range({ start: next.length, end: next.length });
+    this.text = next;
+    this.scrollCurrent();
+    this.input.focus();
+    cx?.notify();
+  }
+
   // The folder and start of the workspace a name would make.
-  planned(r = this.selectedRepo(), name = this.text.trim()) {
+  planned(r = this.selectedRepo(), name = this.parseQuery().name) {
     if (typeof r === "string") { name = r; r = this.selectedRepo(); }
     if (!r) return null;
     const userHome = this.homes[r.on ?? ""] ?? "";
@@ -443,7 +697,7 @@ export default class Workspace extends View {
     return { name, path: untilde(directory, userHome), bookmark: Boolean(r.names?.has(name)) };
   }
 
-  previewPath(r, name = this.text.trim()) {
+  previewPath(r, name = "") {
     const userHome = this.homes[r.on ?? ""] ?? "";
     const directory = settings().directory.replaceAll("{repo}", r.name).replaceAll("{name}", slug(name) || "\u2026");
     return tilde(untilde(directory, userHome), userHome);
@@ -453,16 +707,19 @@ export default class Workspace extends View {
     if (this.busy) return;
     const cur = this.current();
     if (!cur) return;
-    if (cur.kind === "more") return this.expand(cx);
     if (cur.kind === "ws") return this.open(cur.ws, cur.repo, asTab, cx);
     if (cur.kind === "create") {
-      if (!this.text.trim()) { this.input.focus(); return; }
-      cx.spawn(async (cx) => this.work(cur.repo, cx, asTab));
+      if (!cur.name) {
+        if (this.text.trim() !== `${cur.repo.name}/`) this.completeRepo(cur.repo, cx);
+        else this.input.focus();
+        return;
+      }
+      cx.spawn(async (cx) => this.work(cur.repo, cx, asTab, cur.name));
     }
   }
 
-  async work(r = this.selectedRepo(), cx, asTab = false) {
-    if (r && typeof r.notify === "function") { asTab = Boolean(cx); cx = r; r = this.selectedRepo(); }
+  async work(r = this.selectedRepo(), cx, asTab = false, name) {
+    if (r && typeof r.notify === "function") { name = asTab; asTab = Boolean(cx); cx = r; r = this.selectedRepo(); }
     if (this.busy || !r) return;
     if (asTab && !this.canTab(r)) {
       this.error = `Tabs in this space cannot open a workspace on ${r.on}. Press Enter for a new space.`;
@@ -472,7 +729,7 @@ export default class Workspace extends View {
     this.busy = true;
     this.error = "";
     cx.notify();
-    try { this.error = await this.create(r, asTab); }
+    try { this.error = await this.create(r, asTab, name); }
     catch (error) { this.error = String(error?.message ?? error); }
     if (this.error) console.log(`jj-workspace: ${this.error}`);
     this.busy = false;
@@ -480,8 +737,9 @@ export default class Workspace extends View {
     cx.notify();
   }
 
-  async create(r, asTab = false) {
-    const { name, path, bookmark } = this.planned(r);
+  async create(r, asTab = false, rawName) {
+    const targetName = typeof rawName === "string" ? rawName.trim() : this.parseQuery().name;
+    const { name, path, bookmark } = this.planned(r, targetName);
     if (!name) return "Type a jj workspace name.";
     const { links, miseTrust } = settings();
     const add = ["workspace", "add", "--name", name, ...(bookmark ? ["-r", JSON.stringify(name)] : []), path];
@@ -689,20 +947,25 @@ export default class Workspace extends View {
   }
 
   // Kills direct terminals in the checked checkouts and waits up to 10 seconds
-  // for them to go (Herdr Core ends non-outliving children). Closes the target
-  // space only when no panes of any kind remain outside the ended terminals;
-  // otherwise closes the panes that showed ended terminals.
+  // for them to go (Herdr re-renders when `terminals()` changes, resolving the
+  // waiter on the exact frame they exit; a single 10 s deadline bounds the wait).
+  // Closes the target space only when no panes of any kind remain outside the
+  // ended terminals; otherwise closes the panes that showed ended terminals.
   async endTerminals(todo, direct, cx) {
     const rowOf = (t) => todo.find((r) => t.cwd && inside(t.cwd, r.root));
     const ends = new Set(direct.map((t) => t.address));
     for (const terminal of ends) run("terminal.kill", { terminal });
-    for (let waited = 0; ; waited += 200) {
+    if (terminals().some((t) => ends.has(t.address))) {
+      await new Promise((resolve) => {
+        let timer;
+        const done = () => { this.waitingExit = null; timer?.cancel?.(); resolve(); };
+        this.waitingExit = () => { if (!terminals().some((t) => ends.has(t.address))) done(); };
+        timer = cx.timer.after(10_000, done);
+      });
       const left = terminals().find((t) => ends.has(t.address));
-      if (!left) break;
-      if (waited >= 10_000) {
+      if (left) {
         throw Object.assign(new Error(`Terminal ${left.name || left.address} in ${tilde(left.cwd, this.userHome)} did not stop.`), { row: rowOf(left) });
       }
-      await new Promise((resolve) => cx.timer.after(200, resolve));
     }
     const s = spaces().find((c) => c.id === this.spaceId);
     const tabs = new Set((s?.tabs ?? []).map((c) => c.id));
@@ -722,6 +985,15 @@ export default class Workspace extends View {
       else return;
       cx.stop_propagation();
       return cx.notify();
+    }
+    if (e.key === "right" && !e.modifiers?.shift && !e.modifiers?.control && !e.modifiers?.alt && !e.modifiers?.platform) {
+      const g = this.ghost();
+      const sel = this.input.selected_range?.();
+      if (g && (!sel || (sel.start === this.text.length && sel.end === this.text.length))) {
+        this.completeRepo(g.repo, cx);
+        cx.stop_propagation();
+        return;
+      }
     }
     if (e.key === "enter") {
       if (this.submitted) return;
@@ -822,36 +1094,100 @@ export default class Workspace extends View {
   }
 
   render(cx) {
+    this.waitingExit?.();
     const t = theme();
     if (this.finishing) return this.renderFinish(t);
 
     const list = this.items();
     const picks = this.picks(list);
-    const activePick = picks.length ? Math.min(this.at, picks.length - 1) : -1;
-    const cur = this.current();
+    const activePick = this.resolve(picks);
+    const cur = activePick >= 0 ? picks[activePick] : undefined;
     const spaceList = spaces();
     const paneList = panes();
-    const otherCount = this.others().length;
     const activeSpace = spaceList.find((s) => s.active);
     const targetNote = this.spaceId && activeSpace && activeSpace.id !== this.spaceId && this.spaceName ? ` (tab in ${this.spaceName})` : "";
-    const trimmed = this.text.trim();
+
+    const pill = (label, color, bg = null, bordered = false) =>
+      div()
+        .flex_none()
+        .px(6)
+        .py(1)
+        .rounded(4)
+        .text_size(10.5)
+        .text_color(color)
+        .when(Boolean(bg), (el) => el.bg(bg))
+        .when(bordered, (el) => el.border(1).border_color(t.border))
+        .child(label);
+
+    const keycap = (label) =>
+      div()
+        .px(5)
+        .py(1)
+        .rounded(4)
+        .bg(t.surface)
+        .border(1)
+        .border_color(t.border)
+        .text_size(10.5)
+        .text_color(t.muted)
+        .child(label);
 
     let pickIndex = 0;
     const renderEntry = (entry) => {
       if (entry.kind === "divider") {
-        return div().flex_none().px(10).pt(8).pb(2).text_size(11).text_color(t.dim).child(entry.label);
+        return h_flex()
+          .flex_none()
+          .mt(8)
+          .mb(2)
+          .pt(8)
+          .px(8)
+          .border_t(1)
+          .border_color(t.border)
+          .items_center()
+          .child(div().text_size(11).font_semibold().text_color(t.dim).child(entry.label));
       }
       if (entry.kind === "header") {
         const r = entry.repo;
+        const userHome = this.homes[r.on ?? ""] ?? "";
         return h_flex()
           .flex_none()
-          .px(10)
-          .pt(6)
-          .pb(2)
+          .px(8)
+          .pt(8)
+          .pb(3)
           .gap(8)
           .items_center()
-          .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_semibold().text_color(t.muted).child(r.name))
-          .when(Boolean(r.on), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(r.on)));
+          .child(
+            h_flex()
+              .size(18)
+              .flex_none()
+              .rounded(5)
+              .bg(repoColor(t, r, spaceList, paneList))
+              .items_center()
+              .justify_center()
+              .text_size(10.5)
+              .font_bold()
+              .text_color("#ffffff")
+              .child(repoInitial(r.name)),
+          )
+          .child(div().flex_none().text_size(12).font_semibold().text_color(t.foreground).child(r.name))
+          .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(tilde(r.main, userHome)))
+          .when(Boolean(r.on), (el) =>
+            el.child(
+              h_flex()
+                .flex_none()
+                .px(6)
+                .py(1)
+                .gap(4)
+                .rounded(4)
+                .bg(t.surface)
+                .border(1)
+                .border_color(t.border)
+                .items_center()
+                .text_size(10.5)
+                .text_color(t.muted)
+                .child(svg("mods/workspace-chrome/server.svg").size(10).text_color(t.dim))
+                .child(r.on),
+            ),
+          );
       }
       if (entry.kind === "repo-error") {
         return div().flex_none().px(10).py(4).text_size(11.5).text_color(t.blocked).child(entry.repo.error);
@@ -860,113 +1196,145 @@ export default class Workspace extends View {
         return div().flex_none().px(10).py(4).text_size(11.5).text_color(t.dim).child("\u2026");
       }
       if (entry.kind === "looking") {
-        return div().flex_none().px(10).py(8).text_size(12).text_color(t.muted).child("Loading\u2026");
+        return h_flex()
+          .flex_none()
+          .px(10)
+          .py(8)
+          .gap(6)
+          .items_center()
+          .text_size(11.5)
+          .text_color(t.dim)
+          .child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.dim).spin(900))
+          .child("Loading other spaces\u2026");
       }
 
       const i = pickIndex++;
       const on = i === activePick;
 
-      if (entry.kind === "more") {
-        const label = `${entry.count} other space${entry.count === 1 ? "" : "s"}`;
+      if (entry.kind === "create") {
+        const r = entry.repo;
+        const name = entry.name || "";
+        const plan = name ? this.planned(r, name) : null;
+        const label = name ? `New "${name}"` : "New workspace";
         return h_flex()
           .id(`wt-${i}`)
           .flex_none()
-          .h(36)
-          .px(10)
+          .h(44)
+          .pl(6)
+          .pr(10)
+          .gap(8)
           .items_center()
           .rounded(7)
           .cursor_pointer()
           .when(on, (el) => el.bg(t.selected))
           .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
-          .on_click((_e, cx) => { this.at = i; this.expand(cx); })
-          .child(div().flex_1().text_size(12).text_color(t.muted).child(label))
-          .child(div().flex_none().text_size(11).text_color(t.dim).child("\u21b5"));
-      }
-
-      if (entry.kind === "create") {
-        const r = entry.repo;
-        const plan = trimmed ? this.planned(r, trimmed) : null;
-        const label = trimmed ? `+ New "${trimmed}"` : "+ New workspace";
-        return v_flex()
-          .id(`wt-${i}`)
-          .flex_none()
-          .h(44)
-          .px(10)
-          .justify_center()
-          .rounded(7)
-          .cursor_pointer()
-          .when(on, (el) => el.bg(t.selected))
-          .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
           .on_click((e, cx) => {
-            this.at = i;
-            if (!trimmed) { this.input.focus(); cx.notify(); return; }
-            cx.spawn(async (cx) => this.work(r, cx, Boolean(e?.modifiers?.shift || e?.shift)));
+            this.selectedKey = entry.key;
+            if (!name) {
+              if (this.text.trim() !== `${r.name}/`) this.completeRepo(r, cx);
+              else { this.input.focus(); cx.notify(); }
+              return;
+            }
+            cx.spawn(async (cx) => this.work(r, cx, Boolean(e?.modifiers?.shift || e?.shift), name));
           })
+          .child(div().w(3).h(20).flex_none().rounded(2).when(on, (el) => el.bg(t.accent)))
           .child(
             h_flex()
-              .gap(8)
+              .size(20)
+              .flex_none()
+              .rounded(5)
+              .bg(t.surface)
+              .border(1)
+              .border_color(t.border)
               .items_center()
-              .child(div().flex_1().min_w(0).truncate().text_color(trimmed ? t.foreground : t.muted).child(label))
-              .when(Boolean(plan?.bookmark), (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child("bookmark"))),
+              .justify_center()
+              .child(svg("mods/workspace-chrome/plus.svg").size(11).text_color(name ? t.accent : t.muted)),
           )
-          .child(div().truncate().text_size(11.5).text_color(t.dim).child(this.previewPath(r, trimmed)));
+          .child(
+            v_flex()
+              .flex_1()
+              .min_w(0)
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .child(div().flex_1().min_w(0).truncate().text_color(name ? t.foreground : t.muted).child(label))
+                  .when(Boolean(plan?.bookmark), (el) => el.child(pill("bookmark", t.accent, t.surface))),
+              )
+              .child(div().truncate().text_size(11.5).text_color(t.dim).child(this.previewPath(r, name))),
+          );
       }
 
       // entry.kind === "ws"
       const { repo: r, ws: w } = entry;
       const userHome = this.homes[r.on ?? ""] ?? "";
       const found = w.path && whereOpen(w.path, r.list ?? [], r.on, spaceList, paneList);
-      const badge = found ? (found.dedicated ? "open" : `open in ${found.space.name || found.space.id}`) : "";
-      return v_flex()
+      return h_flex()
         .id(`wt-${i}`)
         .flex_none()
         .h(44)
-        .px(10)
-        .justify_center()
+        .pl(6)
+        .pr(10)
+        .gap(8)
+        .items_center()
         .rounded(7)
         .cursor_pointer()
         .when(on, (el) => el.bg(t.selected))
         .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
         .on_click((e, cx) => {
-          this.at = i;
+          this.selectedKey = entry.key;
           this.open(w, r, Boolean(e?.modifiers?.shift || e?.shift), cx);
         })
+        .child(div().w(3).h(20).flex_none().rounded(2).when(on, (el) => el.bg(t.accent)))
+        .child(svg("mods/workspace-chrome/branch.svg").size(14).flex_none().text_color(found ? t.accent : t.dim))
         .child(
-          h_flex()
-            .gap(8)
-            .items_center()
-            .child(div().flex_1().min_w(0).truncate().text_color(w.path ? t.foreground : t.dim).child(w.name))
-            .when(w.main, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("main")))
-            .when(Boolean(badge), (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child(badge)))
-            .when(!w.path, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("unavailable"))),
-        )
-        .child(div().truncate().text_size(11.5).text_color(t.dim).child(w.path ? tilde(w.path, userHome) : "no recorded folder"));
+          v_flex()
+            .flex_1()
+            .min_w(0)
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .child(div().flex_1().min_w(0).truncate().text_color(w.path ? t.foreground : t.dim).child(w.name))
+                .when(w.main, (el) => el.child(pill("root", t.dim, null, true)))
+                .when(!w.path, (el) => el.child(pill("unavailable", t.dim, null, true))),
+            )
+            .child(div().truncate().text_size(11.5).text_color(t.dim).child(w.path ? tilde(w.path, userHome) : "no recorded folder")),
+        );
     };
 
     const userHome = this.homes[this.spaceMachine ?? ""] ?? "";
-    const zeroNotice = this.ready && !this.repos.length && !this.expanding
-      ? (this.expanded
-          ? "No jj repos in other spaces."
-          : otherCount > 0
-            ? "No jj repo in this space."
-            : this.error ? "" : `${this.folder ? tilde(this.folder, userHome) : "This folder"} is not in a jj repo.`)
+    const zeroNotice = this.ready && !this.repos.length && !this.loadingBg && !this.error
+      ? `${this.folder ? tilde(this.folder, userHome) : "This folder"} is not in a jj repo.`
       : "";
 
-    const footerHint = () => {
-      if (this.busy) return "working\u2026";
-      if (!this.ready) return "esc close";
-      if (cur?.kind === "more") return "\u21b5 show other spaces";
-      if (cur?.kind === "create") {
-        if (!trimmed) return "type a name to create";
-        const tabPart = this.canTab(cur.repo) ? ` \u00b7 \u21e7\u21b5 tab${targetNote}` : "";
-        return `\u21b5 create${tabPart}`;
+    const renderFooter = () => {
+      if (this.busy) {
+        return h_flex()
+          .items_center()
+          .gap(6)
+          .child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.dim).spin(900))
+          .child("working\u2026");
       }
-      if (cur?.kind === "ws") {
-        const tabPart = this.canTab(cur.repo) ? ` \u00b7 \u21e7\u21b5 tab${targetNote}` : "";
-        return `\u21b5 open${tabPart}`;
+      if (!this.ready || !cur) return div().child("esc close");
+      const items = [];
+      if (cur.kind === "create") {
+        if (cur.name) {
+          items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("create"));
+          if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(`tab${targetNote}`));
+        } else if (this.text.trim() !== `${cur.repo.name}/`) {
+          items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child(`choose ${cur.repo.name}/`));
+        } else {
+          items.push(div().child("type a name to create"));
+        }
+      } else if (cur.kind === "ws") {
+        items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("open"));
+        if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(`tab${targetNote}`));
       }
-      return "esc close";
+      return h_flex().items_center().gap(10).children(items);
     };
+
+    const g = this.ghost();
 
     return v_flex()
       .id("worktree")
@@ -976,18 +1344,61 @@ export default class Workspace extends View {
       .p(16)
       .gap(10)
       .bg(t.popover)
+      .border(1)
+      .border_color(t.border)
+      .rounded(10)
       .text_size(13)
-      .child(div().font_semibold().text_color(t.foreground).child("jj workspace"))
       .child(
-        Input.new(this.input)
-          .h(32)
-          .px(10)
+        h_flex()
           .items_center()
-          .rounded(6)
+          .child(div().flex_1().text_size(14.5).font_semibold().text_color(t.foreground).child("jj workspace"))
+          .child(
+            div()
+              .id("wt-esc")
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .text_size(11)
+              .text_color(t.dim)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click(() => this.close())
+              .child("Esc"),
+          ),
+      )
+      .child(
+        h_flex()
+          .h(36)
+          .flex_none()
+          .px(10)
+          .gap(8)
+          .items_center()
+          .rounded(8)
           .border(1)
-          .border_color(this.inputFocused ? t.accent : t.input)
+          .border_color(this.inputFocused ? t.accent : t.border)
           .bg(t.background)
-          .text_color(t.foreground),
+          .child(svg("mods/workspace-chrome/search.svg").size(14).flex_none().text_color(t.dim))
+          .child(
+            div()
+              .relative()
+              .flex_1()
+              .h_full()
+              .overflow_hidden()
+              .when(Boolean(g), (el) =>
+                el.child(
+                  h_flex()
+                    .absolute()
+                    .inset_0()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_size(13)
+                    .child(div().text_color("#00000000").child(g.typed))
+                    .child(div().text_color(t.dim).child(g.suffix)),
+                ),
+              )
+              .child(Input.new(this.input).size_full().text_size(13).text_color(t.foreground)),
+          ),
       )
       .when(Boolean(zeroNotice), (el) => el.child(div().text_color(t.muted).child(zeroNotice)))
       .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
@@ -1011,12 +1422,13 @@ export default class Workspace extends View {
       .when(list.length === 0, (el) => el.child(div().flex_1()))
       .child(
         h_flex()
+          .pt(8)
+          .border_t(1)
+          .border_color(t.border)
           .justify_end()
           .text_size(11)
           .text_color(t.dim)
-          .gap(6)
-          .when(this.busy, (el) => el.child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
-          .child(footerHint()),
+          .child(renderFooter()),
       );
   }
 }
