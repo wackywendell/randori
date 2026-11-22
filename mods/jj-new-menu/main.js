@@ -1,5 +1,5 @@
 // A copy of Herdr's `new-menu`. In a space with any jj checkout the worktree
-// rows read New and Open jj workspace and open `jj-workspace`.
+// rows collapse into jj workspace… opening `jj-workspace`.
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
@@ -94,7 +94,7 @@ export default class NewMenu extends View {
     const installed = this.agents.filter(a => a.installed);
     const choices = this.failed ? installed : [...installed, ...this.agents.filter(a => !a.installed).slice(0, 2)];
     const known = this.checkout !== undefined, jj = Boolean(this.checkout?.jj);
-    return v_flex().min_h(0).w_full().h(Math.min(491, 167 + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
+    return v_flex().min_h(0).w_full().h(Math.min(491, (jj ? 136 : 167) + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
       .id("new-menu").track_focus(this.handle)
       .on_key_down((e) => {
         if (e.modifiers.control || e.modifiers.platform || e.modifiers.alt) return;
@@ -111,7 +111,9 @@ export default class NewMenu extends View {
         .when(this.failed || this.agents.length === 0, el => el.child(div().px(9).py(6).text_color(t.dim).child(this.failed ? "Could not check installed agents" : "Checking installed agents…"))))
       .child(div().h(1).mx(4).my(5).bg(t.border))
       .child(this.row("space", div().w(14).child("+"), "New space", () => run("space.new"), shortcut("space.new")))
-      .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "New jj workspace\u2026" : "New worktree\u2026", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", ...(jj ? { width: 560, height: 480 } : { width: 460, height: 280 }), props: { space: space?.id, folder: this.folder, action: "new" } }), jj ? shortcut("mod.open:jj-workspace") : "", Boolean(space) && known))
-      .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), jj ? "Open jj workspace\u2026" : "Open worktree\u2026", () => openOverlay({ mod: jj ? "jj-workspace" : "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }), "", Boolean(space) && known));
+      .when(jj, el => el.child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "jj workspace\u2026", () => openOverlay({ mod: "jj-workspace", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder } }), shortcut("mod.open:jj-workspace"), Boolean(space) && known)))
+      .when(!jj, el => el
+        .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "New worktree\u2026", () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: this.folder, action: "new" } }), "", Boolean(space) && known))
+        .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), "Open worktree\u2026", () => openOverlay({ mod: "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }), "", Boolean(space) && known)));
   }
 }

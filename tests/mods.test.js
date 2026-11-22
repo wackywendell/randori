@@ -315,8 +315,11 @@ test('New workspace adds it on a matching bookmark, links files and trusts linke
     if (['mkdir', 'ln', 'mise'].includes(cmd)) return ok('');
   }, { layout: sidebar({}, { directory: '~/wt/{repo}/{name}', links: ['.env', 'mise.toml', 'missing'] }) });
   await h.drain();
+  // Empty state shows destination with "…" and lands on "+ New workspace" when only current checkout exists.
+  assert.ok(words(h.render()).includes('~/wt/main/\u2026'));
   h.inputs[0].emit('change', 'feat/x');
-  assert.ok(words(h.render()).some(x => x.includes('~/wt/main/feat-x, starts on bookmark feat/x')));
+  assert.ok(words(h.render()).includes('~/wt/main/feat-x'));
+  assert.ok(words(h.render()).includes('bookmark'));
   h.inputs[0].emit('submit');
   await h.drain();
   const lines = h.calls.map(line);
@@ -330,22 +333,28 @@ test('New workspace adds it on a matching bookmark, links files and trusts linke
   assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
 });
 
-test('New workspace without a matching bookmark starts from the parent, and skips mise when it is missing', async () => {
+test('New workspace runs from the main checkout (even when opened from a linked workspace), and skips mise when missing', async () => {
   const h = dialog('new', (cmd, args) => {
     if (args.includes('bookmark')) return ok('main\n');
     if (args.includes('add')) return ok('');
     if (cmd === 'test') return args[0] === '-e' && args[1].startsWith('/r/main') ? ok('') : fail('');
     if (cmd === 'mise') throw new Error('not installed');
     if (['mkdir', 'ln'].includes(cmd)) return ok('');
-  }, { layout: sidebar({}, { links: ['mise.toml'] }) });
+  }, {
+    spaces: [space('s2', '/r/w1')],
+    panes: [pane('s2', '/r/w1')],
+    props: { space: 's2', folder: '/r/w1', overlay: 'o1' },
+    layout: sidebar({}, { links: ['mise.toml'] }),
+  });
   await h.drain();
   h.inputs[0].emit('change', 'topic');
-  assert.ok(words(h.render()).some(x => x.includes("starts from this checkout's parent")));
+  assert.ok(words(h.render()).includes('~/.herdr/worktrees/main/topic'));
   h.inputs[0].emit('submit');
   await h.drain();
-  const lines = h.calls.map(line);
-  assert.ok(lines.includes('jj workspace add --name topic /home/u/.herdr/worktrees/main/topic'));
-  assert.equal(lines.some(l => l.startsWith('mise trust')), false);
+  const add = h.calls.find(c => c.cmd === 'jj' && c.args.includes('add'));
+  assert.equal(add.cwd, '/r/main');
+  assert.equal(line(add), 'jj workspace add --name topic /home/u/.herdr/worktrees/main/topic');
+  assert.equal(h.calls.some(c => line(c).startsWith('mise trust')), false);
   assert.equal(h.notifications.length, 0);
 });
 
@@ -378,14 +387,16 @@ test('a failed jj workspace add shows jj\u2019s error and opens nothing', async 
   assert.deepEqual(h.actions, []);
 });
 
-test('Open workspace lists the main checkout first and selects a space already on one', async () => {
+test('Open workspace lists the main checkout first, lands on another workspace, and selects a space already on one', async () => {
   const list = [{ name: 'w1', root: '/r/w1' }, { name: 'default', root: '/r/main' }, { name: 'old', root: '' }];
   const h = dialog('open', (cmd, args) => args.includes('list') ? ok(list.map(x => JSON.stringify(x)).join('\n')) : undefined);
   await h.drain();
   const text = words(h.render());
   assert.ok(text.indexOf('default') < text.indexOf('w1'));
-  assert.ok(text.includes('main checkout'));
+  assert.ok(text.includes('main'));
   assert.ok(text.includes('unavailable'));
+  // Already in /r/main (default), so initial selection skips default and lands on w1.
+  assert.equal(h.view.current().ws.name, 'w1');
   byId(h.render(), 'wt-2').handlers.on_click({}, h.cx);
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.select', args: { id: 's2' } });
 });
@@ -399,13 +410,13 @@ test('Open workspace opens a space on a workspace no space shows', async () => {
 });
 
 test('a folder outside jj says so', async () => {
-  const h = dialog('new', undefined, { spaces: [space('s1', '/g')], panes: [pane('s1', '/g')], props: { space: 's1', folder: '/g', action: 'new', overlay: 'o1' } });
+  const h = dialog('new', undefined, { spaces: [space('s1', '/g')], panes: [pane('s1', '/g')], props: { space: 's1', folder: '/g', overlay: 'o1' } });
   await h.drain();
-  assert.ok(words(h.render()).some(x => x.includes('/g is not in a jj repository.')));
+  assert.ok(words(h.render()).some(x => x.includes('/g is not in a jj repo.')));
 });
 
-test('New and Open discover multiple repos in tab order, highlight the focused repo, and preserve repo across Tab filter misses', async () => {
-  const wsMain = [{ name: 'default', root: '/r/main' }, { name: 'bench-fix', root: '/r/bench-fix' }];
+test('unified list discovers multiple repos, filters matches above + New, handles empty + New no-op, and creates in chosen repo', async () => {
+  const wsMain = [{ name: 'default', root: '/r/main' }, { name: 'fix-tests', root: '/r/fix-tests' }];
   const wsOther = [{ name: 'default', root: '/o' }];
   const h = dialog('new', (cmd, args, opts) => {
     if (args.includes('workspace') && args.includes('list')) return listed(opts.cwd === '/o' ? wsOther : wsMain);
@@ -419,32 +430,34 @@ test('New and Open discover multiple repos in tab order, highlight the focused r
     props: { overlay: 'o1' },
   });
   await h.drain();
-  // Both repos discovered in tab order (main, o), with focused repo `o` selected.
+  // Both repos discovered in tab order (main, o).
   assert.deepEqual(plain(h.view.repos.map(r => r.name)), ['main', 'o']);
-  assert.equal(h.view.current().repo.name, 'o');
-  // Type a name that exists ONLY in `main`, Tab to Open (filters out `o`), Tab back to New: `o` stays chosen.
-  h.inputs[0].emit('change', 'bench-fix');
-  key(h, 'tab');
-  assert.equal(h.view.view, 'open');
-  assert.ok(words(h.render()).includes('bench-fix'));
-  assert.equal(h.view.current().repo.name, 'main');
-  key(h, 'tab');
-  assert.equal(h.view.view, 'new');
-  assert.equal(h.view.current().repo.name, 'o');
-  assert.ok(h.view.scroll.scrolled.length > 0);
-  // Up/Down changes repo and records scroll_to_item; return to `o` and submit creates in `/o`.
-  key(h, 'up');
-  assert.equal(h.view.current().repo.name, 'main');
+  // Empty + New workspace is a no-op on Enter.
+  const createIdx = h.view.picks().findIndex(e => e.kind === 'create' && e.repo.name === 'o');
+  h.view.at = createIdx;
+  h.inputs[0].emit('submit');
+  await h.drain();
+  assert.deepEqual(h.actions, []);
+  // Partial match ("fix"): existing `fix-tests` is highlighted on top, `+ New "fix"` sits right below it.
+  h.inputs[0].emit('change', 'fix');
+  assert.equal(h.view.current().kind, 'ws');
+  assert.equal(h.view.current().ws.name, 'fix-tests');
   key(h, 'down');
+  assert.equal(h.view.current().kind, 'create');
+  assert.equal(h.view.current().repo.name, 'main');
+  assert.ok(h.view.scroll.scrolled.length > 0);
+  // Down again reaches `+ New "fix"` for repo `o`; submit creates in `/o`.
+  key(h, 'down');
+  assert.equal(h.view.current().kind, 'create');
   assert.equal(h.view.current().repo.name, 'o');
   h.inputs[0].emit('submit');
   await h.drain();
   const add = h.calls.find(c => c.cmd === 'jj' && c.args.includes('add'));
   assert.equal(add.cwd, '/o');
-  assert.ok(add.args.includes('/home/u/.herdr/worktrees/o/bench-fix'));
+  assert.ok(add.args.includes('/home/u/.herdr/worktrees/o/fix'));
 });
 
-test('New opens an existing workspace directly without running jj workspace add, and whereOpen jumps to secondary tabs', async () => {
+test('exact match hides + New and opens existing workspace directly, and whereOpen jumps to secondary tabs', async () => {
   const wsMain = [{ name: 'default', root: '/r/main' }, { name: 'w1', root: '/r/w1' }];
   const h = dialog('new', (cmd, args) => {
     if (args.includes('workspace') && args.includes('list')) return listed(wsMain);
@@ -461,20 +474,17 @@ test('New opens an existing workspace directly without running jj workspace add,
     props: { overlay: 'o1' },
   });
   await h.drain();
-  h.inputs[0].emit('change', 'w1');
-  assert.ok(words(h.render()).some(x => x.includes('w1 already exists in main')));
-  // Open view badges the secondary tab with "open in main".
-  key(h, 'tab');
   assert.ok(words(h.render()).includes('open in main'));
-  key(h, 'tab');
-  // Enter in New opens the existing workspace by jumping to s1 + k2, never calling jj workspace add.
+  h.inputs[0].emit('change', 'w1');
+  // Exact match hides + New; only w1 remains.
+  assert.deepEqual(plain(h.view.picks().map(e => e.kind)), ['ws']);
   h.inputs[0].emit('submit');
   await h.drain();
   assert.equal(h.calls.some(c => c.args.includes('add')), false);
   assert.deepEqual(plain(h.actions), [{ name: 'space.select', args: { id: 's1' } }, { name: 'tab.select', args: { id: 'k2' } }]);
 });
 
-test('lazy expansion probes other spaces (including remote $HOME), enforces same-machine Shift+Enter, and handles non-jj spaces', async () => {
+test('lazy expansion probes other spaces (including remote $HOME), prevents Enter double-fire, keeps filter, and enforces same-machine Shift+Enter', async () => {
   const h = dialog('new', (cmd, args, opts) => {
     if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
     if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root' && opts.on === 'retriever') return ok('/rem/streams\n');
@@ -492,31 +502,35 @@ test('lazy expansion probes other spaces (including remote $HOME), enforces same
       { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/g' },
       { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/streams' },
     ],
-    props: { space: 's1', folder: '/r/main', action: 'new', overlay: 'o1' },
+    props: { space: 's1', folder: '/r/main', overlay: 'o1' },
     readTextFile: async p => (p === '/r/main/.jj/repo/store/type' || p === '/rem/streams/.jj/repo/store/type') ? 'git' : Promise.reject(new Error('no file')),
   });
   await h.drain();
   // Other spaces were NOT probed upfront.
   assert.equal(h.calls.some(c => c.on === 'retriever'), false);
-  // Inactive target space shows "(tab in local-a)" hint.
+  // Shift+Enter on same-machine main checkout opens a tab named after the repo ("main", not "default").
+  h.view.at = 0;
   assert.ok(words(h.render()).some(x => x.includes('(tab in local-a)')));
-  // Shift+Enter on same-machine main checkout in Open opens a tab named after the repo ("main", not "default").
-  key(h, 'tab');
   h.inputs[0].emit('submit', undefined, { shift: true });
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/r/main', name: 'main' } });
 
-  // Switch back to New, move to expand row, press Enter -> discovers remote repo.
+  // Type a name, move to "2 other spaces", trigger submit + bubbled key("enter") synchronously -> expands once and does NOT close!
   h.actions.length = 0;
-  key(h, 'tab');
-  key(h, 'down');
-  assert.equal(h.view.current().kind, 'more');
-  key(h, 'enter');
+  h.overlays.length = 0;
+  h.inputs[0].emit('change', 'remote-wt');
+  const moreIdx = h.view.picks().findIndex(e => e.kind === 'more');
+  assert.ok(moreIdx >= 0);
+  h.view.at = moreIdx;
+  h.inputs[0].emit('submit');
+  key(h, 'enter'); // simulates GPUI bubbling Enter after Input submit
   await h.drain();
+  assert.deepEqual(h.overlays, []);
+  assert.deepEqual(h.actions, []);
   assert.ok(h.view.repos.some(r => r.name === 'streams' && r.on === 'retriever'));
+  assert.equal(h.view.current().kind, 'create');
   assert.equal(h.view.current().repo.name, 'streams');
   // Shift+Enter on remote repo shows inline error and opens nothing.
-  h.inputs[0].emit('change', 'remote-wt');
   h.inputs[0].emit('submit', undefined, { shift: true });
   await h.drain();
   assert.ok(words(h.render()).some(x => x.includes('Tabs in this space cannot open a workspace on retriever.')));
@@ -556,11 +570,11 @@ test('non-jj space with other spaces shows notice + expand row, and identity err
     props: { overlay: 'o1' },
   });
   await h2.drain();
-  assert.ok(words(h2.render()).includes('No jj repositories in this space.'));
-  assert.ok(words(h2.render()).includes('Repositories in 1 other space'));
+  assert.ok(words(h2.render()).includes('No jj repo in this space.'));
+  assert.ok(words(h2.render()).includes('1 other space'));
   key(h2, 'enter');
   await h2.drain();
-  assert.ok(words(h2.render()).includes('No jj repositories found in other spaces.'));
+  assert.ok(words(h2.render()).includes('No jj repos in other spaces.'));
 });
 
 // Finish: space s1 has a tab in w1 and a tab in w2, space s2 a terminal in
@@ -818,11 +832,11 @@ test('a jj space\u2019s menu offers New and Open jj workspace in place of worktr
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
   const text = words(h.render());
-  assert.ok(text.includes('New jj workspace') && text.includes('Open jj workspace'));
+  assert.ok(text.includes('jj workspace\u2026'));
   assert.equal(text.includes('New worktree'), false);
   assert.equal(w.calls.some(c => c.cmd === 'git'), false);
   h.view.choose(1, h.cx);
-  assert.deepEqual(plain(h.overlays.at(-1)), { mod: 'jj-workspace', kind: 'dialog', width: 560, height: 480, props: { space: 's1', folder: '/r/main', action: 'new' } });
+  assert.deepEqual(plain(h.overlays.at(-1)), { mod: 'jj-workspace', kind: 'dialog', width: 560, height: 480, props: { space: 's1', folder: '/r/main' } });
 });
 
 test('a space with a terminal in a linked workspace offers Finish jj workspace in a window, even when tab 1 is outside jj', async () => {
@@ -832,8 +846,8 @@ test('a space with a terminal in a linked workspace offers Finish jj workspace i
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
   const list = words(h.render());
-  assert.ok(list.includes('New jj workspace') && list.includes('Finish jj workspace'));
-  h.view.choose(list.filter(x => ['Rename', 'New jj workspace', 'Open jj workspace', 'Finish jj workspace', 'Close'].includes(x)).indexOf('Finish jj workspace'), h.cx);
+  assert.ok(list.includes('jj workspace\u2026') && list.includes('Finish jj workspace'));
+  h.view.choose(list.filter(x => ['Rename', 'jj workspace\u2026', 'Finish jj workspace', 'Close'].includes(x)).indexOf('Finish jj workspace'), h.cx);
   assert.equal(h.overlays.at(-1).kind, 'window');
   assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1', folder: '/r/w1', action: 'finish' });
 
@@ -897,7 +911,7 @@ test('a space outside jj keeps the shipped menu', async () => {
   const h = load('jj-menu', { spaces: [space('s1', '/g')], panes: [pane('s1', '/g')], props: { tab: 'space', target: { id: 's1' } },
     exec: w.exec, readTextFile: w.readTextFile });
   await h.drain();
-  assert.equal(words(h.render()).includes('New jj workspace'), false);
+  assert.equal(words(h.render()).includes('jj workspace\u2026'), false);
   assert.ok(w.calls.some(c => c.cmd === 'git'));
 });
 
@@ -910,10 +924,11 @@ test('the New menu opens jj-workspace at 560x480 with shortcut hint, probes sibl
     props: { overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile,
   });
   await h.drain();
-  assert.ok(words(h.render()).includes('New jj workspace\u2026'));
+  assert.ok(words(h.render()).includes('jj workspace\u2026'));
+  assert.equal(byId(h.render(), 'worktree-open'), undefined);
   assert.ok(words(byId(h.render(), 'worktree')).includes('\u21e7\u2318N'));
   byId(h.render(), 'worktree').handlers.on_click({}, h.cx);
-  assert.deepEqual(plain(h.overlays.at(-1)), { mod: 'jj-workspace', kind: 'dialog', width: 560, height: 480, props: { space: 's1', folder: '/r/main', action: 'new' } });
+  assert.deepEqual(plain(h.overlays.at(-1)), { mod: 'jj-workspace', kind: 'dialog', width: 560, height: 480, props: { space: 's1', folder: '/r/main' } });
 
   // Focused pane with no cwd (e.g. mod pane) still finds sibling jj checkout.
   const h2 = load('jj-new-menu', {
@@ -922,7 +937,7 @@ test('the New menu opens jj-workspace at 560x480 with shortcut hint, probes sibl
     props: { overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile,
   });
   await h2.drain();
-  assert.ok(words(h2.render()).includes('New jj workspace\u2026'));
+  assert.ok(words(h2.render()).includes('jj workspace\u2026'));
 
   // Non-jj space preserves Git worktree at 460x280.
   const h3 = load('jj-new-menu', {

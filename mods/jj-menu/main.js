@@ -3,8 +3,8 @@
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args];
 // a command "worktree" opens the worktree dialog instead.
 //
-// A copy of Herdr's `menu`. A jj space gets New and Open jj workspace, which
-// open `jj-workspace`, where the shipped menu shows its worktree entries.
+// A copy of Herdr's `menu`. A jj space gets jj workspace…, which opens
+// `jj-workspace`, where the shipped menu shows its worktree entries.
 // Finish jj workspace shows on spaces and tabs when a terminal is in a linked
 // jj workspace.
 
@@ -86,7 +86,7 @@ function items(p, git, jj, linked) {
     case "space":
       return [
         ["Rename", "space.rename", { id: tg.id }],
-        ...(jj ? [["New jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "new" }], ["Open jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "open" }]] : []),
+        ...(jj ? [["jj workspace\u2026", "jj-workspace", { space: tg.id, folder: jj }]] : []),
         ...(jj && linked ? [["Finish jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "finish" }]] : []),
         ...(git && !jj ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" && !jj ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),

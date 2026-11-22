@@ -1,13 +1,11 @@
 // jj workspace dialog and Finish window:
-// { space, folder, action: "new" | "open" | "finish", tab, argv, overlay }.
+// { space, folder, action?: "finish", tab, argv, overlay }.
 //
-// New and Open share one 560x480 dialog switched with Tab / Shift+Tab.
-// It discovers every jj repository open in the target space, expands lazily
-// to other spaces, and opens a workspace as a space (or existing terminal) on
-// Enter or as a new tab in the target space on Shift+Enter when on the same
-// machine. Finish runs in a separate 520x360 window, supports multi-repository
-// spaces and tab-scoped removal, names every affected terminal and owned child
-// before confirmation, and removes checked workspaces sequentially.
+// The workspace dialog shows one filter-first list of workspaces grouped by
+// repository, with an inline "+ New" row per repository and lazy expansion to
+// other spaces. Enter opens the highlighted workspace or creates from the
+// repository's main checkout; Shift+Enter opens a new tab in the target space
+// when on the same machine. Finish runs in a separate 520x360 window.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle, Scrollbar, Checkbox } from "gpui-base";
@@ -119,28 +117,34 @@ export default class Workspace extends View {
     this.homeTasks = new Map();
     this.userHome = this.on ? null : this.homes[""];
     this.finishing = this.p.action === "finish";
-    this.view = this.p.action === "open" ? "open" : "new";
     this.rows = []; // finish: { name, root, main, repoName, checked, removed, error }
     this.multiRepo = false;
     this.confirmed = new Set();
-    this.repos = []; // new/open: { key, name, main, checkout, on, other, list, names, error }
+    this.repos = []; // { key, name, main, checkout, on, other, list, names, error }
     this.probed = new Set();
     this.focusKey = null;
-    this.repoKey = null;
+    this.focusRoot = null;
     this.ready = false;
     this.expanded = false;
     this.expanding = false;
+    this.submitted = false;
     this.text = "";
     this.at = 0;
     this.scroll = ScrollHandle.new();
-    this.input = InputState.new({ value: this.text, placeholder: "jj workspace name or filter" });
+    this.input = InputState.new({ value: this.text, placeholder: "Name" });
     this.input.on("change", (_e, cx) => {
       this.text = this.input.value();
       this.error = "";
-      if (this.view === "open") this.at = 0;
+      this.at = 0;
+      this.scrollCurrent();
       cx.notify();
     });
-    this.input.on("submit", (e, cx) => this.enter(cx, Boolean(e?.shift)));
+    this.input.on("submit", (e, cx) => {
+      // Prevent the same Enter keydown from double-firing on #worktree's on_key_down.
+      this.submitted = true;
+      Promise.resolve().then(() => { this.submitted = false; });
+      this.enter(cx, Boolean(e?.shift));
+    });
     this.inputFocused = true;
     this.input.on("focus", (_e, cx) => { this.inputFocused = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.inputFocused = false; cx.notify(); });
@@ -165,8 +169,8 @@ export default class Workspace extends View {
         this.folder = focusDir || (this.on ? await this.homeOf(this.on) : this.homes[""]);
         const targetList = s ? [s] : [];
         await this.probe(targetList, false, focusDir, cx);
-        this.repoKey = this.focusKey ?? this.repos[0]?.key ?? null;
-        this.at = this.indexForRepo(this.repoKey);
+        this.at = this.initialIndex();
+        this.scrollCurrent();
         this.handle.focus();
         cx.timer.after(100, () => this.input.focus());
       } catch (error) {
@@ -270,12 +274,13 @@ export default class Workspace extends View {
       if (!r) {
         r = { key, name: base(id.main), main: id.main, checkout: id.root, on, other, list: undefined, names: undefined, error: "" };
         this.repos.push(r);
-        if (!other && folder === focusDir) this.focusKey = key;
+        if (!other && folder === focusDir) { this.focusKey = key; this.focusRoot = id.root; }
         return r;
       }
       if (!other && folder === focusDir) {
         r.checkout = id.root;
         this.focusKey = key;
+        this.focusRoot = id.root;
       }
       return null;
     };
@@ -295,7 +300,6 @@ export default class Workspace extends View {
       const id = await identity(folder, on, IO);
       const r = addFromId(folder, on, id);
       if (r) {
-        if (!this.repoKey) this.repoKey = r.key;
         cx?.notify();
         await this.loadRepo(r, cx);
       } else if (id.error) {
@@ -318,15 +322,14 @@ export default class Workspace extends View {
       } finally {
         this.expanding = false;
         this.expanded = true;
+        const p = this.picks();
         if (this.repos.length > before) {
           const firstNew = this.repos[before];
-          if (!this.repoKey || this.current()?.kind === "more") {
-            this.repoKey = firstNew.key;
-            this.at = this.indexForRepo(this.repoKey);
-            this.scrollCurrent();
-          }
+          const idx = p.findIndex((e) => e.repo?.key === firstNew.key);
+          this.at = idx >= 0 ? idx : Math.min(this.at, Math.max(0, p.length - 1));
+          this.scrollCurrent();
         } else {
-          this.at = Math.min(this.at, Math.max(0, this.picks().length - 1));
+          this.at = Math.min(this.at, Math.max(0, p.length - 1));
         }
         cx.notify();
         this.input.focus();
@@ -339,7 +342,7 @@ export default class Workspace extends View {
   }
 
   selectedRepo() {
-    return this.repos.find((r) => r.key === this.repoKey) ?? this.repos[0] ?? null;
+    return this.current()?.repo ?? this.repos.find((r) => r.key === this.focusKey) ?? this.repos[0] ?? null;
   }
 
   canTab(r) {
@@ -356,38 +359,28 @@ export default class Workspace extends View {
     const localRepos = this.repos.filter((r) => !r.other);
     const otherRepos = this.repos.filter((r) => r.other);
     const otherCount = this.others().length;
-
-    if (this.view === "new") {
-      const showList = this.repos.length > 1 || this.expanded || this.expanding || otherCount > 0;
-      if (showList) {
-        for (const r of localRepos) out.push({ kind: "repo", key: r.key, repo: r, pick: true });
-        if (otherRepos.length) {
-          out.push({ kind: "divider", label: "Other spaces" });
-          for (const r of otherRepos) out.push({ kind: "repo", key: r.key, repo: r, pick: true });
-        }
-        if (this.expanding) out.push({ kind: "looking" });
-        else if (!this.expanded && otherCount > 0) out.push({ kind: "more", count: otherCount, pick: true });
-      }
-      return out;
-    }
-
-    const f = this.text.trim().toLowerCase();
+    const trimmed = this.text.trim();
+    const f = trimmed.toLowerCase();
     const showHeaders = this.repos.length > 1 || this.expanded;
+
     const appendGroup = (group, divider) => {
       const entries = [];
       for (const r of group) {
-        const ws = (r.list ?? []).filter((w) => !f || `${w.name} ${w.path}`.toLowerCase().includes(f));
-        if (!ws.length && !r.error && r.list !== undefined) continue;
+        const ws = (r.list ?? []).filter((w) => !f || `${r.name} ${w.name} ${w.path}`.toLowerCase().includes(f));
+        const showCreate = !r.error && r.names !== undefined && !this.existing(r, trimmed);
+        if (!ws.length && !showCreate && !r.error && r.list !== undefined) continue;
         if (showHeaders) entries.push({ kind: "header", repo: r });
         if (r.error) entries.push({ kind: "repo-error", repo: r });
         else if (r.list === undefined) entries.push({ kind: "repo-loading", repo: r });
         for (const w of ws) entries.push({ kind: "ws", key: `${r.key}\0${w.name}`, repo: r, ws: w, pick: true });
+        if (showCreate) entries.push({ kind: "create", key: `${r.key}\0+new`, repo: r, pick: true });
       }
       if (entries.length) {
         if (divider) out.push({ kind: "divider", label: divider });
         out.push(...entries);
       }
     };
+
     appendGroup(localRepos, null);
     appendGroup(otherRepos, "Other spaces");
     if (this.expanding) out.push({ kind: "looking" });
@@ -399,24 +392,30 @@ export default class Workspace extends View {
     return list.filter((e) => e.pick);
   }
 
+  // Initial selection: prefer the first available workspace in the focused repo
+  // that isn't the checkout we're already sitting in, else any other workspace,
+  // else the focused repo's "+ New" row, else 0.
+  initialIndex() {
+    const p = this.picks();
+    if (!p.length) return 0;
+    const isOtherWs = (e) => e.kind === "ws" && Boolean(e.ws.path) && (!this.focusRoot || e.ws.path !== this.focusRoot);
+    if (this.focusKey) {
+      const i = p.findIndex((e) => e.repo?.key === this.focusKey && isOtherWs(e));
+      if (i >= 0) return i;
+    }
+    const anyOther = p.findIndex(isOtherWs);
+    if (anyOther >= 0) return anyOther;
+    if (this.focusKey) {
+      const c = p.findIndex((e) => e.kind === "create" && e.repo?.key === this.focusKey);
+      if (c >= 0) return c;
+    }
+    return 0;
+  }
+
   current() {
     const p = this.picks();
     if (p.length) return p[Math.min(this.at, p.length - 1)];
-    if (this.view === "new") {
-      const r = this.selectedRepo();
-      if (r) return { kind: "repo", key: r.key, repo: r, pick: true };
-    }
     return undefined;
-  }
-
-  indexForRepo(repoKey) {
-    const p = this.picks();
-    if (!p.length) return 0;
-    if (repoKey) {
-      const i = p.findIndex((e) => e.repo?.key === repoKey);
-      if (i >= 0) return i;
-    }
-    return 0;
   }
 
   scrollCurrent() {
@@ -432,19 +431,7 @@ export default class Workspace extends View {
     const p = this.picks();
     if (!p.length) return;
     this.at = (Math.min(this.at, p.length - 1) + delta + p.length) % p.length;
-    const cur = p[this.at];
-    if (cur?.repo) this.repoKey = cur.repo.key;
     this.scrollCurrent();
-  }
-
-  switchView(next, cx) {
-    if (this.finishing || this.view === next) return;
-    this.view = next;
-    this.error = "";
-    this.at = this.indexForRepo(this.repoKey);
-    this.scrollCurrent();
-    this.input.focus();
-    cx.notify();
   }
 
   // The folder and start of the workspace a name would make.
@@ -456,19 +443,22 @@ export default class Workspace extends View {
     return { name, path: untilde(directory, userHome), bookmark: Boolean(r.names?.has(name)) };
   }
 
+  previewPath(r, name = this.text.trim()) {
+    const userHome = this.homes[r.on ?? ""] ?? "";
+    const directory = settings().directory.replaceAll("{repo}", r.name).replaceAll("{name}", slug(name) || "\u2026");
+    return tilde(untilde(directory, userHome), userHome);
+  }
+
   enter(cx, asTab = false) {
     if (this.busy) return;
     const cur = this.current();
-    if (cur?.kind === "more") return this.expand(cx);
-    if (this.view === "open") {
-      if (cur?.kind === "ws") this.open(cur.ws, cur.repo, asTab, cx);
-      return;
+    if (!cur) return;
+    if (cur.kind === "more") return this.expand(cx);
+    if (cur.kind === "ws") return this.open(cur.ws, cur.repo, asTab, cx);
+    if (cur.kind === "create") {
+      if (!this.text.trim()) { this.input.focus(); return; }
+      cx.spawn(async (cx) => this.work(cur.repo, cx, asTab));
     }
-    const r = cur?.repo ?? this.selectedRepo();
-    if (!r || r.list === undefined || r.names === undefined) return;
-    const there = this.existing(r);
-    if (there) return this.open(there, r, asTab, cx);
-    cx.spawn(async (cx) => this.work(r, cx, asTab));
   }
 
   async work(r = this.selectedRepo(), cx, asTab = false) {
@@ -495,9 +485,11 @@ export default class Workspace extends View {
     if (!name) return "Type a jj workspace name.";
     const { links, miseTrust } = settings();
     const add = ["workspace", "add", "--name", name, ...(bookmark ? ["-r", JSON.stringify(name)] : []), path];
-    // jj workspace add makes only the last folder of the path.
+    // jj workspace add makes only the last folder of the path. Run from the main
+    // checkout so new workspaces start from the main repo's @- rather than a
+    // stacked linked workspace.
     if (!(await ok("mkdir", ["-p", parent(path)], r.on))) return `Could not make ${parent(path)}.`;
-    const res = await jj(r.checkout, add, r.on, 600_000);
+    const res = await jj(r.main, add, r.on, 600_000);
     if (!res.ok) return res.err || "jj workspace add failed.";
     const problems = [];
     const linked = [];
@@ -731,12 +723,8 @@ export default class Workspace extends View {
       cx.stop_propagation();
       return cx.notify();
     }
-    if (e.key === "tab") {
-      this.switchView(this.view === "new" ? "open" : "new", cx);
-      cx.stop_propagation();
-      return;
-    }
     if (e.key === "enter") {
+      if (this.submitted) return;
       this.enter(cx, Boolean(e?.modifiers?.shift || e?.shift));
       cx.stop_propagation();
       return cx.notify();
@@ -841,12 +829,12 @@ export default class Workspace extends View {
     const picks = this.picks(list);
     const activePick = picks.length ? Math.min(this.at, picks.length - 1) : -1;
     const cur = this.current();
-    const activeRepo = cur?.repo ?? this.selectedRepo();
     const spaceList = spaces();
     const paneList = panes();
     const otherCount = this.others().length;
     const activeSpace = spaceList.find((s) => s.active);
     const targetNote = this.spaceId && activeSpace && activeSpace.id !== this.spaceId && this.spaceName ? ` (tab in ${this.spaceName})` : "";
+    const trimmed = this.text.trim();
 
     let pickIndex = 0;
     const renderEntry = (entry) => {
@@ -872,14 +860,14 @@ export default class Workspace extends View {
         return div().flex_none().px(10).py(4).text_size(11.5).text_color(t.dim).child("\u2026");
       }
       if (entry.kind === "looking") {
-        return div().flex_none().px(10).py(8).text_size(12).text_color(t.muted).child("Looking in other spaces\u2026");
+        return div().flex_none().px(10).py(8).text_size(12).text_color(t.muted).child("Loading\u2026");
       }
 
       const i = pickIndex++;
       const on = i === activePick;
 
       if (entry.kind === "more") {
-        const label = `Repositories in ${entry.count} other space${entry.count === 1 ? "" : "s"}`;
+        const label = `${entry.count} other space${entry.count === 1 ? "" : "s"}`;
         return h_flex()
           .id(`wt-${i}`)
           .flex_none()
@@ -895,9 +883,10 @@ export default class Workspace extends View {
           .child(div().flex_none().text_size(11).text_color(t.dim).child("\u21b5"));
       }
 
-      if (entry.kind === "repo") {
+      if (entry.kind === "create") {
         const r = entry.repo;
-        const userHome = this.homes[r.on ?? ""] ?? "";
+        const plan = trimmed ? this.planned(r, trimmed) : null;
+        const label = trimmed ? `+ New "${trimmed}"` : "+ New workspace";
         return v_flex()
           .id(`wt-${i}`)
           .flex_none()
@@ -908,15 +897,19 @@ export default class Workspace extends View {
           .cursor_pointer()
           .when(on, (el) => el.bg(t.selected))
           .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
-          .on_click((_e, cx) => { this.at = i; this.repoKey = r.key; this.input.focus(); cx.notify(); })
+          .on_click((e, cx) => {
+            this.at = i;
+            if (!trimmed) { this.input.focus(); cx.notify(); return; }
+            cx.spawn(async (cx) => this.work(r, cx, Boolean(e?.modifiers?.shift || e?.shift)));
+          })
           .child(
             h_flex()
               .gap(8)
               .items_center()
-              .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(r.name))
-              .when(Boolean(r.on), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(r.on))),
+              .child(div().flex_1().min_w(0).truncate().text_color(trimmed ? t.foreground : t.muted).child(label))
+              .when(Boolean(plan?.bookmark), (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child("bookmark"))),
           )
-          .child(div().truncate().text_size(11.5).text_color(r.error ? t.blocked : t.dim).child(r.error || tilde(r.checkout, userHome)));
+          .child(div().truncate().text_size(11.5).text_color(t.dim).child(this.previewPath(r, trimmed)));
       }
 
       // entry.kind === "ws"
@@ -936,7 +929,6 @@ export default class Workspace extends View {
         .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
         .on_click((e, cx) => {
           this.at = i;
-          this.repoKey = r.key;
           this.open(w, r, Boolean(e?.modifiers?.shift || e?.shift), cx);
         })
         .child(
@@ -944,68 +936,37 @@ export default class Workspace extends View {
             .gap(8)
             .items_center()
             .child(div().flex_1().min_w(0).truncate().text_color(w.path ? t.foreground : t.dim).child(w.name))
-            .when(w.main, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("main checkout")))
+            .when(w.main, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("main")))
             .when(Boolean(badge), (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child(badge)))
             .when(!w.path, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("unavailable"))),
         )
-        .child(div().truncate().text_size(11.5).text_color(t.dim).child(w.path ? tilde(w.path, userHome) : "jj recorded no folder for this workspace"));
+        .child(div().truncate().text_size(11.5).text_color(t.dim).child(w.path ? tilde(w.path, userHome) : "no recorded folder"));
     };
 
     const userHome = this.homes[this.spaceMachine ?? ""] ?? "";
     const zeroNotice = this.ready && !this.repos.length && !this.expanding
       ? (this.expanded
-          ? "No jj repositories found in other spaces."
+          ? "No jj repos in other spaces."
           : otherCount > 0
-            ? "No jj repositories in this space."
-            : this.error ? "" : `${this.folder ? tilde(this.folder, userHome) : "This folder"} is not in a jj repository.`)
+            ? "No jj repo in this space."
+            : this.error ? "" : `${this.folder ? tilde(this.folder, userHome) : "This folder"} is not in a jj repo.`)
       : "";
 
-    let detail = "";
-    if (this.view === "new") {
-      if (!this.ready) detail = "\u2026";
-      else if (cur?.kind === "more") detail = "";
-      else if (activeRepo) {
-        const there = this.existing(activeRepo);
-        if (there) {
-          detail = `${there.name} already exists in ${activeRepo.name}. \u21b5 opens it${this.canTab(activeRepo) ? " \u00b7 \u21e7\u21b5 new tab" : ""}.`;
-        } else if (activeRepo.names !== undefined) {
-          const plan = this.planned(activeRepo);
-          const repoHome = this.homes[activeRepo.on ?? ""] ?? "";
-          detail = `${tilde(plan.path, repoHome)}, ${plan.bookmark ? `starts on bookmark ${plan.name}` : "starts from this checkout's parent"}.`;
-        } else {
-          detail = "\u2026";
-        }
-      }
-    }
-
-    const tabBtn = (id, label, active) =>
-      div()
-        .id(id)
-        .px(8)
-        .py(3)
-        .rounded(5)
-        .cursor_pointer()
-        .text_size(12)
-        .when(active, (el) => el.bg(t.selected).text_color(t.foreground).font_semibold())
-        .when(!active, (el) => el.text_color(t.dim).hover((s) => s.bg(t.hover)))
-        .on_click((_e, cx) => this.switchView(id === "view-new" ? "new" : "open", cx))
-        .child(label);
-
-    const openHint = () => {
+    const footerHint = () => {
       if (this.busy) return "working\u2026";
       if (!this.ready) return "esc close";
-      if (cur?.kind === "more") return "\u21b5 show other spaces \u00b7 tab switch \u00b7 esc close";
-      if (this.view === "open") {
-        const tabPart = cur?.repo && this.canTab(cur.repo) ? ` \u00b7 \u21e7\u21b5 new tab${targetNote}` : "";
-        return `\u2191\u2193 choose \u00b7 \u21b5 open${tabPart} \u00b7 tab switch \u00b7 esc close`;
+      if (cur?.kind === "more") return "\u21b5 show other spaces";
+      if (cur?.kind === "create") {
+        if (!trimmed) return "type a name to create";
+        const tabPart = this.canTab(cur.repo) ? ` \u00b7 \u21e7\u21b5 tab${targetNote}` : "";
+        return `\u21b5 create${tabPart}`;
       }
-      if (!activeRepo) return `${otherCount > 0 && !this.expanded ? "\u21b5 show other spaces \u00b7 " : ""}esc close`;
-      const tabPart = this.canTab(activeRepo) ? ` \u00b7 \u21e7\u21b5 new tab${targetNote}` : "";
-      const action = this.existing(activeRepo) ? "open" : "create";
-      return `\u21b5 ${action}${tabPart} \u00b7 tab switch \u00b7 esc cancel`;
+      if (cur?.kind === "ws") {
+        const tabPart = this.canTab(cur.repo) ? ` \u00b7 \u21e7\u21b5 tab${targetNote}` : "";
+        return `\u21b5 open${tabPart}`;
+      }
+      return "esc close";
     };
-
-    const showEmptyOpen = this.view === "open" && this.ready && this.repos.length > 0 && !picks.some((e) => e.kind === "ws") && !this.expanding;
 
     return v_flex()
       .id("worktree")
@@ -1016,14 +977,7 @@ export default class Workspace extends View {
       .gap(10)
       .bg(t.popover)
       .text_size(13)
-      .child(
-        h_flex()
-          .items_center()
-          .gap(8)
-          .child(div().flex_1().font_semibold().text_color(t.foreground).child("jj workspace"))
-          .child(tabBtn("view-new", "New", this.view === "new"))
-          .child(tabBtn("view-open", "Open", this.view === "open")),
-      )
+      .child(div().font_semibold().text_color(t.foreground).child("jj workspace"))
       .child(
         Input.new(this.input)
           .h(32)
@@ -1035,10 +989,9 @@ export default class Workspace extends View {
           .bg(t.background)
           .text_color(t.foreground),
       )
-      .when(Boolean(detail), (el) => el.child(div().text_color(t.muted).child(detail)))
       .when(Boolean(zeroNotice), (el) => el.child(div().text_color(t.muted).child(zeroNotice)))
       .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
-      .when(list.length > 0 || showEmptyOpen, (el) =>
+      .when(list.length > 0, (el) =>
         el.child(
           div()
             .relative()
@@ -1050,13 +1003,12 @@ export default class Workspace extends View {
                 .track_scroll(this.scroll)
                 .size_full()
                 .overflow_y_scroll()
-                .children(list.map(renderEntry))
-                .when(showEmptyOpen, (el) => el.child(div().p(10).text_color(t.dim).child("No matching workspaces."))),
+                .children(list.map(renderEntry)),
             )
             .child(Scrollbar.vertical("wt-list").absolute().inset_0()),
         ),
       )
-      .when(list.length === 0 && !showEmptyOpen, (el) => el.child(div().flex_1()))
+      .when(list.length === 0, (el) => el.child(div().flex_1()))
       .child(
         h_flex()
           .justify_end()
@@ -1064,7 +1016,7 @@ export default class Workspace extends View {
           .text_color(t.dim)
           .gap(6)
           .when(this.busy, (el) => el.child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
-          .child(openHint()),
+          .child(footerHint()),
       );
   }
 }
