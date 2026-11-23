@@ -64,7 +64,7 @@ Creating, opening, and finishing jj workspaces in Randori currently assume one r
 
 ## Operating Assumptions and Failure Boundaries
 
-- Scale. A single space typically holds 1 to 10 tabs touching 1 to 4 repositories. A sidebar may hold 10 to 40 spaces across local and remote machines, and local `repos` folders may hold dozens of repositories. Opening the dialog waits only for the target space's folders, then runs other-space probes and a single shallow POSIX glob (`[ -d "$d/.jj" ]`, deduplicating linked worktrees via `.jj/repo` pointers before invoking `jj`) in the background so slow remote hosts never block local use.
+- Scale. A single space typically holds 1 to 10 tabs touching 1 to 4 repositories. A sidebar may hold 10 to 40 spaces across local and remote machines, and local `repos` patterns may match dozens of repositories. Opening the dialog waits only for the target space's folders, then runs other-space probes and a single POSIX glob scan (`[ -d "$d/.jj" ]`, deduplicating linked worktrees via `.jj/repo` pointers before invoking `jj`) in the background so slow remote hosts never block local use.
 - Single dialog instance and no polling timers. Only one `jj-workspace` overlay is active at a time. No polling timers run while the dialog is open; Finish waits on Herdr's reactive `render(cx)` updates with one 10 s deadline timer.
 - Missing or broken jj binaries. If `identity()` reports an error for a folder in the target space (such as `jj` missing on a remote host), the dialog shows that error inline and skips that folder while keeping other discovered repositories usable. Background errors are logged without disrupting the dialog banner.
 - Cross-machine tab placement boundary. When a repository from another space lives on a different machine than the target space, the Shift+Enter hint is omitted and pressing Shift+Enter shows an inline error stating that tabs in this space cannot open a workspace on that remote machine and directing the user to press Enter for a new space.
@@ -109,7 +109,7 @@ Creating, opening, and finishing jj workspaces in Randori currently assume one r
 
 ### CUJ 5. Open or create a jj workspace in a repository from another space or on disk
 
-- Given local space A in `randori` (focused), remote space B in `streams` on machine `retriever`, and local repository `dd-source` under configured `repos: ["~/dd", "~/code"]`,
+- Given local space A in `randori` (focused), remote space B in `streams` on machine `retriever`, and local repository `dd-source` matched by configured `repos` (`["~/dd/*", "~/code/*", "~/.dotfiles"]`),
 - When you open the jj workspace dialog from space A,
 - Then `randori` appears immediately with default selection staying inside `randori`, while `streams` loads in the background under Other spaces (in sidebar order, badged `retriever`, with the Shift+Enter hint hidden) and `dd-source` loads under Repositories (sorted by most recent jj operation). Typing `streams/remote-test` and pressing Enter creates the workspace on `retriever` using remote `$HOME` and opens a new space there.
 
@@ -162,7 +162,7 @@ Herdr injects `overlay` into `props()` for closing the overlay via `closeOverlay
 Opening the dialog probes only unique terminal pane folders (plus `space.folder`) in the target space first, then launches background discovery with `Promise.allSettled`.
 
 - Other Herdr spaces (`source: "other"`). Probes each unique `(folder, machine)` pair across non-target spaces, updating as each settles so slow remote machines never stall local repositories.
-- Disk repositories (`source: "disk"`). Runs a single shallow POSIX glob (`DISK_SCAN`) across the static base of `settings().directory` (depth 1 and 2) and configured `settings().repos` folders (depth 0 and 1), reading each repository's `.jj/repo/op_heads/heads` mtime (resolving `.jj/repo` pointers for worktrees) and deduplicating against already-discovered repositories before invoking `jj`.
+- Disk repositories (`source: "disk"`). Runs a single POSIX glob scan (`DISK_SCAN`) across the static base of `settings().directory` (depth 1 and 2) and configured `settings().repos` patterns (strictly matching exact repository paths or `*` globs such as `~/code/*`, `~/src/*/*`, and `~/.dotfiles` without descending into matched repositories), reading each repository's `.jj/repo/op_heads/heads` mtime (resolving `.jj/repo` pointers for worktrees) and deduplicating against already-discovered repositories before invoking `jj`.
 - Canonical ordering (`sortRepos()`). Regardless of async completion order, repositories always sort into three sections.
   1. Current space (`source: "space"`). Focused repository first, then tab order.
   2. Other spaces (`source: "other"`). Pure sidebar order, then tab order.

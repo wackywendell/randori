@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import vm from 'node:vm';
 import { load, byId, words, nodes } from './mod-harness.js';
 
@@ -513,9 +516,10 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
   const h = dialog('new', async (cmd, args, opts) => {
     if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
     if (cmd === 'sh' && !opts.on) {
-      // Verify configured `repos` folders and worktrees base are passed to the disk scan.
+      // Verify configured `repos` patterns (trailing slash stripped) and worktrees base are passed to the disk scan.
       assert.ok(args.includes('/home/u/.herdr/worktrees'));
-      assert.ok(args.includes('/home/u/dd'));
+      assert.ok(args.includes('/home/u/dd/*'));
+      assert.ok(args.includes('/home/u/.dotfiles'));
       return ok('100\t/home/u/.herdr/worktrees/main/w1\n200\t/home/u/dd/alpha\n500\t/home/u/dd/dd-source\n');
     }
     if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
@@ -538,7 +542,7 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
     if (args.includes('bookmark')) return ok('');
     if (cmd === 'mkdir' || args.includes('add')) return ok('');
   }, {
-    layout: sidebar({}, { repos: ['~/dd'] }),
+    layout: sidebar({}, { repos: ['~/dd/*/', '~/.dotfiles/'] }),
     spaces: [
       { id: 's1', name: 'local-a', active: false, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
       { id: 's2', name: 'active-other', active: true, machine: null, folder: '/home/u/.dotfiles', tabs: [{ id: 'k2', active: true }] },
@@ -659,6 +663,53 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
   h.inputs[0].emit('submit');
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/bits/.herdr/worktrees/streams/remote-wt', machine: 'retriever' } });
+});
+
+test('disk scan expands strict repo globs, preserves spaces, and never descends into matched repos', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'randori-disk-scan-'));
+  try {
+    for (const rel of [
+      '.dotfiles/.jj',
+      '.dotfiles/nested/.jj',
+      'code/alpha/.jj',
+      'code/beta/.jj',
+      'code/.hidden/.jj',
+      'src/org/r1/.jj',
+      'My Projects/my repo/.jj',
+      'no-glob/child/.jj',
+    ]) mkdirSync(join(dir, rel), { recursive: true });
+    let scanArgs = null;
+    const h = dialog('new', (cmd, args, opts) => {
+      if (cmd === 'sh' && !opts.on && args[0] === '-c') {
+        scanArgs = args;
+        const stdout = execFileSync('/bin/sh', args, { encoding: 'utf8' });
+        return ok(stdout);
+      }
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
+        if (opts.cwd?.startsWith(dir)) return ok(`${opts.cwd}\n`);
+      }
+      if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: opts.cwd }]);
+      if (args.includes('bookmark')) return ok('');
+    }, {
+      layout: sidebar({}, {
+        directory: `${dir}/wt/{repo}/{name}`,
+        repos: [`${dir}/.dotfiles/`, `${dir}/code/*`, `${dir}/src/*/*`, `${dir}/My Projects/*`, `${dir}/no-glob`, `${dir}/missing/*`],
+      }),
+      readTextFile: async (p) => p.endsWith('/.jj/repo/store/type') ? 'git' : Promise.reject(new Error('no file')),
+    });
+    await h.drain();
+    assert.ok(scanArgs);
+    const diskPaths = h.view.repos.filter(r => r.source === 'disk').map(r => r.main).sort();
+    assert.deepEqual(plain(diskPaths), [
+      join(dir, '.dotfiles'),
+      join(dir, 'My Projects/my repo'),
+      join(dir, 'code/alpha'),
+      join(dir, 'code/beta'),
+      join(dir, 'src/org/r1'),
+    ].sort());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('non-jj space shows notice when no repos exist anywhere, and identity error keeps sibling repo usable', async () => {

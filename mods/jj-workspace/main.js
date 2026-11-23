@@ -43,8 +43,9 @@ function worktreesBase(directory, userHome) {
   return raw ? untilde(raw, userHome) : null;
 }
 
-// Fast POSIX glob scan: checks immediate children of configured repo folders
-// and depth 1-2 of the worktrees base for `.jj` without descending into repos.
+// Fast POSIX glob scan: checks depth 1-2 of the worktrees base and expands
+// configured `repos` patterns (strict: exact repo paths or `*` globs such as
+// `~/code/*` or `~/src/*/*`) for `.jj` without descending into repos.
 // Emits `<mtime>\t<dir>` using each repo's `.jj/repo/op_heads/heads` mtime so
 // disk repositories sort by most recent jj activity.
 const DISK_SCAN = [
@@ -67,13 +68,14 @@ const DISK_SCAN = [
   '    done',
   '  done',
   'fi',
-  'for root in "$@"; do',
-  '  [ -d "$root" ] || continue',
-  '  [ -d "$root/.jj" ] && emit "$root"',
-  '  for d in "$root"/* "$root"/.[!.]*; do',
+  'old_ifs="$IFS"',
+  'IFS=""',
+  'for pat in "$@"; do',
+  '  for d in $pat; do',
   '    [ -d "$d/.jj" ] && emit "$d"',
   '  done',
   'done',
+  'IFS="$old_ifs"',
 ].join("\n");
 
 const SOURCE_RANK = { space: 0, other: 1, disk: 2 };
@@ -425,7 +427,9 @@ export default class Workspace extends View {
     const cfg = settings();
     const localHome = this.homes[""];
     const wt = worktreesBase(cfg.directory, localHome);
-    const roots = (Array.isArray(cfg.repos) ? cfg.repos : []).filter((d) => typeof d === "string" && d.trim()).map((d) => untilde(d.trim(), localHome));
+    const roots = (Array.isArray(cfg.repos) ? cfg.repos : [])
+      .filter((d) => typeof d === "string" && d.trim())
+      .map((d) => untilde(d.trim(), localHome).replace(/\/+$/, "") || "/");
     if (!otherSpaces.length && !wt && !roots.length) return;
     this.loadingBg = true;
     cx.spawn(async (cx) => {
