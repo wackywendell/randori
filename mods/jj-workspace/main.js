@@ -101,7 +101,7 @@ function folders(s, all = panes()) {
 }
 
 // The settings on the jj-spaces layout block, over these defaults.
-const DEFAULTS = { directory: "~/.herdr/worktrees/{repo}/{name}", links: [], miseTrust: true, repos: [] };
+const DEFAULTS = { directory: "~/.herdr/worktrees/{repo}/{name}", links: [], miseTrust: true, repos: [], openIn: "space" };
 function settings(root = layout()) {
   const find = (node) => node?.content?.mod === "jj-spaces" ? node : (node?.children ?? []).map(find).find(Boolean);
   return { ...DEFAULTS, ...(find(root)?.content?.props ?? {}) };
@@ -508,6 +508,19 @@ export default class Workspace extends View {
     return Boolean(r && this.spaceId) && (r.on ?? null) === (this.spaceMachine ?? null);
   }
 
+  preferTab(r) {
+    return settings().openIn === "tab" && this.canTab(r);
+  }
+
+  // Maps Enter vs Shift+Enter to tab vs space: already-open workspaces always
+  // switch on Enter and open a new tab on Shift+Enter; new and closed
+  // workspaces follow `openIn` ("space" or "tab", falling back to space when
+  // cross-machine) with Shift flipping to the other destination.
+  resolveAsTab(r, shift = false, found = null) {
+    if (found) return Boolean(shift);
+    return this.preferTab(r) ? !shift : Boolean(shift);
+  }
+
   existing(r, name = this.text.trim()) {
     if (!r || !name || !r.list) return null;
     return r.list.find((w) => w.name === name) ?? null;
@@ -707,18 +720,21 @@ export default class Workspace extends View {
     return tilde(untilde(directory, userHome), userHome);
   }
 
-  enter(cx, asTab = false) {
+  enter(cx, shift = false) {
     if (this.busy) return;
     const cur = this.current();
     if (!cur) return;
-    if (cur.kind === "ws") return this.open(cur.ws, cur.repo, asTab, cx);
+    if (cur.kind === "ws") {
+      const found = cur.ws.path && whereOpen(cur.ws.path, cur.repo.list ?? [], cur.repo.on, spaces(), panes());
+      return this.open(cur.ws, cur.repo, this.resolveAsTab(cur.repo, shift, found), cx);
+    }
     if (cur.kind === "create") {
       if (!cur.name) {
         if (this.text.trim() !== `${cur.repo.name}/`) this.completeRepo(cur.repo, cx);
         else this.input.focus();
         return;
       }
-      cx.spawn(async (cx) => this.work(cur.repo, cx, asTab, cur.name));
+      cx.spawn(async (cx) => this.work(cur.repo, cx, this.resolveAsTab(cur.repo, shift), cur.name));
     }
   }
 
@@ -1109,7 +1125,7 @@ export default class Workspace extends View {
     const spaceList = spaces();
     const paneList = panes();
     const activeSpace = spaceList.find((s) => s.active);
-    const targetNote = this.spaceId && activeSpace && activeSpace.id !== this.spaceId && this.spaceName ? ` (tab in ${this.spaceName})` : "";
+    const targetNote = this.spaceId && activeSpace && activeSpace.id !== this.spaceId && this.spaceName ? ` in ${this.spaceName}` : "";
 
     const pill = (label, color, bg = null, bordered = false) =>
       div()
@@ -1239,7 +1255,7 @@ export default class Workspace extends View {
               else { this.input.focus(); cx.notify(); }
               return;
             }
-            cx.spawn(async (cx) => this.work(r, cx, Boolean(e?.modifiers?.shift || e?.shift), name));
+            cx.spawn(async (cx) => this.work(r, cx, this.resolveAsTab(r, Boolean(e?.modifiers?.shift || e?.shift)), name));
           })
           .child(div().w(3).h(20).flex_none().rounded(2).when(on, (el) => el.bg(t.accent)))
           .child(
@@ -1287,7 +1303,8 @@ export default class Workspace extends View {
         .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
         .on_click((e, cx) => {
           this.selectedKey = entry.key;
-          this.open(w, r, Boolean(e?.modifiers?.shift || e?.shift), cx);
+          const liveFound = w.path && whereOpen(w.path, r.list ?? [], r.on, spaces(), panes());
+          this.open(w, r, this.resolveAsTab(r, Boolean(e?.modifiers?.shift || e?.shift), liveFound), cx);
         })
         .child(div().w(3).h(20).flex_none().rounded(2).when(on, (el) => el.bg(t.accent)))
         .child(svg("mods/workspace-chrome/branch.svg").size(14).flex_none().text_color(found ? t.accent : t.dim))
@@ -1322,18 +1339,37 @@ export default class Workspace extends View {
       }
       if (!this.ready || !cur) return div().child("esc close");
       const items = [];
+      const tabDest = `new tab${targetNote}`;
       if (cur.kind === "create") {
         if (cur.name) {
-          items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("create"));
-          if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(`tab${targetNote}`));
+          if (this.preferTab(cur.repo)) {
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child(tabDest));
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child("new space"));
+          } else {
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("new space"));
+            if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(tabDest));
+          }
         } else if (this.text.trim() !== `${cur.repo.name}/`) {
           items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child(`choose ${cur.repo.name}/`));
         } else {
           items.push(div().child("type a name to create"));
         }
       } else if (cur.kind === "ws") {
-        items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("open"));
-        if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(`tab${targetNote}`));
+        if (!cur.ws.path) {
+          items.push(div().child("unavailable"));
+        } else {
+          const found = whereOpen(cur.ws.path, cur.repo.list ?? [], cur.repo.on, spaceList, paneList);
+          if (found) {
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("switch"));
+            if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(tabDest));
+          } else if (this.preferTab(cur.repo)) {
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child(tabDest));
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child("new space"));
+          } else {
+            items.push(h_flex().items_center().gap(4).child(keycap("\u21b5")).child("new space"));
+            if (this.canTab(cur.repo)) items.push(h_flex().items_center().gap(4).child(keycap("\u21e7\u21b5")).child(tabDest));
+          }
+        }
       }
       return h_flex().items_center().gap(10).children(items);
     };
