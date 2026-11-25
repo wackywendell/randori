@@ -46,18 +46,19 @@ function worktreesBase(directory, userHome) {
 // Fast POSIX glob scan: checks depth 1-2 of the worktrees base and expands
 // configured `repos` patterns (strict: exact repo paths or `*` globs such as
 // `~/code/*` or `~/src/*/*`) for `.jj` without descending into repos.
-// Emits `<mtime>\t<dir>` using each repo's `.jj/repo/op_heads/heads` mtime so
-// disk repositories sort by most recent jj activity.
+// Emits `<mtime>\t<dir>\t<ptr>` using each repo's `.jj/repo/op_heads/heads`
+// mtime and optional linked `.jj/repo` pointer so both local and remote scans
+// deduplicate worktrees in a single shell call and sort by recent jj activity.
 const DISK_SCAN = [
   'wt="$1"; shift',
   'emit() {',
-  '  p="$1"; h="$p/.jj/repo/op_heads/heads"',
+  '  p="$1"; h="$p/.jj/repo/op_heads/heads"; ptr=""',
   '  if [ -f "$p/.jj/repo" ]; then',
-  '    r=$(cat "$p/.jj/repo" 2>/dev/null)',
-  '    case "$r" in /*) h="$r/op_heads/heads" ;; *) h="$p/.jj/$r/op_heads/heads" ;; esac',
+  '    ptr=$(cat "$p/.jj/repo" 2>/dev/null)',
+  '    case "$ptr" in /*) h="$ptr/op_heads/heads" ;; *) h="$p/.jj/$ptr/op_heads/heads" ;; esac',
   '  fi',
   '  m=$(stat -f %m "$h" 2>/dev/null || stat -c %Y "$h" 2>/dev/null || echo 0)',
-  '  printf "%s\\t%s\\n" "$m" "$p"',
+  '  printf "%s\\t%s\\t%s\\n" "$m" "$p" "$ptr"',
   '}',
   'if [ -n "$wt" ] && [ -d "$wt" ]; then',
   '  for a in "$wt"/* "$wt"/.[!.]*; do',
@@ -200,7 +201,7 @@ export default class Workspace extends View {
     this.focusRoot = null;
     this.ready = false;
     this.loadingBg = false;
-    this.submitted = false;
+    this.closed = false;
     this.text = "";
     this.at = 0; // finish window cursor
     this.selectedKey = null; // pinned picker row key; null follows top/initial row
@@ -225,9 +226,6 @@ export default class Workspace extends View {
       cx.notify();
     });
     this.input.on("submit", (e, cx) => {
-      // Prevent the same Enter keydown from double-firing on #worktree's on_key_down.
-      this.submitted = true;
-      Promise.resolve().then(() => { this.submitted = false; });
       this.enter(cx, Boolean(e?.shift));
     });
     this.inputFocused = true;
@@ -325,11 +323,13 @@ export default class Workspace extends View {
     cx?.notify();
   }
 
-  // Canonical deterministic repo order:
+  // Canonical deterministic repo order (source first, current machine first):
   // 1. Current space (focused repo first, then tab order)
-  // 2. Other spaces (pure sidebar order, then tab order)
-  // 3. Disk repositories (most recent jj op_heads mtime first, then alphabetical)
+  // 2. Other spaces (current machine first, then other machines; sidebar order within each)
+  // 3. Disk repositories (current machine first, then local; jj op_heads mtime descending, then alphabetical)
   sortRepos() {
+    const curMachine = this.spaceMachine ?? null;
+    const mRank = (r) => ((r.on ?? null) === curMachine ? 0 : 1);
     this.repos.sort((a, b) => {
       const sr = (SOURCE_RANK[a.source] ?? 9) - (SOURCE_RANK[b.source] ?? 9);
       if (sr !== 0) return sr;
@@ -339,6 +339,8 @@ export default class Workspace extends View {
         if (af !== bf) return af - bf;
         return (a.order ?? 0) - (b.order ?? 0);
       }
+      const mr = mRank(a) - mRank(b);
+      if (mr !== 0) return mr;
       if (a.source === "other") return (a.order ?? 0) - (b.order ?? 0);
       if ((b.mtime ?? 0) !== (a.mtime ?? 0)) return (b.mtime ?? 0) - (a.mtime ?? 0);
       return (a.name ?? "").localeCompare(b.name ?? "", undefined, { sensitivity: "base" });
@@ -420,23 +422,17 @@ export default class Workspace extends View {
     }));
   }
 
-  // Background discovery of other spaces, the worktrees folder, and configured
-  // `repos` folders on local disk. Never blocks initial dialog open.
+  // Background discovery of other spaces and disk repositories (the target
+  // space's machine plus local when on a remote machine). Never blocks open.
   loadBackground(cx) {
     const otherSpaces = this.others();
-    const cfg = settings();
-    const localHome = this.homes[""];
-    const wt = worktreesBase(cfg.directory, localHome);
-    const roots = (Array.isArray(cfg.repos) ? cfg.repos : [])
-      .filter((d) => typeof d === "string" && d.trim())
-      .map((d) => untilde(d.trim(), localHome).replace(/\/+$/, "") || "/");
-    if (!otherSpaces.length && !wt && !roots.length) return;
+    const scanMachines = this.spaceMachine ? [this.spaceMachine, null] : [null];
     this.loadingBg = true;
     cx.spawn(async (cx) => {
       try {
         await Promise.allSettled([
           otherSpaces.length ? this.probe(otherSpaces, "other", null, cx) : Promise.resolve(),
-          wt || roots.length ? this.scanDisk(wt, roots, cx) : Promise.resolve(),
+          ...scanMachines.map((on) => this.scanDisk(on, cx)),
         ]);
       } finally {
         this.loadingBg = false;
@@ -445,32 +441,46 @@ export default class Workspace extends View {
     });
   }
 
-  async scanDisk(wt, roots, cx) {
+  async scanDisk(on, cx) {
+    const machine = on ?? null;
+    const cfg = settings();
+    let userHome;
+    try { userHome = await this.homeOf(machine); }
+    catch { return; }
+    const wt = worktreesBase(cfg.directory, userHome);
+    const roots = (Array.isArray(cfg.repos) ? cfg.repos : [])
+      .filter((d) => typeof d === "string" && d.trim())
+      .map((d) => untilde(d.trim(), userHome).replace(/\/+$/, "") || "/");
+    if (!wt && !roots.length) return;
     let r;
     try {
-      r = await exec("sh", ["-c", DISK_SCAN, "sh", wt || "", ...roots], { timeout: 5_000 });
+      r = await exec("sh", ["-c", DISK_SCAN, "sh", wt || "", ...roots], { ...(machine ? { on: machine } : {}), timeout: 5_000 });
     } catch {
       return;
     }
     if (r.code !== 0 || !r.stdout?.trim()) return;
-    // Parse `<mtime>\t<dir>` (or plain `<dir>`), keeping highest mtime per path.
+    // Parse `<mtime>\t<dir>[\t<ptr>]`, keeping highest mtime per path.
     const rawEntries = new Map();
     for (const line of r.stdout.trim().split("\n")) {
       if (!line) continue;
-      const tab = line.indexOf("\t");
-      const mtime = tab >= 0 ? (Number(line.slice(0, tab)) || 0) : 0;
-      const dir = tab >= 0 ? line.slice(tab + 1) : line;
+      const parts = line.split("\t");
+      const mtime = parts.length >= 2 ? (Number(parts[0]) || 0) : 0;
+      const dir = parts.length >= 2 ? parts[1] : parts[0];
+      const ptr = parts.length >= 3 ? parts.slice(2).join("\t").trim() : null;
       if (!dir) continue;
-      if (!rawEntries.has(dir) || mtime > rawEntries.get(dir)) rawEntries.set(dir, mtime);
+      const prev = rawEntries.get(dir);
+      if (!prev || mtime > prev.mtime) rawEntries.set(dir, { mtime, ptr });
     }
-    // Resolve linked worktrees via `.jj/repo` pointer file so multiple worktrees
+    // Resolve linked worktrees via `.jj/repo` pointer so multiple worktrees
     // of an already-known repo produce zero extra jj calls.
     const candidates = new Map();
-    const seenMains = new Set(this.repos.filter((x) => !x.on).map((x) => x.main));
-    for (const [dir, mtime] of rawEntries) {
+    const onMachine = (x) => (x.on ?? null) === machine;
+    const seenMains = new Set(this.repos.filter(onMachine).map((x) => x.main));
+    for (const [dir, { mtime, ptr: scannedPtr }] of rawEntries) {
       if (seenMains.has(dir)) continue;
-      if (this.repos.some((x) => !x.on && (x.list ?? []).some((w) => w.path === dir))) continue;
-      const ptr = await readTextFile(`${dir}/.jj/repo`).catch(() => null);
+      if (this.repos.some((x) => onMachine(x) && (x.list ?? []).some((w) => w.path === dir))) continue;
+      let ptr = scannedPtr;
+      if (ptr === null && !machine) ptr = await readTextFile(`${dir}/.jj/repo`).catch(() => null);
       let target = dir;
       if (typeof ptr === "string" && ptr.trim()) {
         const repoDir = joinPath(`${dir}/.jj`, ptr.trim());
@@ -481,14 +491,14 @@ export default class Workspace extends View {
     }
     if (!candidates.size) return;
     await Promise.allSettled([...candidates.entries()].map(async ([folder, mtime]) => {
-      const pk = `\0${folder}`;
+      const pk = `${machine ?? ""}\0${folder}`;
       if (this.probed.has(pk)) return;
       this.probed.add(pk);
-      const id = await identity(folder, null, IO);
+      const id = await identity(folder, machine, IO);
       if (id.error || !id.jj || !id.main) return;
-      const key = `\0${id.main}`;
+      const key = `${machine ?? ""}\0${id.main}`;
       if (this.repos.some((x) => x.key === key)) return;
-      const repo = { key, name: base(id.main), main: id.main, checkout: id.root, on: null, source: "disk", spaceId: null, order: 0, mtime, list: undefined, names: undefined, error: "" };
+      const repo = { key, name: base(id.main), main: id.main, checkout: id.root, on: machine, source: "disk", spaceId: null, order: 0, mtime, list: undefined, names: undefined, error: "" };
       this.repos.push(repo);
       this.sortRepos();
       cx?.notify();
@@ -497,6 +507,8 @@ export default class Workspace extends View {
   }
 
   close() {
+    if (this.closed) return;
+    this.closed = true;
     closeOverlay((this.p ?? props())?.overlay);
   }
 
@@ -721,7 +733,7 @@ export default class Workspace extends View {
   }
 
   enter(cx, shift = false) {
-    if (this.busy) return;
+    if (this.busy || this.closed) return;
     const cur = this.current();
     if (!cur) return;
     if (cur.kind === "ws") {
@@ -740,7 +752,7 @@ export default class Workspace extends View {
 
   async work(r = this.selectedRepo(), cx, asTab = false, name) {
     if (r && typeof r.notify === "function") { name = asTab; asTab = Boolean(cx); cx = r; r = this.selectedRepo(); }
-    if (this.busy || !r) return;
+    if (this.busy || this.closed || !r) return;
     if (asTab && !this.canTab(r)) {
       this.error = `Tabs in this space cannot open a workspace on ${r.on}. Press Enter for a new space.`;
       cx.notify();
@@ -773,8 +785,8 @@ export default class Workspace extends View {
     const linked = [];
     for (const rel of links) {
       const source = `${r.main}/${rel}`, target = `${path}/${rel}`;
-      if (!(await ok("test", ["-e", source], r.on))) { problems.push(`${rel}: not in the main checkout`); continue; }
-      if ((await ok("test", ["-e", target], r.on)) || (await ok("test", ["-L", target], r.on))) { problems.push(`${rel}: already in the new checkout`); continue; }
+      if (!(await ok("test", ["-e", source], r.on))) continue;
+      if ((await ok("test", ["-e", target], r.on)) || (await ok("test", ["-L", target], r.on))) continue;
       if (!(await ok("mkdir", ["-p", parent(target)], r.on)) || !(await ok("ln", ["-s", source, target], r.on))) { problems.push(`${rel}: could not link`); continue; }
       linked.push(rel);
     }
@@ -797,7 +809,7 @@ export default class Workspace extends View {
   }
 
   open(w, r, asTab = false, cx) {
-    if (!w?.path || !r) return;
+    if (this.closed || !w?.path || !r) return;
     if (asTab) {
       if (!this.canTab(r)) {
         this.error = `Tabs in this space cannot open a workspace on ${r.on}. Press Enter for a new space.`;
@@ -996,6 +1008,7 @@ export default class Workspace extends View {
   }
 
   key(e, cx) {
+    if (this.closed) return;
     if (e.key === "escape") return this.close();
     if (this.finishing) {
       const n = this.rows.length;
@@ -1016,7 +1029,9 @@ export default class Workspace extends View {
       }
     }
     if (e.key === "enter") {
-      if (this.submitted) return;
+      // While the input is focused, Input's "submit" handles Enter/Shift+Enter;
+      // ignoring the bubbled keydown prevents double-opening two tabs/spaces.
+      if (this.inputFocused) return;
       this.enter(cx, Boolean(e?.modifiers?.shift || e?.shift));
       cx.stop_propagation();
       return cx.notify();
@@ -1190,7 +1205,7 @@ export default class Workspace extends View {
           )
           .child(div().flex_none().text_size(12).font_semibold().text_color(t.foreground).child(r.name))
           .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(tilde(r.main, userHome)))
-          .when(Boolean(r.on), (el) =>
+          .when(Boolean(r.on || this.spaceMachine), (el) =>
             el.child(
               h_flex()
                 .flex_none()
@@ -1204,8 +1219,8 @@ export default class Workspace extends View {
                 .items_center()
                 .text_size(10.5)
                 .text_color(t.muted)
-                .child(svg("mods/workspace-chrome/server.svg").size(10).text_color(t.dim))
-                .child(r.on),
+                .when(Boolean(r.on), (el) => el.child(svg("mods/workspace-chrome/server.svg").size(10).text_color(t.dim)))
+                .child(r.on || "local"),
             ),
           );
       }

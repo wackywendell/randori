@@ -335,7 +335,8 @@ test('New workspace adds it on a matching bookmark, links files and trusts linke
   assert.ok(lines.includes('ln -s /r/main/.env /home/u/wt/main/feat-x/.env'));
   assert.ok(lines.includes('mise trust /home/u/wt/main/feat-x/mise.toml'));
   assert.equal(lines.some(l => l.includes('mise trust') && l.includes('.env')), false);
-  assert.match(h.notifications[0].body, /missing: not in the main checkout/);
+  // Missing link sources are silently skipped without noisy notifications.
+  assert.equal(h.notifications.length, 0);
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/u/wt/main/feat-x', machine: '' } });
   assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
 });
@@ -365,19 +366,51 @@ test('New workspace runs from the main checkout (even when opened from a linked 
   assert.equal(h.notifications.length, 0);
 });
 
-test('New workspace never replaces a file already in the new checkout', async () => {
-  const h = dialog('new', (cmd, args) => {
+test('New workspace silently skips already-present files, respects miseTrust: false, and notifies on link or mise trust failure', async () => {
+  // 1. Existing target file is never replaced and produces no notification.
+  const h1 = dialog('new', (cmd, args) => {
     if (args.includes('bookmark')) return ok('');
     if (args.includes('add')) return ok('');
     if (cmd === 'mkdir') return ok('');
     if (cmd === 'test') return args[0] === '-L' ? ok('') : args[1].startsWith('/r/main') ? ok('') : fail('');
   }, { layout: sidebar({}, { links: ['.env'] }) });
-  await h.drain();
-  h.inputs[0].emit('change', 'topic');
-  h.inputs[0].emit('submit');
-  await h.drain();
-  assert.equal(h.calls.some(c => c.cmd === 'ln'), false);
-  assert.match(h.notifications[0].body, /\.env: already in the new checkout/);
+  await h1.drain();
+  h1.inputs[0].emit('change', 'topic');
+  h1.inputs[0].emit('submit');
+  await h1.drain();
+  assert.equal(h1.calls.some(c => c.cmd === 'ln'), false);
+  assert.equal(h1.notifications.length, 0);
+
+  // 2. miseTrust: false skips mise completely; ln failure notifies.
+  const h2 = dialog('new', (cmd, args) => {
+    if (args.includes('bookmark')) return ok('');
+    if (args.includes('add')) return ok('');
+    if (cmd === 'mkdir') return ok('');
+    if (cmd === 'test') return args[0] === '-e' && args[1].startsWith('/r/main') ? ok('') : fail('');
+    if (cmd === 'ln') return args[1].endsWith('/.env') ? fail('denied') : ok('');
+  }, { layout: sidebar({}, { links: ['mise.toml', '.env'], miseTrust: false }) });
+  await h2.drain();
+  h2.inputs[0].emit('change', 'topic');
+  h2.inputs[0].emit('submit');
+  await h2.drain();
+  assert.equal(h2.calls.some(c => c.cmd === 'mise'), false);
+  assert.equal(h2.notifications.length, 1);
+  assert.match(h2.notifications[0].body, /\.env: could not link/);
+
+  // 3. miseTrust: true notifies when mise trust fails.
+  const h3 = dialog('new', (cmd, args) => {
+    if (args.includes('bookmark')) return ok('');
+    if (args.includes('add')) return ok('');
+    if (cmd === 'mkdir' || cmd === 'ln') return ok('');
+    if (cmd === 'test') return args[0] === '-e' && args[1].startsWith('/r/main') ? ok('') : fail('');
+    if (cmd === 'mise') return args[0] === '--version' ? ok('2026.1.0\n') : fail('trust failed');
+  }, { layout: sidebar({}, { links: ['mise.toml'], miseTrust: true }) });
+  await h3.drain();
+  h3.inputs[0].emit('change', 'topic');
+  h3.inputs[0].emit('submit');
+  await h3.drain();
+  assert.equal(h3.notifications.length, 1);
+  assert.match(h3.notifications[0].body, /mise\.toml: mise trust failed/);
 });
 
 test('a failed jj workspace add shows jj\u2019s error and opens nothing', async () => {
@@ -575,14 +608,18 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
   assert.equal(h.view.current().repo.name, 'main');
   assert.equal(h.view.current().kind, 'create');
 
-  // Inactive target space shows "new tab in local-a" hint; Shift+Enter opens a tab named "main".
+  // Inactive target space shows "new tab in local-a" hint; Shift+Enter opens a tab named "main" ONCE even if Enter bubbles after microtask drain.
   h.view.selectedKey = h.view.picks()[0].key;
   assert.ok(words(h.render()).some(x => x.includes('new tab in local-a')));
   h.inputs[0].emit('submit', undefined, { shift: true });
+  await Promise.resolve();
+  key(h, 'enter', { shift: true });
   await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/r/main', name: 'main' } });
+  assert.equal(h.actions.length, 1);
+  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/main', name: 'main' } });
 
   // Unpinned typing `.dotf` (prefix) floats `.dotfiles` with `New workspace` FIRST and renders inline `iles/` ghost suffix (no `.dotfiles/` pill or Tab hint).
+  h.view.closed = false;
   h.view.selectedKey = null;
   h.actions.length = 0;
   h.overlays.length = 0;
@@ -654,6 +691,7 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
   assert.ok(dotAdd[0].args.includes('/home/u/.herdr/worktrees/.dotfiles/fix'));
 
   // Remote `streams/remote-wt`: Shift+Enter refuses cross-machine tab; Enter creates on retriever using remote $HOME.
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('change', 'streams/remote-wt');
   h.inputs[0].emit('submit', undefined, { shift: true });
@@ -750,44 +788,62 @@ test('openIn: tab opens new and closed workspaces in a tab on Enter, space on Sh
   const newFooter = words(h.render());
   assert.ok(newFooter.indexOf('new tab') < newFooter.indexOf('new space'));
   h.inputs[0].emit('submit', undefined, { shift: false });
+  await Promise.resolve();
+  key(h, 'enter');
   await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/home/u/.herdr/worktrees/main/fresh', name: 'fresh' } });
+  assert.equal(h.actions.length, 1);
+  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/home/u/.herdr/worktrees/main/fresh', name: 'fresh' } });
 
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('submit', undefined, { shift: true });
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/u/.herdr/worktrees/main/fresh', machine: '' } });
 
-  // 2. Closed existing workspace on same machine: Enter opens tab, Shift+Enter opens space.
+  // 2. Closed existing workspace on same machine: Enter opens exactly ONE tab (even when Enter bubbles after microtask drain), Shift+Enter opens space.
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('change', 'closed-w');
   const closedFooter = words(h.render());
   assert.ok(closedFooter.indexOf('new tab') < closedFooter.indexOf('new space'));
   h.inputs[0].emit('submit', undefined, { shift: false });
+  await Promise.resolve();
+  key(h, 'enter');
   await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/r/closed-w', name: 'closed-w' } });
+  assert.equal(h.actions.length, 1);
+  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/closed-w', name: 'closed-w' } });
 
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('submit', undefined, { shift: true });
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/r/closed-w', machine: '' } });
 
   // 3. Already-open existing workspace: Enter STILL switches (never duplicates), Shift+Enter opens a new tab.
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('change', 'open-w');
   const openFooter = words(h.render());
   assert.ok(openFooter.includes('switch'));
   assert.ok(openFooter.includes('new tab'));
   h.inputs[0].emit('submit', undefined, { shift: false });
+  await Promise.resolve();
+  key(h, 'enter');
   await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.select', args: { id: 's2' } });
+  assert.equal(h.actions.length, 1);
+  assert.deepEqual(plain(h.actions[0]), { name: 'space.select', args: { id: 's2' } });
 
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('submit', undefined, { shift: true });
+  await Promise.resolve();
+  key(h, 'enter', { shift: true });
   await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'tab.new', args: { space: 's1', folder: '/r/open-w', name: 'open-w' } });
+  assert.equal(h.actions.length, 1);
+  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/open-w', name: 'open-w' } });
 
   // 4. Remote cross-machine repo: falls back gracefully to new space on Enter (no error), footer shows only new space.
+  h.view.closed = false;
   h.actions.length = 0;
   h.inputs[0].emit('change', 'streams/r-closed');
   const remFooter = words(h.render());
@@ -796,6 +852,74 @@ test('openIn: tab opens new and closed workspaces in a tab on Enter, space on Sh
   h.inputs[0].emit('submit', undefined, { shift: false });
   await h.drain();
   assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/rem/r-closed', machine: 'retriever' } });
+});
+
+test('remote space prioritizes current-machine spaces and disk repos (A2), scans remote + local disk (B), and badges local', async () => {
+  const listed = rows => ok(rows.map(x => JSON.stringify(x)).join('\n'));
+  const files = {
+    '/rem/streams/.jj/repo/store/type': 'git',
+    '/rem/remote-other/.jj/repo/store/type': 'git',
+    '/rem/dd/dd-source/.jj/repo/store/type': 'git',
+    '/r/main/.jj/repo/store/type': 'git',
+    '/home/u/dd/dd-source/.jj/repo/store/type': 'git',
+  };
+  const h = dialog('new', (cmd, args, opts) => {
+    if (cmd === 'sh' && args[1] === 'printf %s "$HOME"' && opts.on === 'retriever') return ok('/home/bits\n');
+    if (cmd === 'sh' && args[0] === '-c' && args[1] !== 'printf %s "$HOME"') {
+      if (opts.on === 'retriever') {
+        assert.ok(args.includes('/home/bits/.herdr/worktrees'));
+        assert.ok(args.includes('/home/bits/dd/*'));
+        // Includes a linked worktree pointing at already-known /rem/streams via 3rd field (deduped without readTextFile)
+        // plus a closed remote disk repo /rem/dd/dd-source.
+        return ok('900\t/home/bits/.herdr/worktrees/streams/w1\t/rem/streams/.jj/repo\n500\t/rem/dd/dd-source\t\n');
+      }
+      assert.ok(args.includes('/home/u/dd/*'));
+      return ok('800\t/home/u/dd/dd-source\t\n');
+    }
+    if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
+      if (opts.on === 'retriever') return ok(`${opts.cwd}\n`);
+      if (opts.cwd === '/r/main' || opts.cwd === '/home/u/dd/dd-source') return ok(`${opts.cwd}\n`);
+    }
+    if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: opts.cwd }]);
+    if (args.includes('bookmark')) return ok('');
+  }, {
+    layout: sidebar({}, { repos: ['~/dd/*'] }),
+    spaces: [
+      // Local space is FIRST in sidebar, remote space s3 is AFTER it.
+      { id: 's1', name: 'local-space', active: false, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
+      { id: 's2', name: 'streams', active: true, machine: 'retriever', folder: '/rem/streams', tabs: [{ id: 'k2', active: true }] },
+      { id: 's3', name: 'remote-other', active: false, machine: 'retriever', folder: '/rem/remote-other', tabs: [{ id: 'k3', active: true }] },
+    ],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/rem/streams' },
+      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/remote-other' },
+    ],
+    props: { space: 's2', folder: '/rem/streams', overlay: 'o1' },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h.drain();
+  // A2 order:
+  // 1. Current space (`streams` on retriever)
+  // 2. Other spaces: `remote-other` (retriever) BEFORE `local-space` (local, even though earlier in sidebar)
+  // 3. Disk repos: `dd-source` (retriever, mtime 500) BEFORE `dd-source` (local, mtime 800!)
+  assert.deepEqual(plain(h.view.repos.map(r => [r.name, r.source, r.on])), [
+    ['streams', 'space', 'retriever'],
+    ['remote-other', 'other', 'retriever'],
+    ['main', 'other', null],
+    ['dd-source', 'disk', 'retriever'],
+    ['dd-source', 'disk', null],
+  ]);
+  // Remote worktree w1 pointing at /rem/streams was deduplicated without probing jj.
+  assert.equal(h.calls.some(c => c.cwd === '/home/bits/.herdr/worktrees/streams/w1'), false);
+  // Rendering from a remote space badges local repos with "local" alongside "retriever".
+  const rendered = words(h.render());
+  assert.ok(rendered.includes('retriever'));
+  assert.ok(rendered.includes('local'));
+  // Typing a colliding repo name selects retriever's dd-source first.
+  h.inputs[0].emit('change', 'dd-s');
+  assert.equal(h.view.current().repo.name, 'dd-source');
+  assert.equal(h.view.current().repo.on, 'retriever');
 });
 
 test('non-jj space shows notice when no repos exist anywhere, and identity error keeps sibling repo usable', async () => {
