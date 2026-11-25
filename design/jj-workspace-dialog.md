@@ -2,13 +2,13 @@
 
 Author: Wendell Smith
 Status: Approved
-Date: 2026-11-21
+Date: 2026-11-25
 
 ---
 
 ## Overview
 
-This design updates how Randori creates, opens, and finishes jj workspaces across multi-repository and multi-tab Herdr spaces. Randori is a set of JavaScript mods for Herdr that adds Jujutsu (jj) workspace management alongside Herdr's shipped Git behavior. See [jj workspace lifecycle in Herdr](./jj-workspace-lifecycle.md) and [README](../README.md) for background on Randori's existing mods (`jj-spaces`, `jj-changes`, `jj-tabs`, `jj-menu`, `jj-new-menu`, `jj-workspace`), workspace path templates, `links` symlinking, and `mise trust`.
+This design updates how Randori creates, opens, and finishes jj workspaces across multi-repository and multi-tab Herdr spaces. Randori is a set of JavaScript mods for Herdr that adds Jujutsu (jj) workspace management alongside Herdr's shipped Git behavior. See [jj workspace lifecycle in Herdr](./jj-workspace-lifecycle.md) and [README](../README.md) for background on Randori's mods (`jj-spaces`, `jj-changes`, `jj-tabs`, `jj-menu`, `jj-new-menu`, `jj-workspace`, `jj-finish`), workspace path templates, `links` symlinking, and `mise trust`.
 
 This design makes two connected changes.
 
@@ -45,7 +45,7 @@ Creating, opening, and finishing jj workspaces in Randori currently assume one r
 - Enable full keyboard creation and switching from one unified filter-first list. Pressing the configured key binding, typing a workspace name or `repo/name`, optionally moving Up or Down, and pressing Enter (or Shift+Enter for a new tab) opens or creates the jj workspace without using the mouse.
 - Keep one consistent list without mode switching. Existing workspaces and inline `New workspace` rows appear together under each repository header. Exact workspace name matches hide the duplicate `New` row so Enter opens the existing workspace directly.
 - Float matching repositories and support `/` and `→` completion. Typing a repository prefix such as `.dotf` floats `.dotfiles` to the top with `New workspace` first and displays an inline ghost completion (`iles/` for prefix matches, ` → .dotfiles/` for mid-string matches). Typing `/` or pressing `→` at the end of the text completes `.dotfiles/` so typing a new name immediately targets that repository.
-- Preserve deterministic order and stable selection. Repositories sort into three sections (current space with the focused repository first then tab order, Other spaces in pure sidebar order, and Repositories on disk ordered by `.jj/repo/op_heads/heads` mtime then alphabetical). Selection uses a stable row key (`selectedKey`) so typing, completion, or background discovery never hijack a row you scrolled to.
+- Preserve deterministic order and stable selection. Repositories sort into three sections (source first, current machine first within each), with current space first (focused repository first then tab order), Other spaces next (current machine first then other machines in sidebar order), and Repositories on disk last (current machine first then local ordered by `.jj/repo/op_heads/heads` mtime then alphabetical). Selection uses a kind-prefixed row key (`selectedKey`) so typing, completion, or background discovery never hijack a row you scrolled to.
 - Open immediately and discover other spaces and disk repositories in the background. Opening the dialog blocks only on the target space's folders, then probes other Herdr spaces, the worktrees base folder, and configured `repos` folders asynchronously without stealing input focus or pulling default selection out of the current space.
 - Support both space/tab jumping and new-tab placement, with configurable default destination (`openIn: "space" | "tab"`). Already-open workspaces always switch on Enter (`↵ switch · ⇧↵ new tab`, preferring a dedicated space, else switching to the matching space and tab). For new and closed workspaces on the target space's machine, `openIn` selects whether Enter opens a new space (`↵ new space · ⇧↵ new tab`, default) or a new tab in the target space (`↵ new tab · ⇧↵ new space`), with Shift+Enter using the opposite destination. Cross-machine repositories fall back cleanly to a new space on Enter (`↵ new space`).
 - Make Finish work across tabs and multiple repositories while upholding `AGENTS.md` safety rules. Finish appears in both tab right-click menus and space right-click menus, lists linked workspaces across all repositories in scope, pre-checks all linked workspaces in the clicked or active tab (and none when the active tab has no linked workspace), names every individual terminal and parent-owned child that will end before confirmation, and refuses silent broadening of the kill set or deletion of nested checkouts.
@@ -65,8 +65,8 @@ Creating, opening, and finishing jj workspaces in Randori currently assume one r
 ## Operating Assumptions and Failure Boundaries
 
 - Scale. A single space typically holds 1 to 10 tabs touching 1 to 4 repositories. A sidebar may hold 10 to 40 spaces across local and remote machines, and local `repos` patterns may match dozens of repositories. Opening the dialog waits only for the target space's folders, then runs other-space probes and a single POSIX glob scan (`[ -d "$d/.jj" ]`, deduplicating linked worktrees via `.jj/repo` pointers before invoking `jj`) in the background so slow remote hosts never block local use.
-- Single dialog instance and no polling timers. Only one `jj-workspace` overlay is active at a time. No polling timers run while the dialog is open; Finish waits on Herdr's reactive `render(cx)` updates with one 10 s deadline timer.
-- Missing or broken jj binaries. If `identity()` reports an error for a folder in the target space (such as `jj` missing on a remote host), the dialog shows that error inline and skips that folder while keeping other discovered repositories usable. Background errors are logged without disrupting the dialog banner.
+- Single dialog instance and low idle timer cost. Only one `jj-workspace` overlay is active at a time. No polling timers run while `jj-workspace` or `jj-finish` is open and idle; during the brief post-kill exit wait in `jj-finish`, both reactive `render(cx)` and a bounded 100 ms poll (cancelled as soon as terminals exit or at 10 s) detect terminal exit reliably in detached `window` overlays.
+- Missing or broken jj binaries. If `identity()` reports an error for a folder in the target space (such as `jj` missing on a remote host), the dialog shows that error inline and skips that folder while keeping other discovered repositories usable. Background errors (including `scanDisk` failures) are logged via `log()` without disrupting the dialog banner.
 - Cross-machine tab placement boundary. When a repository from another space lives on a different machine than the target space, the Shift+Enter hint is omitted and pressing Shift+Enter shows an inline error stating that tabs in this space cannot open a workspace on that remote machine and directing the user to press Enter for a new space.
 - Finish when the active tab has no linked workspace. When sidebar Finish opens on a space whose active tab works outside any linked workspace (such as the main checkout or `~`), Finish lists the space's linked workspaces with zero rows checked. Pressing Enter with zero rows checked is a no-op.
 - Finish preview-to-kill consistency and residual non-atomic boundary. Finish snapshots the terminal addresses named in the preview, re-evaluates the live affected set immediately before sending kill signals, and fails fast with an inline error if any unnamed terminal appeared (requiring a fresh confirmation). After the final pre-kill check, a new process or terminal could still enter the folder before `jj workspace remove` deletes it; Herdr provides no filesystem transaction across processes.
@@ -77,8 +77,10 @@ Creating, opening, and finishing jj workspaces in Randori currently assume one r
 ## Live Findings (Resolved Open Questions)
 
 - GPUI `Tab` focus traversal. Live testing in Herdr confirmed GPUI consumes `Tab` inside `Input` at the window focus-traversal layer before `on_key_down` fires, blurring the input even with `tab_stop(false)` on the outer container. Replacing `Tab`-switched views with a single filter-first list and using `/` and `→` for repository completion eliminated the need to intercept `Tab`.
-- GPUI `Input` `submit` and bubbled `Enter`. Pressing `Enter` inside `Input` fires the `submit` listener before the same `enter` keydown bubbles to `#worktree`'s `on_key_down`. A microtask-cleared `submitted` guard prevents double-firing.
-- `props()` lifetime across `await`. Herdr clears `props()` after an `await` inside `cx.spawn`, so `init()` caches `this.p = props() ?? {}` synchronously.
+- GPUI `Input` `submit` and bubbled `Enter`. QuickJS drains microtasks at the end of `Input`'s `submit` callback before GPUI bubbles the `enter` keydown event to `#worktree`'s `on_key_down`, so microtask-cleared dedup flags fail and can open two terminals on one keypress. Making `Input`'s `submit` the sole Enter owner (matching Herdr's shipped `picker`) and guarding `close()` with `this.closed = true` eliminates double-firing completely.
+- GNU versus BSD `stat` in `DISK_SCAN`. Running `stat -f %m` first causes GNU `stat` (Linux and Homebrew coreutils) to interpret `-f` as filesystem status and emit a 5-line report to stdout before exiting non-zero. Trying `stat -c %Y` first fails silently on BSD `stat` and falls through to `stat -f %m`; pairing this with a strict 3-field tab parser drops any stray stdout lines.
+- `props()` lifetime across `await`. Herdr clears `props()` after an `await` inside `cx.spawn`, so `init()` caches parsed props (`this.cfg = parseProps(props())`) synchronously.
+- Detached `window` overlay repaints on terminal exit. Live native trials (`scripts/app-trial.js`) showed that when `jj-finish` runs as a `kind: "window"` overlay and kills a terminal in another space, Herdr does not always repaint the detached Finish window when that terminal leaves `terminals()`. Pairing reactive `render(cx)` wake-up with a bounded 100 ms active-only poll during the kill wait (immediately cancelled on exit or at the 10 s deadline) keeps idle timer cost at zero while waking promptly on exit.
 - First-frame focus. Focusing `this.input` once in `init()` works on frame 1; calling `this.handle.focus()` plus a 100 ms focus timer caused a visible focus bounce and was removed.
 
 ## Critical User Journeys (CUJs)
@@ -127,35 +129,34 @@ Creating, opening, and finishing jj workspaces in Randori currently assume one r
 
 ## Technical Plan (Architecture)
 
-All changes stay inside existing Randori mods (`mods/jj-workspace`, `mods/jj-menu`, `mods/jj-new-menu`, plus event-driven timer cleanups in `mods/jj-spaces`, `mods/jj-changes`, and `mods/jj-tabs`), the test suite (`tests/mod-harness.js`, `tests/mods.test.js`), the isolated trial script (`scripts/app-trial.js`), and repository documentation (`README.md`, `design/jj-workspace-lifecycle.md`). No new mod, background daemon, or modification to the shared `jj.js` identity block is introduced.
+All changes live inside Randori's seven mods (`mods/jj-workspace`, `mods/jj-finish`, `mods/jj-menu`, `mods/jj-new-menu`, plus event-driven timer cleanups in `mods/jj-spaces`, `mods/jj-changes`, and `mods/jj-tabs`), the test suite (`tests/mod-harness.js`, `tests/workspace-core.test.js`, `tests/finish-core.test.js`, `tests/mods.test.js`, `tests/jj.test.js`), the isolated trial script (`scripts/app-trial.js`), and repository documentation (`README.md`, `design/jj-workspace-lifecycle.md`). No background daemon or modification to the shared `jj.js` identity block is introduced.
 
 ```text
 Entry points
-  keys.json (mod.open:jj-workspace) ──> props: { overlay }
-  jj-new-menu (+ button)            ──> props: { space, folder }
-  jj-menu (space right-click)       ──> props: { space, folder } or { space, folder, action: "finish" }
-  jj-menu (tab right-click)         ──> props: { space, tab, action: "finish" }
-                                              │
-                                              ▼
-                                    mods/jj-workspace/main.js
-                                     ┌────────┴────────┐
-                                     ▼                 ▼
-                      Filter-first jj workspace    Finish jj workspace window
-                      (kind: "dialog", 560x480)   (kind: "window", 520x360)
-                       │                            │
-                       ├─ probe target space first  ├─ probe clicked tab or whole space
-                       ├─ bg: other spaces + disk   ├─ group linked checkouts by repo
-                       ├─ selectedKey invariant     ├─ pre-check target tab's roots
-                       ├─ repo/name, / & -> ghost   ├─ name every terminal + children
-                       ├─ Enter -> open or create   └─ check -> verify -> kill -> remove
-                       └─ Shift+Enter -> new tab
+  keys.json (mod.open:jj-workspace) ──> jj-workspace  props: { overlay }
+  jj-new-menu (+ button)            ──> jj-workspace  props: { space, folder }
+  jj-menu (space right-click)       ──> jj-workspace  props: { space, folder }
+                                    ──> jj-finish     props: { space, folder }
+  jj-menu (tab right-click)         ──> jj-finish     props: { space, tab }
+
+  mods/jj-workspace/                          mods/jj-finish/
+   (kind: "dialog", 560x480)                   (kind: "window", 520x360)
+   ├─ core.js (pure paths, glob parser,        ├─ core.js (snapshotHerdr,
+   │   upsert/sort, query, ghost, placement)   │   planAffected, detectDrift,
+   ├─ discovery.js (target + bg discovery)     │   findNestedWorkspace, planCleanup)
+   └─ main.js (Workspace picker View)          └─ main.js (4-phase Finish View)
 ```
 
-### Overlay declaration and props contract
+### Module structure, overlay declaration, and props contract
 
-`mods/jj-workspace/mod.json` declares a `560x480` `dialog` overlay block so Herdr's native `mod.open:jj-workspace` command toggles the dialog directly from `keys.json` without `nextCommand()`. `jj-menu` and `jj-new-menu` each expose one `jj workspace…` row opening `jj-workspace` at `560x480`, while preserving `460x280` for Herdr's shipped Git `worktree` New dialog. Finish remains a `520x360` `window` overlay.
+Picker and Finish live in two independent mods with zero runtime coupling between them.
 
-Herdr injects `overlay` into `props()` for closing the overlay via `closeOverlay(this.p?.overlay)` (cached synchronously in `init()`). Callers may also pass optional `space`, `folder`, `action` (`"finish"` for Finish), `tab` (tab ID for Finish, or initial tab name forwarded to `space.new`), and `argv` (command arguments forwarded to `space.new` or `tab.new`). When opened with no `space` or `folder` prop (as from `mod.open:jj-workspace`), the dialog resolves the target space from the focused space (falling back to the active space) and uses the focused pane's folder within that space (falling back to the space's first terminal or folder). When opened from a sidebar space right-click, the dialog binds to that clicked target space and its machine, showing `new tab in <space>` in the footer whenever it differs from the active space.
+- `mods/jj-workspace/` holds the filter-first picker across three focused modules. `core.js` holds pure path, slug, and link validation helpers, `DISK_SCAN` and its strict 3-field parser, `upsertRepo` promotion, `sortRepos`, `parseQuery`, `shouldAutoCompleteSlash`, `buildItems`, selection resolution, ghost computation, and tagged `placement()`. `discovery.js` holds `RepoDiscovery` for target-space and background discovery (cancellation-aware after every `await`), plus `workspaces()` and `bookmarks()`. `main.js` holds the `Workspace` view.
+- `mods/jj-finish/` holds the destructive Finish window across two focused modules. `core.js` holds `snapshotHerdr`, `planAffected`, `detectDrift`, `findNestedWorkspace`, `planCleanup`, and `collectScopeFolders`. `main.js` holds a 4-phase state machine (`loading`, `error`, `confirm`, `running`) with strictly read-only `render()` and explicit confirmation snapshots.
+
+`mods/jj-workspace/mod.json` declares a `560x480` `dialog` overlay block so Herdr's native `mod.open:jj-workspace` command toggles the dialog directly from `keys.json` without `nextCommand()`. `mods/jj-finish/mod.json` declares a `520x360` `window` overlay block. `jj-menu` and `jj-new-menu` each expose one `jj workspace…` row opening `jj-workspace` at `560x480`, while preserving `460x280` for Herdr's shipped Git `worktree` New dialog. `jj-menu` opens `jj-finish` at `520x360` as a window.
+
+Herdr injects `overlay` into `props()` for closing the overlay via `closeOverlay(this.cfg.overlay)` (parsed once in `init()`). Callers pass optional `space`, `folder`, and `argv` to `jj-workspace`, and `space`, optional `tab`, and optional `folder` to `jj-finish`. When `jj-workspace` opens with no `space` or `folder` prop (as from `mod.open:jj-workspace`), it resolves the target space from `focused().space` (falling back to the active space) and uses the focused pane's folder within that space (falling back to the active tab or the space's first terminal or folder). When opened from a sidebar space right-click, it binds to that clicked target space and its machine, showing `new tab in <space>` in the footer whenever it differs from the active space. Both views ignore `Escape` while an action or removal is running so overlays cannot strand background mutations.
 
 ### Repository discovery, background loading, and deterministic ordering
 
@@ -200,25 +201,25 @@ Placement rules on Enter vs Shift+Enter follow three cases (with the footer expl
 
 ### Multi-repository and tab-scoped Finish jj workspace
 
-Finish runs in its separate window overlay.
+Finish runs in its separate `mods/jj-finish/` window overlay as a 4-phase state machine (`loading`, `error`, `confirm`, `running`).
 
-- Scope and discovery. When opened from a tab right-click (with `tab` in props), Finish inspects terminal panes in that tab only. When opened from a space right-click (no `tab` prop), Finish inspects terminal panes across every tab of that space. Unique linked workspaces across all repositories are collected, each carrying its own main checkout and repository name, and `jj workspace list` runs once per distinct repository in parallel to resolve workspace names.
+- Scope and discovery. When opened from a tab right-click (with `tab` in props), Finish inspects terminal panes in that tab only. When opened from a space right-click (no `tab` prop), Finish inspects terminal panes across every tab of that space. Unique linked workspaces across all repositories are probed in parallel via `identity()` (recording non-fatal errors without aborting sibling repositories), and `jj workspace list` runs once per distinct repository in parallel to resolve workspace names.
 - Pre-checking rule. For tab right-click, every linked workspace present in the clicked tab starts checked. For space right-click, every linked workspace present in the space's active tab starts checked and all other rows start unchecked (zero rows checked if the active tab has no linked workspace).
-- Affected terminals and confirmation. One helper derives the affected terminals for any checked checkout root from live `terminals()`, collecting direct terminals whose `cwd` lies inside the root plus transitive child terminals owned via `parent` in Herdr Core. Each terminal is labeled with its name or address and its context (same-space tab name using `TabInfo` metadata, other space name, parked, or child of its parent). Under every checked row, Finish lists every affected terminal individually.
-- Execution and safety gates. Pressing Enter with zero checked rows is a no-op. Otherwise Finish captures the previewed terminal address set and runs three sequential steps across checked, unremoved rows.
-  1. Check. Fetch `jj workspace list` once per distinct repository in the checked set, verify each workspace still maps to its recorded folder, refuse any checked root that contains another known workspace root from those lists, and run `jj status` (10 s timeout) in each checked root.
-  2. Verify and end terminals. Re-evaluate the live affected-terminal set immediately before killing; if any terminal address not in the confirmed preview set appeared, fail fast with an inline error so the user sees the new terminal and confirms again. Otherwise send `terminal.kill` to the direct terminals and wait via Herdr's reactive `render(cx)` updates (bounded by one 10 s deadline timer) for them to leave `terminals()`. Close the target space with `space.close { id, confirmed: true }` only when no panes of any kind remain outside the ended terminals; close every remaining pane showing an ended terminal via `pane.close` (Herdr closes tabs and spaces whose last pane closes).
+- Affected terminals and explicit confirmation. `snapshotHerdr(spaces, panes, terminals)` joins live pane folders (`pane.cwd`) with launch folders (`terminal.cwd`) so terminals that `cd` into a checkout are caught alongside terminals launched there, and tracks transitive `parent` ownership in Herdr Core. `planAffected()` derives `{ direct, children, all }` for checked roots and labels each terminal with its name or address and context (same-space tab name using `TabInfo` metadata, other space name, parked, or child of its parent). `render()` is strictly read-only and never mutates the confirmed terminal set; `syncConfirmed()` refreshes `confirmed` only on initial load, checkbox toggle, or drift refusal so reactive updates never silently absorb newly spawned terminals.
+- Execution and safety gates. Pressing Enter with zero checked rows is a no-op. Otherwise Finish transitions to `running` (blocking Escape and toggles) and runs three sequential steps across checked, unremoved rows.
+  1. Check. Fetch `jj workspace list` once per distinct repository in the checked set, verify each workspace still maps to its recorded folder, refuse any checked root that contains another known workspace root from those lists (or another unchecked row's root across repositories), and run `jj status` (10 s timeout) in each checked root.
+  2. Verify and end terminals. Re-evaluate `planAffected()` against a fresh Herdr snapshot immediately before killing; if `detectDrift()` finds any terminal address not in `confirmed`, update `confirmed` to the live set and fail fast with an inline error so the user reviews the new terminal and presses Enter again. Otherwise send `terminal.kill` to `live.direct` and wait (via reactive `render(cx)` plus a bounded 100 ms active-only poll, capped at 10 s) until every terminal in `live.all` (including children) leaves `terminals()`. Use `planCleanup()` to close the target space with `space.close { id, confirmed: true }` only when no panes of any kind remain outside `live.all`, and close every remaining pane showing an ended terminal (including kept child panes) via `pane.close`.
   3. Remove. Run `jj workspace remove <name>` sequentially from each checked row's own main checkout (600 s timeout), marking each row removed on completion.
 
 ### Menu updates in `jj-menu` and `jj-new-menu`
 
-- `jj-menu` space right-click probes all unique folders of the space in parallel via `identity()`. If any folder is in a jj repository, the menu offers one `jj workspace…` row (passing `space` and the first jj folder, preferring the space's first terminal when jj, opening at `560x480`). If any terminal pane folder is in a linked jj workspace, it also offers `Finish jj workspace` (opening at `520x360` as a window). Git fallback runs only when no folder is jj and no jj error occurred.
-- `jj-menu` tab right-click looks up the clicked tab's space (for its machine) and probes the clicked tab's unique terminal pane folders via `identity()`. When any pane works in a linked jj workspace, it inserts `Finish jj workspace` before `Close` (passing `space`, `tab`, and `action: "finish"`).
+- `jj-menu` space right-click probes all unique folders of the space in parallel via `identity()`. If any folder is in a jj repository, the menu offers one `jj workspace…` row (passing `space` and the first jj folder, preferring the space's first terminal when jj, opening at `560x480`). If any terminal pane folder is in a linked jj workspace, it also offers `Finish jj workspace` (opening `jj-finish` at `520x360` as a window). Git fallback runs only when no folder is jj and no jj error occurred.
+- `jj-menu` tab right-click looks up the clicked tab's space (for its machine) and probes the clicked tab's unique terminal pane folders via `identity()`. When any pane works in a linked jj workspace, it inserts `Finish jj workspace` before `Close` (opening `jj-finish` with `space` and `tab`).
 - `jj-new-menu` probes the focused pane's folder and any remaining unique folders of the active space (continuing even if the focused pane has no `cwd` or hits an `identity()` error, while suppressing Git fallback for errored folders). When any folder is jj, the menu displays one `jj workspace…` row (with the user's `mod.open:jj-workspace` shortcut hint if bound), passing `space` and `folder` and opening at `560x480`. Otherwise it preserves Herdr's shipped `worktree` rows and `460x280` / `560x480` dialog sizes.
 
 ### Event-driven updates and idle cost across mods
 
-- `jj-workspace`. Zero timers while the dialog is open; Finish waits for killed terminals via `render(cx)` plus one 10 s deadline timer.
+- `jj-workspace` and `jj-finish`. Zero timers while open and idle; `jj-finish` uses reactive `render(cx)` plus one bounded 100 ms active-only poll and a 10 s deadline timer only during the brief post-kill terminal exit wait.
 - `jj-spaces`. Drives `checkNew(cx, true)` reactively from `render(cx)` whenever `spaces()`, `panes()`, `machines()`, or `layout()` change, replacing the shipped 250 ms polling loop with a 30 s fallback timer (`JJ_FALLBACK`) for unwatched/remote repositories and Git fallback (plus a one-shot 250 ms timer only while a newly created space or `space.move` is settling).
 - `jj-changes` and `jj-tabs`. Replaces the 1 s visibility polling timer in `jj-changes` with a shared counter (`jj-changes:opened`) bumped by `jj-tabs` whenever the Changes panel transitions from hidden to visible, so re-opening the panel triggers one snapshot immediately with zero polling timers in jj mode.
 
@@ -275,9 +276,9 @@ Finish runs in its separate window overlay.
 
 ## Verification Status
 
-- Automated tests and native mod checks. `just verify` passes all 96 tests in `tests/jj.test.js` and `tests/mods.test.js`, native `herdr-app check` on all six mods, and `node --check`.
-- Live interactive verification. Tested in Herdr 0.1.15 on macOS via `cmd-shift-n`, verifying background discovery of other spaces and configured `repos` folders, deterministic ordering, `selectedKey` selection stability, `.dotf` + `/` and `→` completion with inline ghost suffix, pre-0.38 `default` recovery (`root` pill), and zero focus jump on open.
-- Isolated native lifecycle trial (`scripts/app-trial.js`). Covers `jj-workspace` creation, opening, space nesting, status line updates, Changes panel, Hunk diff panes, and Finish across single-workspace, two-workspace, and held-lock retry flows in a disposable `HOME`, `HERDR_APP_HOME`, and core session.
+- Automated tests and native mod checks. `just verify` passes all 117 tests across `tests/jj.test.js`, `tests/workspace-core.test.js`, `tests/finish-core.test.js`, and `tests/mods.test.js`, native `herdr-app check` on all seven mods, and `node --check`.
+- Isolated native lifecycle trial (`scripts/app-trial.js`). Re-verified end-to-end in a disposable `HOME`, `HERDR_APP_HOME`, and core session after splitting `jj-finish` out of `jj-workspace`, covering `jj-workspace` creation, space nesting, two-workspace Finish (`review` removed while `nesting` stayed intact), and held-lock Finish followed by unlock and retry (`locked` removed).
+- Live interactive verification (earlier commit). Visual layout, inline ghost alignment, and `cmd-shift-n` keybinding were previously verified in Herdr 0.1.15 on macOS; interactive visual re-check and remote-host end-to-end testing after the `jj-finish` split remain to be exercised in your active Herdr session after `just install-mods`.
 
 ---
 

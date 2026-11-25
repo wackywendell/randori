@@ -67,7 +67,8 @@ export default class TrialLauncher extends View {
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
       const size = r.action === 'finish' ? { width: 520, height: 360 } : { width: 560, height: 480 };
       const mod = r.action === 'new' ? 'trial-new' : r.action === 'finish' ? 'trial-finish' : 'jj-workspace';
-      openOverlay({ mod, kind: r.action === 'finish' ? 'window' : 'dialog', ...size, props: { space: r.space, folder: r.folder, action: r.action } });
+      const p = r.action === 'finish' ? { space: r.space } : { space: r.space, folder: r.folder };
+      openOverlay({ mod, kind: r.action === 'finish' ? 'window' : 'dialog', ...size, props: p });
       closeOverlay(own);
     });
   }
@@ -83,18 +84,18 @@ export default class TrialNew extends Workspace {
       while (!this.ready) await new Promise((done) => cx.timer.after(100, done));
       this.text = r.name;
       const repo = this.current()?.repo;
-      await writeTextFile(appHome() + '/new-plan.json', JSON.stringify(repo ? this.planned(repo) : { error: this.error }), null);
+      await writeTextFile(appHome() + '/new-plan.json', JSON.stringify(repo ? { path: this.planned(repo) } : { error: this.error }), null);
       if (repo) await this.work(repo, cx);
       if (this.error) await writeTextFile(appHome() + '/new-error.txt', this.error, null);
     });
   }
 }`,
-    // jj-workspace's Finish with the requested names checked and Enter
-    // pressed. It records spaces, panes and terminals every 100 ms while it
-    // works, and presses Enter again when finish-again.json counts higher.
-    'trial-finish': `import Workspace from './workspace.js';
+    // jj-finish with the requested names checked and Enter pressed.
+    // It records spaces, panes and terminals every 100 ms while it works,
+    // and presses Enter again when finish-again.json counts higher.
+    'trial-finish': `import Finish from './finish.js';
 import { appHome, readTextFile, writeTextFile, spaces, panes, terminals } from 'herdr';
-export default class TrialFinish extends Workspace {
+export default class TrialFinish extends Finish {
   init(p, cx) {
     super.init(p, cx);
     this.timeline = [];
@@ -102,7 +103,10 @@ export default class TrialFinish extends Workspace {
     cx.spawn(async (cx) => {
       while (!this.ready) await new Promise((done) => cx.timer.after(100, done));
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
-      if (r.check) for (const w of this.rows) w.checked = r.check.includes(w.name);
+      if (r.check) {
+        for (const w of this.rows) w.checked = r.check.includes(w.name);
+        this.syncConfirmed();
+      }
       cx.notify();
       await this.save('opened');
       cx.timer.every(100, () => { if (this.busy) this.mark(); });
@@ -200,10 +204,14 @@ export default class TrialChanges extends Changes {
     await fs.writeFile(path.join(app, 'mods', name, 'main.js'), source);
     await fs.writeFile(path.join(app, 'mods', name, 'mod.json'), '{"place":"none"}');
   }
-  await fs.copyFile('mods/jj-workspace/main.js', path.join(app, 'mods/trial-new/workspace.js'));
-  await fs.copyFile('mods/jj-workspace/jj.js', path.join(app, 'mods/trial-new/jj.js'));
-  await fs.copyFile('mods/jj-workspace/main.js', path.join(app, 'mods/trial-finish/workspace.js'));
-  await fs.copyFile('mods/jj-workspace/jj.js', path.join(app, 'mods/trial-finish/jj.js'));
+  for (const file of await fs.readdir('mods/jj-workspace')) {
+    if (!file.endsWith('.js')) continue;
+    await fs.copyFile(path.join('mods/jj-workspace', file), path.join(app, 'mods/trial-new', file === 'main.js' ? 'workspace.js' : file));
+  }
+  for (const file of await fs.readdir('mods/jj-finish')) {
+    if (!file.endsWith('.js')) continue;
+    await fs.copyFile(path.join('mods/jj-finish', file), path.join(app, 'mods/trial-finish', file === 'main.js' ? 'finish.js' : file));
+  }
   await fs.copyFile('mods/jj-changes/main.js', path.join(app, 'mods/trial-changes/changes.js'));
   await fs.copyFile('mods/jj-changes/jj.js', path.join(app, 'mods/trial-changes/jj.js'));
   console.log(JSON.stringify({ root, app, record }));

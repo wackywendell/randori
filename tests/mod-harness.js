@@ -24,19 +24,72 @@ export const nodes = root => typeof root === 'object' && root ? [root, ...root._
 export const byId = (root, id) => nodes(root).find(n => n.calls.id?.[0] === id);
 export const words = root => typeof root === 'string' ? [root] : (root?._children ?? []).flatMap(words);
 
-// A mod's source with its imports removed. `./jj.js` is inlined, as Herdr
-// would load it from the mod's own folder.
-function source(name) {
+// Compiles a mod's entry (`main.js`) and its local `./*.js` modules with
+// per-file lexical isolation (each module runs in its own IIFE returning its
+// named exports), so missing imports fail with ReferenceError instead of being
+// masked by flat concatenation.
+function compileMod(name) {
   const read = file => readFileSync(new URL(`../mods/${name}/${file}`, import.meta.url), 'utf8');
-  let main = read('main.js');
-  const jj = /^import .* from "\.\/jj\.js";\n/m.test(main) ? read('jj.js') : '';
-  main = main.replace(/^import .*;\n/gm, '');
-  return `${jj}\n${main}`.replace('export default class ', 'class ').replace(/^export /gm, '');
+  const seen = new Set();
+  const order = [];
+  const visit = file => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const text = read(file);
+    for (const m of text.matchAll(/^(?:import|export)\s+[\s\S]*?\s+from\s+"\.\/([^"]+\.js)";/gm)) visit(m[1]);
+    order.push({ file, text });
+  };
+  visit('main.js');
+
+  const lines = ['const __mods = Object.create(null);'];
+  for (const { file, text } of order) {
+    const exportsList = [];
+    let defaultName = null;
+    const localImports = [];
+    let body = text
+      .replace(/^import\s+\{([^}]+)\}\s+from\s+"\.\/([^"]+\.js)";\n?/gm, (_m, names, modFile) => {
+        const cleaned = names.replace(/\s+/g, ' ').trim();
+        localImports.push(`const { ${cleaned} } = __mods[${JSON.stringify(modFile)}];`);
+        return '';
+      })
+      .replace(/^export\s+\{([^}]+)\}\s+from\s+"\.\/([^"]+\.js)";\n?/gm, (_m, names, modFile) => {
+        const cleaned = names.replace(/\s+/g, ' ').trim();
+        localImports.push(`const { ${cleaned} } = __mods[${JSON.stringify(modFile)}];`);
+        for (const item of cleaned.split(',').map(s => s.trim()).filter(Boolean)) {
+          const [orig, alias] = item.split(/\s+as\s+/);
+          exportsList.push(alias ? `${alias}: ${alias}` : orig);
+        }
+        return '';
+      })
+      .replace(/^import\s+[^;]+;\n?/gm, '')
+      .replace(/^export\s+\{([^}]*)\};\n?/gm, (_m, names) => {
+        for (const item of names.split(',').map(s => s.trim()).filter(Boolean)) {
+          const [orig, alias] = item.split(/\s+as\s+/);
+          exportsList.push(alias ? `${alias}: ${orig}` : orig);
+        }
+        return '';
+      })
+      .replace(/^export\s+default\s+class\s+(\w+)/m, (_m, cls) => {
+        defaultName = cls;
+        return `class ${cls}`;
+      })
+      .replace(/^export\s+(?:async\s+)?(function|class|const|let|var)\s+(\w+)/gm, (m, _kw, id) => {
+        exportsList.push(id);
+        return m.replace(/^export\s+/, '');
+      });
+    if (defaultName) exportsList.push(`default: ${defaultName}`);
+    lines.push(
+      `__mods[${JSON.stringify(file)}] = (() => {\n${localImports.join('\n')}\n${body}\nreturn { ${exportsList.join(', ')} };\n})();`,
+    );
+  }
+  lines.push('__mods["main.js"].default');
+  return lines.join('\n');
 }
 
 // Loads a mod into a sandbox with fake Herdr globals. `data` sets the state
 // (spaces, panes, props, layout, ...) and replaces exec, readTextFile or
-// watchFolder. Without a watchFolder, watches wait for `fire(path)`.
+// watchFolder. Set `reactive: true` to re-render automatically on `cx.notify()`.
+// `props()` returns `undefined` inside `cx.spawn` continuations, matching Herdr.
 export function load(name, data = {}) {
   const state = { agents: [], terminals: [], spaces: [], panes: [], machines: [], props: {}, focused: { space: 's1' }, active: true, now: 0,
     layout: { children: [] }, home: '/home/u', ...data };
@@ -45,16 +98,25 @@ export function load(name, data = {}) {
   const actions = [], tasks = [], timers = [], notifications = [], overlays = [], logs = [], inputs = [], watches = [], errors = [];
   const task = entry => { entry.cancelled = false; entry.cancel = () => { entry.cancelled = true; }; return entry; };
   const clipboard = [];
-  const cx = { notify() {}, stop_propagation() {}, write_to_clipboard: text => clipboard.push(text), focus_handle: () => ({ focus() {} }),
+  let inSpawn = false;
+  let notifyCount = 0;
+  let view = null;
+  const cx = {
+    notify() {
+      notifyCount++;
+      if (data.reactive && view) view.render(cx);
+    },
+    stop_propagation() {},
+    write_to_clipboard: text => clipboard.push(text),
+    focus_handle: () => ({ focus() {} }),
     spawn(body, opts) { const t = task({ body, opts }); tasks.push(t); return t; },
     timer: {
       after(ms, body) { const t = task({ at: state.now + ms, body }); timers.push(t); return t; },
       every(ms, body) { const t = task({ every: ms, next: state.now + ms, body }); timers.push(t); return t; },
     },
   };
-  const src = source(name);
-  const className = src.match(/^class (\w+) extends View/m)[1];
-  const Mod = vm.runInNewContext(`${src}\n${className}`, {
+  const src = compileMod(name);
+  const Mod = vm.runInNewContext(src, {
     View: class {}, div: element, v_flex: element, h_flex: element, svg: element, image: element,
     InputState: { new: ({ value = '' } = {}) => {
       const on = {};
@@ -77,7 +139,9 @@ export function load(name, data = {}) {
     // Every row of a virtual list, as if all were on screen.
     v_virtual_list: (id, count, height, key, rows) => element().id(id).children(rows({ start: 0, end: count })),
     agents: () => state.agents, terminals: () => state.terminals, spaces: () => state.spaces,
-    panes: () => state.panes, machines: () => state.machines, props: () => state.props,
+    panes: () => state.panes, machines: () => state.machines,
+    props: () => (inSpawn ? undefined : state.props),
+    checking: () => Boolean(data.checking),
     focused: () => state.focused, layout: () => state.layout, window: () => ({ active: state.active, platform: 'macos' }),
     keys: () => state.keys ?? [], settings: () => ({ zoom: 1 }), theme: () => new Proxy({}, { get: () => '#8899aa' }),
     home: () => state.home, appHome: () => `${state.home}/.config/herdr-app`,
@@ -94,16 +158,23 @@ export function load(name, data = {}) {
     Date: class extends Date { static now() { return state.now; } },
     localStorage: { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k) },
   });
-  const view = new Mod();
+  view = new Mod();
   view.init({}, cx);
-  const harness = { state, view, cx, shared, clipboard, actions, tasks, timers, notifications, overlays, logs, inputs, watches, render: () => view.render(cx),
+  const runInSpawn = fn => {
+    inSpawn = true;
+    try { return fn(); } finally { inSpawn = false; }
+  };
+  const harness = {
+    state, view, cx, shared, clipboard, actions, tasks, timers, notifications, overlays, logs, inputs, watches,
+    get notifyCount() { return notifyCount; },
+    render: () => view.render(cx),
     // Starts every spawned task and lets them run until they wait on
     // something that is not ready (a watch, a pending exec).
     async drain() {
       for (let round = 0; round < 20; round++) {
         for (const t of tasks) if (!t.started && !t.cancelled) {
           t.started = true;
-          Promise.resolve().then(() => t.body(cx)).catch(e => errors.push(e));
+          Promise.resolve().then(() => runInSpawn(() => t.body(cx))).catch(e => errors.push(e));
         }
         await new Promise(r => setImmediate(r));
       }

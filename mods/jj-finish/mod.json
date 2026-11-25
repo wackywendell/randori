@@ -1,0 +1,7 @@
+{
+  "name": "jj-finish",
+  "description": "Finish linked jj workspaces with explicit terminal confirmation",
+  "place": "none",
+  "title": "Finish jj workspace",
+  "version": "1.0.0"
+}

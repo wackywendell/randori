@@ -306,8 +306,9 @@ function dialog(action, over = () => undefined, data = {}) {
     }
     if (cmd === 'jj' && args.includes('bookmark') && args.includes('list')) return ok('');
   });
-  const h = load('jj-workspace', { spaces: [space('s1', '/r/main'), space('s2', '/r/w1')], panes: [pane('s1', '/r/main'), pane('s2', '/r/w1')],
-    props: { space: 's1', folder: '/r/main', action, overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile, ...data });
+  const modName = action === 'finish' ? 'jj-finish' : 'jj-workspace';
+  const h = load(modName, { spaces: [space('s1', '/r/main'), space('s2', '/r/w1')], panes: [pane('s1', '/r/main'), pane('s2', '/r/w1')],
+    props: action === 'finish' ? { space: 's1', overlay: 'o1' } : { space: 's1', folder: '/r/main', overlay: 'o1' }, exec: w.exec, readTextFile: w.readTextFile, ...data });
   h.calls = w.calls;
   return h;
 }
@@ -330,7 +331,7 @@ test('New workspace adds it on a matching bookmark, links files and trusts linke
   h.inputs[0].emit('submit');
   await h.drain();
   const lines = h.calls.map(line);
-  assert.ok(lines.indexOf('mkdir -p /home/u/wt/main') < lines.indexOf('jj workspace add --name feat/x -r "feat/x" /home/u/wt/main/feat-x'));
+  assert.ok(lines.indexOf('mkdir -p /home/u/wt/main') < lines.indexOf('jj workspace add --name=feat/x -r "feat/x" -- /home/u/wt/main/feat-x'));
   assert.ok(lines.indexOf('mkdir -p /home/u/wt/main') >= 0);
   assert.ok(lines.includes('ln -s /r/main/.env /home/u/wt/main/feat-x/.env'));
   assert.ok(lines.includes('mise trust /home/u/wt/main/feat-x/mise.toml'));
@@ -361,7 +362,7 @@ test('New workspace runs from the main checkout (even when opened from a linked 
   await h.drain();
   const add = h.calls.find(c => c.cmd === 'jj' && c.args.includes('add'));
   assert.equal(add.cwd, '/r/main');
-  assert.equal(line(add), 'jj workspace add --name topic /home/u/.herdr/worktrees/main/topic');
+  assert.equal(line(add), 'jj workspace add --name=topic -- /home/u/.herdr/worktrees/main/topic');
   assert.equal(h.calls.some(c => line(c).startsWith('mise trust')), false);
   assert.equal(h.notifications.length, 0);
 });
@@ -553,7 +554,7 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
       assert.ok(args.includes('/home/u/.herdr/worktrees'));
       assert.ok(args.includes('/home/u/dd/*'));
       assert.ok(args.includes('/home/u/.dotfiles'));
-      return ok('100\t/home/u/.herdr/worktrees/main/w1\n200\t/home/u/dd/alpha\n500\t/home/u/dd/dd-source\n');
+      return ok('100\t/home/u/.herdr/worktrees/main/w1\t/r/main/.jj/repo\n200\t/home/u/dd/alpha\t\n500\t/home/u/dd/dd-source\t\n');
     }
     if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
       if (opts.on === 'retriever') return ok('/rem/streams\n');
@@ -608,6 +609,43 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
   assert.equal(h.view.current().repo.name, 'main');
   assert.equal(h.view.current().kind, 'create');
 
+  const openBg = async () => {
+    let rel;
+    const d = dialog('new', async (cmd, args, opts) => {
+      if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
+      if (cmd === 'sh' && !opts.on) return ok('100\t/home/u/.herdr/worktrees/main/w1\t/r/main/.jj/repo\n200\t/home/u/dd/alpha\t\n500\t/home/u/dd/dd-source\t\n');
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
+        if (opts.on === 'retriever') return ok('/rem/streams\n');
+        if (opts.cwd === '/home/u/.dotfiles') { await new Promise((r) => { rel = r; }); return ok('/home/u/.dotfiles\n'); }
+        if (opts.cwd === '/home/u/dd/dd-source' || opts.cwd === '/home/u/dd/alpha') return ok(`${opts.cwd}\n`);
+      }
+      if (args.includes('workspace') && args.includes('list')) {
+        if (opts.on === 'retriever') return listed([{ name: 'default', root: '/rem/streams' }]);
+        return listed([{ name: 'default', root: opts.cwd }]);
+      }
+      if (args.includes('bookmark')) return ok('');
+      if (cmd === 'mkdir' || args.includes('add')) return ok('');
+    }, {
+      layout: sidebar({}, { repos: ['~/dd/*/', '~/.dotfiles/'] }),
+      spaces: [
+        { id: 's1', name: 'local-a', active: false, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
+        { id: 's2', name: 'active-other', active: true, machine: null, folder: '/home/u/.dotfiles', tabs: [{ id: 'k2', active: true }] },
+        { id: 's3', name: 'remote-s', active: false, machine: 'retriever', folder: '/rem/streams', tabs: [{ id: 'k3', active: true }] },
+      ],
+      panes: [
+        { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+        { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/home/u/.dotfiles' },
+        { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/streams' },
+      ],
+      props: { space: 's1', folder: '/r/main', overlay: 'o1' },
+      readTextFile: async p => p in diskFiles ? diskFiles[p] : Promise.reject(new Error('no file')),
+    });
+    await d.drain();
+    rel?.();
+    await d.drain();
+    return d;
+  };
+
   // Inactive target space shows "new tab in local-a" hint; Shift+Enter opens a tab named "main" ONCE even if Enter bubbles after microtask drain.
   h.view.selectedKey = h.view.picks()[0].key;
   assert.ok(words(h.render()).some(x => x.includes('new tab in local-a')));
@@ -618,89 +656,86 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
   assert.equal(h.actions.length, 1);
   assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/main', name: 'main' } });
 
-  // Unpinned typing `.dotf` (prefix) floats `.dotfiles` with `New workspace` FIRST and renders inline `iles/` ghost suffix (no `.dotfiles/` pill or Tab hint).
-  h.view.closed = false;
-  h.view.selectedKey = null;
-  h.actions.length = 0;
-  h.overlays.length = 0;
-  h.inputs[0].emit('change', '.dotf');
-  assert.equal(h.view.current().repo.name, '.dotfiles');
-  assert.equal(h.view.current().kind, 'create');
-  const preWords = words(h.render());
+  // Fresh dialog: unpinned typing `.dotf` (prefix) floats `.dotfiles` with `New workspace` FIRST and renders inline `iles/` ghost suffix.
+  const h2 = await openBg();
+  h2.inputs[0].emit('change', '.dotf');
+  assert.equal(h2.view.current().repo.name, '.dotfiles');
+  assert.equal(h2.view.current().kind, 'create');
+  const preWords = words(h2.render());
   assert.ok(preWords.includes('iles/'));
   assert.equal(preWords.includes('.dotfiles/'), false);
   assert.equal(preWords.includes('\u21e5'), false);
 
   // Pinning `default` under `.dotfiles` survives typing (`i`), disappears cleanly on `x`,
   // and re-attaches when backspacing back to `.dotfi`! Also stays on `default` across `right`.
-  key(h, 'down');
-  assert.equal(h.view.current().kind, 'ws');
-  assert.equal(h.view.current().ws.name, 'default');
-  h.inputs[0].emit('change', '.dotfi');
-  assert.equal(h.view.current().kind, 'ws');
-  assert.equal(h.view.current().ws.name, 'default');
-  h.inputs[0].emit('change', '.dotfix');
-  assert.equal(h.view.current().kind, 'create');
-  assert.equal(h.view.current().name, '.dotfix');
-  h.inputs[0].emit('change', '.dotfi');
-  assert.equal(h.view.current().kind, 'ws');
-  assert.equal(h.view.current().ws.name, 'default');
-  h.inputs[0].set_selected_range({ start: 2, end: 2 });
-  key(h, 'right');
-  assert.equal(h.inputs[0].value(), '.dotfi');
-  h.inputs[0].set_selected_range({ start: 6, end: 6 });
-  key(h, 'right');
-  assert.equal(h.inputs[0].value(), '.dotfiles/');
-  assert.equal(h.view.current().kind, 'ws');
-  assert.equal(h.view.current().ws.name, 'default');
+  key(h2, 'down');
+  assert.equal(h2.view.current().kind, 'ws');
+  assert.equal(h2.view.current().ws.name, 'default');
+  h2.inputs[0].emit('change', '.dotfi');
+  assert.equal(h2.view.current().kind, 'ws');
+  assert.equal(h2.view.current().ws.name, 'default');
+  h2.inputs[0].emit('change', '.dotfix');
+  assert.equal(h2.view.current().kind, 'create');
+  assert.equal(h2.view.current().name, '.dotfix');
+  h2.inputs[0].emit('change', '.dotfi');
+  assert.equal(h2.view.current().kind, 'ws');
+  assert.equal(h2.view.current().ws.name, 'default');
+  h2.inputs[0].set_selected_range({ start: 2, end: 2 });
+  key(h2, 'right');
+  assert.equal(h2.inputs[0].value(), '.dotfi');
+  h2.inputs[0].set_selected_range({ start: 6, end: 6 });
+  key(h2, 'right');
+  assert.equal(h2.inputs[0].value(), '.dotfiles/');
+  assert.equal(h2.view.current().kind, 'ws');
+  assert.equal(h2.view.current().ws.name, 'default');
 
   // Scrolling off `.dotfiles` to a non-matching repo (`main` under Create elsewhere) hides the ghost
   // and `right` does not hijack back to `.dotfiles`.
-  h.view.selectedKey = null;
-  h.inputs[0].emit('change', '.dotf');
-  key(h, 'down'); // .dotfiles/default
-  key(h, 'down'); // main / New ".dotf"
-  assert.equal(h.view.current().repo.name, 'main');
-  assert.equal(h.view.ghost(), null);
-  h.inputs[0].set_selected_range({ start: 5, end: 5 });
-  key(h, 'right');
-  assert.equal(h.inputs[0].value(), '.dotf');
-  assert.equal(h.view.current().repo.name, 'main');
+  h2.view.selectedKey = null;
+  h2.inputs[0].emit('change', '.dotf');
+  key(h2, 'down'); // .dotfiles/default
+  key(h2, 'down'); // main / New ".dotf"
+  assert.equal(h2.view.current().repo.name, 'main');
+  assert.equal(h2.view.ghost(), null);
+  h2.inputs[0].set_selected_range({ start: 5, end: 5 });
+  key(h2, 'right');
+  assert.equal(h2.inputs[0].value(), '.dotf');
+  assert.equal(h2.view.current().repo.name, 'main');
 
   // Typing `/` on `.dotfiles`'s `New workspace` auto-completes `.dotfiles/` and keeps `New workspace` at row 0.
-  h.view.selectedKey = null;
-  h.inputs[0].emit('change', 'dotf');
-  assert.ok(words(h.render()).includes(' \u2192 .dotfiles/'));
-  h.inputs[0].emit('change', 'dotf/');
-  assert.equal(h.inputs[0].value(), '.dotfiles/');
-  assert.equal(h.view.current().kind, 'create');
-  assert.equal(h.view.current().repo.name, '.dotfiles');
-  assert.equal(h.view.picks()[0].kind, 'create');
+  h2.view.selectedKey = null;
+  h2.inputs[0].emit('change', 'dotf');
+  assert.ok(words(h2.render()).includes(' \u2192 .dotfiles/'));
+  h2.inputs[0].emit('change', 'dotf/');
+  assert.equal(h2.inputs[0].value(), '.dotfiles/');
+  assert.equal(h2.view.current().kind, 'create');
+  assert.equal(h2.view.current().repo.name, '.dotfiles');
+  assert.equal(h2.view.picks()[0].kind, 'create');
 
   // Typing `fix` after `.dotfiles/` highlights New "fix" in `.dotfiles`, and submit + bubbled Enter only creates once!
-  h.inputs[0].emit('change', '.dotfiles/fix');
-  assert.equal(h.view.current().kind, 'create');
-  assert.equal(h.view.current().name, 'fix');
-  h.inputs[0].emit('submit');
-  key(h, 'enter'); // simulates GPUI bubbling Enter after Input submit
-  await h.drain();
-  const dotAdd = h.calls.filter(c => c.cmd === 'jj' && c.args.includes('add'));
+  h2.inputs[0].emit('change', '.dotfiles/fix');
+  assert.equal(h2.view.current().kind, 'create');
+  assert.equal(h2.view.current().name, 'fix');
+  h2.inputs[0].emit('submit');
+  await Promise.resolve();
+  key(h2, 'enter'); // simulates GPUI bubbling Enter after Input submit + QuickJS microtask drain
+  await h2.drain();
+  const dotAdd = h2.calls.filter(c => c.cmd === 'jj' && c.args.includes('add'));
   assert.equal(dotAdd.length, 1);
   assert.equal(dotAdd[0].cwd, '/home/u/.dotfiles');
-  assert.ok(dotAdd[0].args.includes('--name') && dotAdd[0].args.includes('fix'));
+  assert.ok(dotAdd[0].args.includes('--name=fix'));
   assert.ok(dotAdd[0].args.includes('/home/u/.herdr/worktrees/.dotfiles/fix'));
 
-  // Remote `streams/remote-wt`: Shift+Enter refuses cross-machine tab; Enter creates on retriever using remote $HOME.
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('change', 'streams/remote-wt');
-  h.inputs[0].emit('submit', undefined, { shift: true });
-  await h.drain();
-  assert.ok(words(h.render()).some(x => x.includes('Tabs in this space cannot open a workspace on retriever.')));
-  assert.deepEqual(h.actions, []);
-  h.inputs[0].emit('submit');
-  await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/bits/.herdr/worktrees/streams/remote-wt', machine: 'retriever' } });
+  // Fresh dialog for remote `streams/remote-wt`: Shift+Enter refuses cross-machine tab; Enter creates on retriever using remote $HOME.
+  const h3 = await openBg();
+  h3.inputs[0].emit('change', 'streams/remote-wt');
+  h3.inputs[0].emit('submit', undefined, { shift: true });
+  await h3.drain();
+  assert.ok(words(h3.render()).some(x => x.includes('Tabs in this space cannot open a workspace on retriever.')));
+  assert.deepEqual(h3.actions, []);
+  h3.inputs[0].emit('submit');
+  await h3.drain();
+  assert.deepEqual(plain(h3.actions.at(-1)), { name: 'space.new', args: { folder: '/home/bits/.herdr/worktrees/streams/remote-wt', machine: 'retriever' } });
 });
 
 test('disk scan expands strict repo globs, preserves spaces, and never descends into matched repos', async () => {
@@ -756,105 +791,117 @@ test('openIn: tab opens new and closed workspaces in a tab on Enter, space on Sh
     '/r/main/.jj/repo/store/type': 'git',
     '/rem/streams/.jj/repo/store/type': 'git',
   };
-  const h = dialog('new', (cmd, args, opts) => {
-    if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
-    if (cmd === 'sh' && !opts.on) return ok('');
-    if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root' && opts.on === 'retriever') return ok('/rem/streams\n');
-    if (args.includes('workspace') && args.includes('list')) {
-      if (opts.on === 'retriever') return listed([{ name: 'default', root: '/rem/streams' }, { name: 'r-closed', root: '/rem/r-closed' }]);
-      return listed([{ name: 'default', root: '/r/main' }, { name: 'open-w', root: '/r/open-w' }, { name: 'closed-w', root: '/r/closed-w' }]);
-    }
-    if (args.includes('bookmark')) return ok('');
-    if (cmd === 'mkdir' || args.includes('add')) return ok('');
-  }, {
-    layout: sidebar({}, { openIn: 'tab' }),
-    spaces: [
-      { id: 's1', name: 'main', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
-      { id: 's2', name: 'open-w', active: false, machine: null, folder: '/r/open-w', tabs: [{ id: 'k2', active: true }] },
-      { id: 's3', name: 'streams', active: false, machine: 'retriever', folder: '/rem/streams', tabs: [{ id: 'k3', active: true }] },
-    ],
-    panes: [
-      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
-      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/open-w' },
-      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/streams' },
-    ],
-    props: { space: 's1', folder: '/r/main', overlay: 'o1' },
-    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
-  });
-  await h.drain();
+  const openTabDialog = async () => {
+    const h = dialog('new', (cmd, args, opts) => {
+      if (cmd === 'sh' && opts.on === 'retriever') return ok('/home/bits\n');
+      if (cmd === 'sh' && !opts.on) return ok('');
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root' && opts.on === 'retriever') return ok('/rem/streams\n');
+      if (args.includes('workspace') && args.includes('list')) {
+        if (opts.on === 'retriever') return listed([{ name: 'default', root: '/rem/streams' }, { name: 'r-closed', root: '/rem/r-closed' }]);
+        return listed([{ name: 'default', root: '/r/main' }, { name: 'open-w', root: '/r/open-w' }, { name: 'closed-w', root: '/r/closed-w' }]);
+      }
+      if (args.includes('bookmark')) return ok('');
+      if (cmd === 'mkdir' || args.includes('add')) return ok('');
+    }, {
+      layout: sidebar({}, { openIn: 'tab' }),
+      spaces: [
+        { id: 's1', name: 'main', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }] },
+        { id: 's2', name: 'open-w', active: false, machine: null, folder: '/r/open-w', tabs: [{ id: 'k2', active: true }] },
+        { id: 's3', name: 'streams', active: false, machine: 'retriever', folder: '/rem/streams', tabs: [{ id: 'k3', active: true }] },
+      ],
+      panes: [
+        { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+        { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/open-w' },
+        { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/streams' },
+      ],
+      props: { space: 's1', folder: '/r/main', overlay: 'o1' },
+      readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+    });
+    await h.drain();
+    return h;
+  };
 
-  // 1. New workspace on same machine: footer says ↵ new tab · ⇧↵ new space; Enter opens tab, Shift+Enter opens space.
-  h.inputs[0].emit('change', 'fresh');
-  const newFooter = words(h.render());
-  assert.ok(newFooter.indexOf('new tab') < newFooter.indexOf('new space'));
-  h.inputs[0].emit('submit', undefined, { shift: false });
-  await Promise.resolve();
-  key(h, 'enter');
-  await h.drain();
-  assert.equal(h.actions.length, 1);
-  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/home/u/.herdr/worktrees/main/fresh', name: 'fresh' } });
+  // 1. New workspace on same machine: footer says ↵ new tab · ⇧↵ new space; Enter opens ONE tab, Shift+Enter opens space.
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'fresh');
+    const newFooter = words(h.render());
+    assert.ok(newFooter.indexOf('new tab') < newFooter.indexOf('new space'));
+    h.inputs[0].emit('submit', undefined, { shift: false });
+    await Promise.resolve();
+    key(h, 'enter');
+    await h.drain();
+    assert.equal(h.actions.length, 1);
+    assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/home/u/.herdr/worktrees/main/fresh', name: 'fresh' } });
+  }
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'fresh');
+    h.inputs[0].emit('submit', undefined, { shift: true });
+    await h.drain();
+    assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/u/.herdr/worktrees/main/fresh', machine: '' } });
+  }
 
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('submit', undefined, { shift: true });
-  await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/home/u/.herdr/worktrees/main/fresh', machine: '' } });
+  // 2. Closed existing workspace on same machine: Enter opens ONE tab (even when Enter bubbles after microtask drain), Shift+Enter opens space.
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'closed-w');
+    const closedFooter = words(h.render());
+    assert.ok(closedFooter.indexOf('new tab') < closedFooter.indexOf('new space'));
+    h.inputs[0].emit('submit', undefined, { shift: false });
+    await Promise.resolve();
+    key(h, 'enter');
+    await h.drain();
+    assert.equal(h.actions.length, 1);
+    assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/closed-w', name: 'closed-w' } });
+  }
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'closed-w');
+    h.inputs[0].emit('submit', undefined, { shift: true });
+    await h.drain();
+    assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/r/closed-w', machine: '' } });
+  }
 
-  // 2. Closed existing workspace on same machine: Enter opens exactly ONE tab (even when Enter bubbles after microtask drain), Shift+Enter opens space.
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('change', 'closed-w');
-  const closedFooter = words(h.render());
-  assert.ok(closedFooter.indexOf('new tab') < closedFooter.indexOf('new space'));
-  h.inputs[0].emit('submit', undefined, { shift: false });
-  await Promise.resolve();
-  key(h, 'enter');
-  await h.drain();
-  assert.equal(h.actions.length, 1);
-  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/closed-w', name: 'closed-w' } });
-
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('submit', undefined, { shift: true });
-  await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/r/closed-w', machine: '' } });
-
-  // 3. Already-open existing workspace: Enter STILL switches (never duplicates), Shift+Enter opens a new tab.
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('change', 'open-w');
-  const openFooter = words(h.render());
-  assert.ok(openFooter.includes('switch'));
-  assert.ok(openFooter.includes('new tab'));
-  h.inputs[0].emit('submit', undefined, { shift: false });
-  await Promise.resolve();
-  key(h, 'enter');
-  await h.drain();
-  assert.equal(h.actions.length, 1);
-  assert.deepEqual(plain(h.actions[0]), { name: 'space.select', args: { id: 's2' } });
-
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('submit', undefined, { shift: true });
-  await Promise.resolve();
-  key(h, 'enter', { shift: true });
-  await h.drain();
-  assert.equal(h.actions.length, 1);
-  assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/open-w', name: 'open-w' } });
+  // 3. Already-open existing workspace: Enter STILL switches (never duplicates), Shift+Enter opens ONE new tab.
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'open-w');
+    const openFooter = words(h.render());
+    assert.ok(openFooter.includes('switch'));
+    assert.ok(openFooter.includes('new tab'));
+    h.inputs[0].emit('submit', undefined, { shift: false });
+    await Promise.resolve();
+    key(h, 'enter');
+    await h.drain();
+    assert.equal(h.actions.length, 1);
+    assert.deepEqual(plain(h.actions[0]), { name: 'space.select', args: { id: 's2' } });
+  }
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'open-w');
+    h.inputs[0].emit('submit', undefined, { shift: true });
+    await Promise.resolve();
+    key(h, 'enter', { shift: true });
+    await h.drain();
+    assert.equal(h.actions.length, 1);
+    assert.deepEqual(plain(h.actions[0]), { name: 'tab.new', args: { space: 's1', folder: '/r/open-w', name: 'open-w' } });
+  }
 
   // 4. Remote cross-machine repo: falls back gracefully to new space on Enter (no error), footer shows only new space.
-  h.view.closed = false;
-  h.actions.length = 0;
-  h.inputs[0].emit('change', 'streams/r-closed');
-  const remFooter = words(h.render());
-  assert.ok(remFooter.includes('new space'));
-  assert.equal(remFooter.includes('new tab'), false);
-  h.inputs[0].emit('submit', undefined, { shift: false });
-  await h.drain();
-  assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/rem/r-closed', machine: 'retriever' } });
+  {
+    const h = await openTabDialog();
+    h.inputs[0].emit('change', 'streams/r-closed');
+    const remFooter = words(h.render());
+    assert.ok(remFooter.includes('new space'));
+    assert.equal(remFooter.includes('new tab'), false);
+    h.inputs[0].emit('submit', undefined, { shift: false });
+    await h.drain();
+    assert.deepEqual(plain(h.actions.at(-1)), { name: 'space.new', args: { folder: '/rem/r-closed', machine: 'retriever' } });
+  }
 });
 
-test('remote space prioritizes current-machine spaces and disk repos (A2), scans remote + local disk (B), and badges local', async () => {
+test('remote space prioritizes current-machine spaces and disk repos, scans remote + local disk, and badges local', async () => {
   const listed = rows => ok(rows.map(x => JSON.stringify(x)).join('\n'));
   const files = {
     '/rem/streams/.jj/repo/store/type': 'git',
@@ -922,6 +969,61 @@ test('remote space prioritizes current-machine spaces and disk repos (A2), scans
   assert.equal(h.view.current().repo.on, 'retriever');
 });
 
+test('background discovery promotes disk repo to other when disk scan wins the race, and spaceError persists across typing', async () => {
+  const listed = rows => ok(rows.map(x => JSON.stringify(x)).join('\n'));
+  const files = {
+    '/r/main/.jj/repo/store/type': 'git',
+    '/home/u/code/alpha/.jj/repo/store/type': 'git',
+  };
+  let releaseOther;
+  const h = dialog('new', async (cmd, args, opts) => {
+    if (cmd === 'sh' && !opts.on) {
+      // Include GNU-style stray lines alongside the valid 3-field record to ensure they are dropped.
+      return ok([
+        '  File: /home/u/code/alpha/.jj/repo/op_heads/heads',
+        'Block size: 4096       Fundamental block size: 4096',
+        '500\t/home/u/code/alpha\t',
+      ].join('\n') + '\n');
+    }
+    if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') {
+      if (opts.cwd === '/r/bad') return fail('Error: broken toml');
+      if (opts.cwd === '/home/u/code/alpha/sub') {
+        // Delay other-space probe so disk scan finishes FIRST.
+        await new Promise((r) => { releaseOther = r; });
+        return ok('/home/u/code/alpha\n');
+      }
+      if (opts.cwd === '/home/u/code/alpha') return ok('/home/u/code/alpha\n');
+    }
+    if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: opts.cwd }]);
+    if (args.includes('bookmark')) return ok('');
+  }, {
+    layout: sidebar({}, { repos: ['~/code/*'] }),
+    spaces: [
+      { id: 's1', name: 'main', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }, { id: 'k2', active: false }] },
+      { id: 's2', name: 'alpha', active: false, machine: null, folder: '/home/u/code/alpha/sub', tabs: [{ id: 'k3', active: true }] },
+    ],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' },
+      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/bad' },
+      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/home/u/code/alpha/sub' },
+    ],
+    props: { space: 's1', folder: '/r/main', overlay: 'o1' },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h.drain();
+  // Disk scan finished first, so alpha is temporarily source='disk'.
+  assert.equal(h.view.repos.find(r => r.name === 'alpha')?.source, 'disk');
+  // No junk line from GNU stat was passed to jj!
+  assert.equal(h.calls.some(c => c.cwd?.includes('Block size')), false);
+  // Once other-space probe settles, alpha is promoted to source='other' (not left in disk!).
+  releaseOther?.();
+  await h.drain();
+  assert.equal(h.view.repos.find(r => r.name === 'alpha')?.source, 'other');
+  // spaceError persists across typing (unlike transient actionError).
+  h.inputs[0].emit('change', 'alpha');
+  assert.ok(words(h.render()).includes('Error: broken toml'));
+});
+
 test('non-jj space shows notice when no repos exist anywhere, and identity error keeps sibling repo usable', async () => {
   const h = dialog('new', (cmd, args, opts) => {
     if (cmd === 'jj' && args.includes('root') && opts.cwd === '/bad') return fail('Error: broken toml');
@@ -958,16 +1060,17 @@ test('non-jj space shows notice when no repos exist anywhere, and identity error
 // w1, t4 is a parked terminal in w1 and t5 works in the main checkout.
 const WS = [{ name: 'default', root: '/r/main' }, { name: 'w1', root: '/r/w1' }, { name: 'w2', root: '/r/w2' }];
 const listed = (ws = WS) => ok(ws.map(x => JSON.stringify(x)).join('\n'));
-function finishing(over = () => undefined) {
+function finishing(over = () => undefined, data = {}) {
   const h = dialog('finish', (cmd, args, opts) => over(cmd, args, opts) ?? (args.includes('list') ? listed() : args[0] === 'status' || args.includes('remove') ? ok('') : undefined), {
     spaces: [{ id: 's1', name: 'review', machine: null, folder: '/r/w1', tabs: [{ id: 'k1' }, { id: 'k2' }] }, { id: 's2', name: 'nesting', machine: null, folder: '/r/w1', tabs: [{ id: 'k3' }] }],
     panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1/src' }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w2' }, { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/r/w1' }],
     terminals: [{ address: 't1', cwd: '/r/w1/src' }, { address: 't2', cwd: '/r/w2' }, { address: 't3', cwd: '/r/w1' }, { address: 't4', cwd: '/r/w1' }, { address: 't5', cwd: '/r/main' }],
-    props: { space: 's1', folder: '/r/w1/src', action: 'finish', overlay: 'o1' },
+    props: { space: 's1', overlay: 'o1' },
+    ...data,
   });
   return h;
 }
-const key = (h, k) => byId(h.render(), 'worktree').handlers.on_key_down({ key: k }, h.cx);
+const key = (h, k, modifiers = {}) => byId(h.render(), 'worktree').handlers.on_key_down({ key: k, modifiers }, h.cx);
 // Ends the killed terminals, as the core would, and re-renders as Herdr does.
 async function ended(h) {
   const killed = new Set(h.actions.filter(a => a.name === 'terminal.kill').map(a => a.args.terminal));
@@ -1010,7 +1113,7 @@ test('Finish from a tab right-click lists only that tab\u2019s linked workspaces
       { address: 't3', cwd: '/r/w1' },
       { address: 't4', name: 'sub', cwd: '/r/main', parent: 't2a' },
     ],
-    props: { space: 's1', tab: 'k2', action: 'finish', overlay: 'o1' },
+    props: { space: 's1', tab: 'k2', overlay: 'o1' },
   });
   await h.drain();
   const text = words(h.render());
@@ -1027,7 +1130,7 @@ test('Finish handles multi-repo spaces, active-tab pre-check, zero-checked no-op
 
   // 1. Multi-repo sidebar Finish: active tab is /o-w1 -> only ow1 pre-checked, removes from /o.
   let arrived = false;
-  const h = load('jj-workspace', {
+  const h = load('jj-finish', {
     spaces: [{ id: 's1', name: 'multi', active: true, machine: null, folder: '/r/main',
       tabs: [{ id: 'k1', name: '1', named: false, index: 1 }, { id: 'k2', name: '2', named: false, index: 2, active: true }, { id: 'k3', name: 'diff', named: true, index: 3 }] }],
     panes: [
@@ -1036,7 +1139,7 @@ test('Finish handles multi-repo spaces, active-tab pre-check, zero-checked no-op
       { pane: 'p3', tab: 'k3', mod: 'jj-changes' }, // non-terminal mod pane prevents space.close
     ],
     terminals: [{ address: 't1', cwd: '/r/w1' }, { address: 't2', cwd: '/o-w1' }],
-    props: { space: 's1', action: 'finish', overlay: 'o1' },
+    props: { space: 's1', overlay: 'o1' },
     exec: async (cmd, args, opts = {}) => {
       if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return roots[opts.cwd] ? ok(`${roots[opts.cwd]}\n`) : fail('no jj');
       if (args.includes('workspace') && args.includes('list')) return listed(opts.cwd === '/o' ? wsO : wsR);
@@ -1072,11 +1175,11 @@ test('Finish handles multi-repo spaces, active-tab pre-check, zero-checked no-op
   assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
 
   // 2. Overlapping checkout-root refusal: /r/w1 contains /r/w1/nested -> refuses before status/kill.
-  const h2 = load('jj-workspace', {
+  const h2 = load('jj-finish', {
     spaces: [{ id: 's1', name: 'nest', active: true, machine: null, folder: '/r/w1', tabs: [{ id: 'k1', active: true }] }],
     panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1' }],
     terminals: [{ address: 't1', cwd: '/r/w1' }],
-    props: { space: 's1', action: 'finish', overlay: 'o1' },
+    props: { space: 's1', overlay: 'o1' },
     exec: async (cmd, args, opts = {}) => {
       if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return roots[opts.cwd] ? ok(`${roots[opts.cwd]}\n`) : fail('no jj');
       if (args.includes('workspace') && args.includes('list')) return listed(wsR);
@@ -1095,7 +1198,7 @@ test('Finish handles multi-repo spaces, active-tab pre-check, zero-checked no-op
     spaces: [{ id: 's1', name: 'main', active: true, machine: null, folder: '/r/main', tabs: [{ id: 'k1', active: true }, { id: 'k2' }] }],
     panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/main' }, { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/w1' }],
     terminals: [{ address: 't1', cwd: '/r/main' }, { address: 't2', cwd: '/r/w1' }],
-    props: { space: 's1', action: 'finish', overlay: 'o1' },
+    props: { space: 's1', overlay: 'o1' },
   });
   await h3.drain();
   assert.deepEqual(plain(h3.view.rows.map(r => r.checked)), [false]);
@@ -1206,6 +1309,193 @@ test('Enter after a failure retries only the names not yet removed', async () =>
   assert.deepEqual(plain(h.overlays.at(-1)), { close: 'o1' });
 });
 
+test('Finish catches cd-ed terminals (pane.cwd !== terminal.cwd), never silently confirms on reactive render, waits for children, ignores Escape while busy, and supports remote spaces', async () => {
+  // 1. Reactive render when a new terminal spawns before Enter: badged `new`, NOT absorbed into confirmed, rejected on Enter!
+  const h1 = finishing(undefined, {
+    reactive: true,
+    spaces: [{ id: 's1', name: 'w1', tabs: [{ id: 'k1', name: 'shell', named: true, active: true }, { id: 'k2', name: 'kid', named: true }] }],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't-cd', cwd: '/r/w1/src' }, // launched in ~, cd'd into /r/w1/src
+      { pane: 'p2', tab: 'k2', terminal: 't-kid', cwd: '/home/u' },  // kept child pane
+    ],
+    terminals: [
+      { address: 't-cd', name: 'zsh', cwd: '/home/u' },
+      { address: 't-kid', name: 'sub', cwd: '/home/u', parent: 't-cd' },
+    ],
+  });
+  await h1.drain();
+  assert.ok(h1.view.confirmed.has('t-cd'));
+  assert.ok(h1.view.confirmed.has('t-kid'));
+
+  // A new terminal spawns BEFORE Enter and GPUI re-renders reactively!
+  h1.state.terminals.push({ address: 't-late', name: 'surprise', cwd: '/r/w1' });
+  const painted = words(h1.render());
+  assert.ok(painted.includes('new'));
+  assert.equal(h1.view.confirmed.has('t-late'), false);
+  // Pressing Enter refuses to kill `surprise` and re-arms confirmation.
+  key(h1, 'enter');
+  await h1.drain();
+  assert.deepEqual(runs(h1, 'terminal.kill'), []);
+  assert.ok(words(h1.render()).some(x => x.includes('New terminal surprise appeared')));
+  assert.equal(h1.view.confirmed.has('t-late'), true);
+
+  // Second Enter starts running: Escape while busy is IGNORED!
+  key(h1, 'enter');
+  await h1.drain();
+  assert.equal(h1.view.busy, true);
+  key(h1, 'escape');
+  assert.equal(h1.view.closed, false);
+  assert.equal(h1.overlays.length, 0);
+  // Kills direct terminals (t-cd + t-late); waits until BOTH direct AND child (t-kid) exit!
+  assert.deepEqual(runs(h1, 'terminal.kill'), [{ terminal: 't-cd' }, { terminal: 't-late' }]);
+  h1.state.terminals = [{ address: 't-kid', name: 'sub', cwd: '/home/u', parent: 't-cd' }];
+  h1.render();
+  await h1.drain();
+  // Still waiting because child t-kid has not exited yet!
+  assert.equal(h1.view.busy, true);
+  assert.deepEqual(runs(h1, 'space.close'), []);
+  // Once t-kid exits, space closes cleanly (all panes in s1 belonged to ended direct+child terminals) and workspace removes!
+  h1.state.terminals = [];
+  h1.render();
+  await h1.drain();
+  assert.deepEqual(runs(h1, 'space.close'), [{ id: 's1', confirmed: true }]);
+  assert.deepEqual(plain(h1.overlays.at(-1)), { close: 'o1' });
+
+  // 2. Remote Finish forwards space.machine ('retriever') to every jj call.
+  const hRem = finishing(undefined, {
+    spaces: [{ id: 's9', name: 'rem', machine: 'retriever', folder: '/r/w1', tabs: [{ id: 'k9', active: true }] }],
+    panes: [{ pane: 'p9', tab: 'k9', terminal: 't9', cwd: '/r/w1' }],
+    terminals: [{ address: 't9', cwd: '/r/w1' }],
+    props: { space: 's9', overlay: 'o9' },
+  });
+  await hRem.drain();
+  assert.ok(hRem.calls.every(c => c.on === 'retriever'));
+});
+
+test('Workspace skips exact-repo slash hijack, selects inactive tab on dedicated space, forwards argv, ignores Escape while busy, renders loadRepo errors, and spawns nothing during checking()', async () => {
+  // checking() spawns zero subprocesses.
+  const hCheck = dialog('new', () => { throw new Error('must not exec during checking()'); }, { checking: true });
+  await hCheck.drain();
+  assert.equal(hCheck.calls.length, 0);
+
+  // Exact repo `randori/` is not hijacked by `randori-docs/`; loadRepo error renders; dedicated space with inactive tab selects the tab; closed workspace forwards argv; Escape while busy is ignored.
+  let releaseAdd;
+  const files = {
+    '/r/randori-docs/.jj/repo/store/type': 'git',
+    '/r/randori/.jj/repo/store/type': 'git',
+    '/r/broken/.jj/repo/store/type': 'git',
+  };
+  const h = load('jj-workspace', {
+    spaces: [
+      { id: 's1', name: 'randori-docs', active: true, machine: null, folder: '/r/randori-docs', tabs: [{ id: 'k1', active: true }, { id: 'k-b' }] },
+      { id: 's2', name: 'randori', active: false, machine: null, folder: '/r/randori', tabs: [{ id: 'k2a', active: false }, { id: 'k2b', active: true }] },
+    ],
+    panes: [
+      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/randori-docs' },
+      { pane: 'pb', tab: 'k-b', terminal: 'tb', cwd: '/r/broken' },
+      { pane: 'p2a', tab: 'k2a', terminal: 't2a', cwd: '/r/randori' },
+      { pane: 'p2b', tab: 'k2b', terminal: 't2b', cwd: '/r/elsewhere' },
+    ],
+    props: { space: 's1', folder: '/r/randori-docs', overlay: 'o1', argv: ['zsh', '-l'] },
+    exec: async (cmd, args, opts = {}) => {
+      if (cmd === 'sh') return ok('');
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return opts.cwd in { '/r/randori-docs': 1, '/r/randori': 1, '/r/broken': 1 } ? ok(`${opts.cwd}\n`) : fail('There is no jj repo');
+      if (args.includes('workspace') && args.includes('list')) {
+        if (opts.cwd === '/r/broken') return fail('corrupt op log');
+        if (opts.cwd === '/r/randori') return listed([{ name: 'default', root: '/r/randori' }, { name: 'closed-w', root: '/r/randori-closed' }]);
+        return listed([{ name: 'default', root: '/r/randori-docs' }]);
+      }
+      if (args.includes('bookmark')) return ok('');
+      if (cmd === 'mkdir') return ok('');
+      if (args.includes('add')) { await new Promise(r => { releaseAdd = r; }); return ok(''); }
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h.drain();
+  // loadRepo error for /r/broken renders inline.
+  assert.ok(words(h.render()).includes('corrupt op log'));
+
+  // Typing `randori` then `/` stays `randori/` (NOT hijacked to `randori-docs/`!).
+  h.inputs[0].emit('change', 'randori');
+  h.inputs[0].emit('change', 'randori/');
+  assert.equal(h.inputs[0].value(), 'randori/');
+  assert.equal(h.view.current().repo.name, 'randori');
+
+  // Switching to dedicated space s2 whose active tab is k2b (elsewhere) selects BOTH space s2 AND tab k2a!
+  h.inputs[0].emit('change', 'randori/default');
+  h.inputs[0].emit('submit');
+  await h.drain();
+  assert.deepEqual(plain(h.actions), [
+    { name: 'space.select', args: { id: 's2' } },
+    { name: 'tab.select', args: { id: 'k2a' } },
+  ]);
+
+  // Fresh dialog: closed workspace forwards `argv`, and Escape is ignored while `jj workspace add` is in flight!
+  const h2 = load('jj-workspace', {
+    spaces: [{ id: 's1', name: 'randori', active: true, machine: null, folder: '/r/randori', tabs: [{ id: 'k1', active: true }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/randori' }],
+    props: { space: 's1', folder: '/r/randori', overlay: 'o2', argv: ['zsh', '-l'] },
+    exec: async (cmd, args, opts = {}) => {
+      if (cmd === 'sh') return ok('');
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return ok('/r/randori\n');
+      if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: '/r/randori' }, { name: 'closed-w', root: '/r/randori-closed' }]);
+      if (args.includes('bookmark')) return ok('');
+      if (cmd === 'mkdir') return ok('');
+      if (args.includes('add')) { await new Promise(r => { releaseAdd = r; }); return ok(''); }
+    },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h2.drain();
+  h2.inputs[0].emit('change', 'closed-w');
+  h2.inputs[0].emit('submit');
+  await h2.drain();
+  assert.deepEqual(plain(h2.actions), [{ name: 'space.new', args: { folder: '/r/randori-closed', machine: '', argv: ['zsh', '-l'] } }]);
+
+  // Escape ignored while busy creating!
+  const h3 = load('jj-workspace', {
+    spaces: [{ id: 's1', name: 'randori', active: true, machine: null, folder: '/r/randori', tabs: [{ id: 'k1', active: true }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/randori' }],
+    props: { space: 's1', folder: '/r/randori', overlay: 'o3' },
+    exec: async (cmd, args) => {
+      if (cmd === 'sh') return ok('');
+      if (cmd === 'jj' && args.join(' ') === '--ignore-working-copy workspace root') return ok('/r/randori\n');
+      if (args.includes('workspace') && args.includes('list')) return listed([{ name: 'default', root: '/r/randori' }]);
+      if (args.includes('bookmark')) return ok('');
+      if (cmd === 'mkdir') return ok('');
+      if (args.includes('add')) { await new Promise(r => { releaseAdd = r; }); return ok(''); }
+    },
+    readTextFile: async p => p in files ? files[p] : Promise.reject(new Error('no file')),
+  });
+  await h3.drain();
+  h3.inputs[0].emit('change', 'new-wt');
+  h3.inputs[0].emit('submit');
+  await h3.drain();
+  assert.equal(h3.view.busy, true);
+  key(h3, 'escape');
+  assert.equal(h3.view.closed, false);
+  releaseAdd?.();
+  await h3.drain();
+  assert.equal(h3.view.closed, true);
+});
+
+test('Finish treats an empty previewed terminal set as a valid confirmation and refuses if a terminal appears later', async () => {
+  const h = finishing(undefined, {
+    spaces: [{ id: 's1', name: 'w1', tabs: [{ id: 'k1', active: true }] }],
+    panes: [{ pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1' }],
+    terminals: [], // zero live terminals when preview paints!
+  });
+  await h.drain();
+  const root = h.render(); // paints preview with 0 terminals -> previewed = empty Set
+  assert.equal(h.view.previewed.size, 0);
+  // A new terminal spawns in /r/w1 after preview, before Enter (no intervening render).
+  h.state.terminals = [{ address: 't-late', name: 'late-shell', cwd: '/r/w1' }];
+  byId(root, 'worktree').handlers.on_key_down({ key: 'enter', modifiers: {} }, h.cx);
+  await h.drain();
+  assert.equal(h.actions.length, 0);
+  assert.ok(words(h.render()).some(x => x.includes('New terminal late-shell appeared')));
+});
+
 test('Finish stops when jj no longer lists a checked workspace', async () => {
   let n = 0;
   const h = finishing((cmd, args) => args.includes('list') ? listed(n++ ? WS.filter(w => w.name !== 'w1') : WS) : undefined);
@@ -1240,8 +1530,9 @@ test('a space with a terminal in a linked workspace offers Finish jj workspace i
   const list = words(h.render());
   assert.ok(list.includes('jj workspace\u2026') && list.includes('Finish jj workspace'));
   h.view.choose(list.filter(x => ['Rename', 'jj workspace\u2026', 'Finish jj workspace', 'Close'].includes(x)).indexOf('Finish jj workspace'), h.cx);
+  assert.equal(h.overlays.at(-1).mod, 'jj-finish');
   assert.equal(h.overlays.at(-1).kind, 'window');
-  assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1', folder: '/r/w1', action: 'finish' });
+  assert.deepEqual(plain(h.overlays.at(-1).props), { space: 's1' });
 
   // space.folder pointing to a linked checkout without any terminal pane in it must NOT offer Finish jj workspace.
   const h2 = load('jj-menu', { spaces: [{ ...space('s1', '/r/w1'), tabs: [{ id: 's1-tab' }] }],
@@ -1273,7 +1564,7 @@ test('a tab right-click menu offers Finish jj workspace only for linked tabs, in
   assert.ok(items1.includes('Finish jj workspace'));
   assert.ok(items1.indexOf('Finish jj workspace') < items1.indexOf('Close'));
   h1.view.choose(2, h1.cx);
-  assert.deepEqual(plain(h1.overlays.at(-1)), { mod: 'jj-workspace', kind: 'window', width: 520, height: 360, props: { space: 's1', tab: 'k2', action: 'finish' } });
+  assert.deepEqual(plain(h1.overlays.at(-1)), { mod: 'jj-finish', kind: 'window', width: 520, height: 360, props: { space: 's1', tab: 'k2' } });
 
   // Main-checkout tab: no Finish jj workspace.
   const h2 = load('jj-menu', {

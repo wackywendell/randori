@@ -6,7 +6,7 @@
 // A copy of Herdr's `menu`. A jj space gets jj workspace…, which opens
 // `jj-workspace`, where the shipped menu shows its worktree entries.
 // Finish jj workspace shows on spaces and tabs when a terminal is in a linked
-// jj workspace.
+// jj workspace, opening `jj-finish`.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
@@ -80,14 +80,14 @@ function items(p, git, jj, linked) {
       return [
         ["Rename", "tab.rename", { id: tg.id }],
         ["New tab", "tab.new", { space: tg.space }],
-        ...(linked ? [["Finish jj workspace", "jj-workspace", { space: tg.space, tab: tg.id, action: "finish" }]] : []),
+        ...(linked ? [["Finish jj workspace", "jj-finish", { space: tg.space, tab: tg.id }]] : []),
         ["Close", "tab.close", { id: tg.id }],
       ];
     case "space":
       return [
         ["Rename", "space.rename", { id: tg.id }],
         ...(jj ? [["jj workspace\u2026", "jj-workspace", { space: tg.id, folder: jj }]] : []),
-        ...(jj && linked ? [["Finish jj workspace", "jj-workspace", { space: tg.id, folder: jj, action: "finish" }]] : []),
+        ...(jj && linked ? [["Finish jj workspace", "jj-finish", { space: tg.id }]] : []),
         ...(git && !jj ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" && !jj ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
         ["Close", "space.close", { id: tg.id }],
@@ -105,7 +105,7 @@ function items(p, git, jj, linked) {
 }
 
 function menuIcon(command) {
-  const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" || command === "jj-workspace" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : "terminal";
+  const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" || command === "jj-workspace" || command === "jj-finish" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : "terminal";
   return `mods/workspace-chrome/${name}.svg`;
 }
 
@@ -164,7 +164,7 @@ export default class Menu extends View {
     const it = items(props(), this.git, this.jj, this.linked)[i];
     if (!it) return;
     closeOverlay(props()?.overlay);
-    if (it[1] === "jj-workspace" && it[2].action === "finish") openOverlay({ mod: "jj-workspace", kind: "window", width: 520, height: 360, props: it[2] });
+    if (it[1] === "jj-finish") openOverlay({ mod: "jj-finish", kind: "window", width: 520, height: 360, props: it[2] });
     else if (it[1] === "jj-workspace") openOverlay({ mod: "jj-workspace", kind: "dialog", width: 560, height: 480, props: it[2] });
     else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
