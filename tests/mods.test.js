@@ -605,6 +605,15 @@ test('background discovery loads other spaces (sidebar order) and disk repos (jj
     ['alpha', 'disk'],
   ]);
   assert.equal(h.calls.some(c => c.cwd === '/home/u/.herdr/worktrees/main/w1'), false);
+  // While empty with open-space repos present, disk-only repos stay folded behind a count hint,
+  // and immediately appear once a search starts.
+  const emptyWords = words(h.render());
+  assert.ok(emptyWords.includes('Type to search 2 other repositories'));
+  assert.equal(emptyWords.includes('dd-source'), false);
+  assert.equal(emptyWords.includes('alpha'), false);
+  h.inputs[0].emit('change', 'dd');
+  assert.ok(words(h.render()).includes('dd-source'));
+  h.inputs[0].emit('change', '');
   // Default selection stays on `main`'s New workspace (never jumps down to Other spaces!).
   assert.equal(h.view.current().repo.name, 'main');
   assert.equal(h.view.current().kind, 'create');

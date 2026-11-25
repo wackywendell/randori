@@ -519,6 +519,21 @@ export default class Workspace extends View {
       if (entry.kind === "repo-loading") {
         return div().flex_none().px(10).py(4).text_size(11.5).text_color(t.dim).child("\u2026");
       }
+      if (entry.kind === "disk-hint") {
+        const noun = entry.count === 1 ? "other repository" : "other repositories";
+        return h_flex()
+          .flex_none()
+          .mt(8)
+          .pt(8)
+          .px(10)
+          .pb(4)
+          .border_t(1)
+          .border_color(t.border)
+          .items_center()
+          .text_size(11.5)
+          .text_color(t.dim)
+          .child(`Type to search ${entry.count} ${noun}`);
+      }
       if (entry.kind === "looking") {
         return h_flex()
           .flex_none()

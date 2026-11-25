@@ -181,7 +181,7 @@ Selection follows one invariant driven by a single field `selectedKey` (`null` u
 
 Query parsing (`parseQuery()`) and ranking (`items()`) operate in three modes.
 
-- Empty input. Lists all repositories grouped under current space, `Other spaces`, and `Repositories`, with workspaces followed by `New workspace` under each repository header.
+- Empty input. Lists current-space repositories followed by `Other spaces`, with workspaces followed by `New workspace` under each repository header. Disk-only repositories stay folded behind a `Type to search N other repositories` hint while open-space repositories exist (and appear directly when no open-space repository exists so a non-jj space is never blank).
 - Scoped input (`repo/name`, when the prefix before the first `/` matches one or more loaded repositories). Restricts the list to matching repositories and uses the text after `/` as the workspace filter and creation name, putting `New workspace` first when the text after `/` is empty so rows stay stable across completion. Slashes whose prefix matches no repository (such as `feat/auth`) remain literal workspace names.
 - Unscoped search input. Floats repositories matching by repository name or workspace name above non-matching repositories (`Create elsewhere`). When a query matches a repository name and zero workspace names in that repository, `New workspace` sits first under that repository header. Exact workspace matches hide the duplicate `New` row.
 

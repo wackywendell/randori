@@ -245,4 +245,17 @@ test('buildItems, initialIndex, resolveSelection, and parseProps handle repo sta
   assert.deepEqual(parseProps({ space: 's1', folder: '/r/a', overlay: 'o2', argv: ['zsh'] }), {
     overlay: 'o2', spaceId: 's1', folder: '/r/a', machine: null, argv: ['zsh'],
   });
+
+  // Disk-only repos stay folded behind a disk-hint while empty if space/other repos exist,
+  // appear immediately once searching, and show while empty when no space/other repos exist.
+  const diskRepo = { key: '\0/d/extra', name: 'extra', main: '/d/extra', on: null, source: 'disk', state: 'ready', list: [{ name: 'default', path: '/d/extra', main: true }], names: new Set(), error: '' };
+  const emptyWithDisk = buildItems({ repos: [repos[2], diskRepo], text: '', loadingBg: false });
+  assert.equal(emptyWithDisk.some(i => i.repo?.key === diskRepo.key), false);
+  assert.deepEqual(emptyWithDisk.find(i => i.kind === 'disk-hint'), { kind: 'disk-hint', key: 'disk-hint', count: 1 });
+  const searchedWithDisk = buildItems({ repos: [repos[2], diskRepo], text: 'ext', loadingBg: false });
+  assert.equal(searchedWithDisk.some(i => i.kind === 'header' && i.repo.key === diskRepo.key), true);
+  assert.equal(searchedWithDisk.some(i => i.kind === 'disk-hint'), false);
+  const diskOnlyEmpty = buildItems({ repos: [diskRepo], text: '', loadingBg: false });
+  assert.equal(diskOnlyEmpty.some(i => i.kind === 'header' && i.repo.key === diskRepo.key), true);
+  assert.equal(diskOnlyEmpty.some(i => i.kind === 'disk-hint'), false);
 });

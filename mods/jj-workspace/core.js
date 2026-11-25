@@ -409,19 +409,26 @@ export function buildItems({ repos, text, loadingBg }) {
   };
 
   if (pq.mode === "empty") {
+    const hasOpen = repos.some((r) => r.source !== "disk");
     let seenOther = false;
     let seenDisk = false;
+    let hiddenDisk = 0;
     for (const r of repos) {
+      if (r.source === "disk" && hasOpen) {
+        hiddenDisk++;
+        continue;
+      }
       if (r.source === "other" && !seenOther) {
         seenOther = true;
-        out.push({ kind: "divider", key: "div\0other", label: "Other spaces" });
+        if (out.length) out.push({ kind: "divider", key: "div\0other", label: "Other spaces" });
       }
       if (r.source === "disk" && !seenDisk) {
         seenDisk = true;
-        out.push({ kind: "divider", key: "div\0disk", label: "Repositories" });
+        if (out.length) out.push({ kind: "divider", key: "div\0disk", label: "Repositories" });
       }
       pushSection(out, r.source, r, r.list, "", r.state === "ready");
     }
+    if (hiddenDisk > 0) out.push({ kind: "disk-hint", key: "disk-hint", count: hiddenDisk });
     if (loadingBg) out.push({ kind: "looking", key: "looking" });
     return out;
   }
