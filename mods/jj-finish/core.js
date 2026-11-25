@@ -1,247 +1,246 @@
-// Pure functional core for Finish jj workspace: Herdr snapshot normalization,
-// live+launch terminal graph planning, drift detection, overlap refusal, and
-// space/pane cleanup planning. Zero Herdr/GPUI globals.
+// Pure planning and safety logic for `jj-finish`. No Herdr runtime imports.
+// Every snapshot and affected-terminal calculation is scoped strictly to one
+// machine so Finish can never target or close terminals on another machine.
 
-export function base(path) {
-  if (!path) return "";
-  return path.replace(/\/+$/, "").split("/").pop() || "";
-}
+import {
+  machineOf,
+  sameMachine,
+  addressMachine,
+  inside,
+  ownerRoot,
+  tilde,
+  base,
+  tabOrderedPanes,
+} from "./jj.js";
 
-export function tilde(path, userHome) {
-  if (!path) return "";
-  const h = (userHome ?? "").replace(/\/+$/, "");
-  if (!h) return path;
-  if (path === h) return "~";
-  if (path.startsWith(`${h}/`)) return `~${path.slice(h.length)}`;
-  return path;
-}
-
-export function inside(dir, root) {
-  if (!dir || !root) return false;
-  const r = root.replace(/\/+$/, "");
-  return dir === r || dir.startsWith(`${r}/`);
-}
+export { machineOf, sameMachine, addressMachine, inside, ownerRoot, tilde, base, tabOrderedPanes };
 
 export function isLiveTerminal(t) {
-  return Boolean(t) && (!t.state || t.state === "live");
+  return Boolean(t?.address) && (!t.state || t.state === "live");
 }
 
-// One normalized view of Herdr's spaces, panes, and live terminals.
-// Attaches every live terminal's effective folders (both live pane.cwd and
-// launch terminal.cwd) and builds the transitive parent -> child graph.
-export function snapshotHerdr({ spaces = [], panes = [], terminals = [], spaceId = null }) {
+// Machine-scoped Herdr snapshot. Fails closed when an explicit spaceId or tabId
+// is missing — never falls back to another space or tab.
+export function snapshotHerdr({ spaces = [], panes = [], terminals = [], spaceId = null, tabId = null, machine } = {}) {
   const spaceById = new Map();
-  const spaceByTab = new Map();
+  for (const s of spaces) if (s?.id) spaceById.set(s.id, s);
+
+  const targetSpace = spaceId ? spaceById.get(spaceId) ?? null : null;
+  const targetTab = tabId && targetSpace ? (targetSpace.tabs ?? []).find((t) => t.id === tabId) ?? null : null;
+  const targetMachine = machine !== undefined ? machineOf(machine) : machineOf(targetSpace?.machine);
+
+  const tabSpace = new Map();
   const tabMeta = new Map();
   for (const s of spaces) {
-    spaceById.set(s.id, s);
-    (s.tabs ?? []).forEach((tab, idx) => {
-      spaceByTab.set(tab.id, s);
-      tabMeta.set(tab.id, { tab, index: idx + 1, space: s });
-    });
+    if (!sameMachine(s?.machine, targetMachine)) continue;
+    for (const c of s.tabs ?? []) {
+      tabSpace.set(c.id, s);
+      tabMeta.set(c.id, { spaceId: s.id, spaceName: s.name || base(s.folder) || s.id, tabId: c.id, tabName: c.name || c.id });
+    }
   }
 
-  const panesByTerm = new Map();
+  const machinePanes = [];
+  const paneByTerminal = new Map();
   for (const p of panes) {
-    if (!p.terminal) continue;
-    let list = panesByTerm.get(p.terminal);
-    if (!list) {
-      list = [];
-      panesByTerm.set(p.terminal, list);
+    if (!p?.tab || !tabSpace.has(p.tab)) continue;
+    machinePanes.push(p);
+    if (p.terminal) {
+      const meta = tabMeta.get(p.tab);
+      paneByTerminal.set(p.terminal, {
+        ...meta,
+        pane: p.pane,
+        cwd: p.cwd || "",
+        machine: targetMachine,
+      });
     }
-    list.push(p);
   }
 
-  const liveTerminals = terminals.filter(isLiveTerminal);
-  const termByAddr = new Map(liveTerminals.map((t) => [t.address, t]));
-  const childrenOf = new Map();
+  const liveTerminals = [];
+  const liveByAddress = new Map();
+  const childrenByAddress = new Map();
+  for (const t of terminals) {
+    if (!isLiveTerminal(t)) continue;
+    if (!sameMachine(addressMachine(t.address), targetMachine)) continue;
+    liveTerminals.push(t);
+    liveByAddress.set(t.address, t);
+  }
   for (const t of liveTerminals) {
-    if (!t.parent || !termByAddr.has(t.parent)) continue;
-    let kids = childrenOf.get(t.parent);
-    if (!kids) {
-      kids = [];
-      childrenOf.set(t.parent, kids);
-    }
+    if (!t.parent || !liveByAddress.has(t.parent)) continue;
+    let kids = childrenByAddress.get(t.parent);
+    if (!kids) { kids = []; childrenByAddress.set(t.parent, kids); }
     kids.push(t);
   }
 
-  const liveFoldersOf = (t) => {
-    const out = [];
-    const seen = new Set();
-    const add = (dir) => {
-      if (dir && !seen.has(dir)) {
-        seen.add(dir);
-        out.push(dir);
-      }
-    };
-    for (const p of panesByTerm.get(t.address) ?? []) add(p.cwd);
-    add(t.cwd);
-    return out;
-  };
-
-  const labelOf = (t, parentTerm = null) => {
-    const tName = t.name || t.address;
-    const tPanes = panesByTerm.get(t.address) ?? [];
-    let where = "";
-    const inTarget = tPanes.find((p) => spaceByTab.get(p.tab)?.id === spaceId);
-    if (inTarget) {
-      const m = tabMeta.get(inTarget.tab);
-      const tab = m?.tab;
-      where = tab?.named && tab?.name ? tab.name : `tab ${tab?.index ?? m?.index ?? 1}`;
-    } else if (tPanes.length) {
-      const sp = spaceByTab.get(tPanes[0].tab);
-      where = sp?.name ? `space ${sp.name}` : "another space";
-    } else {
-      where = "parked";
-    }
-    if (parentTerm) {
-      const pName = parentTerm.name || parentTerm.address;
-      return `${tName} (child of ${pName}${tPanes.length ? `, ${where}` : ""})`;
-    }
-    return `${tName} (${where})`;
-  };
-
   return {
-    spaces,
-    panes,
+    machine: targetMachine,
     spaceId,
-    targetSpace: spaceId ? spaceById.get(spaceId) ?? null : null,
-    spaceById,
-    spaceByTab,
-    tabMeta,
-    panesByTerm,
+    tabId,
+    targetSpace,
+    targetTab,
+    panes: machinePanes,
+    paneByTerminal,
     liveTerminals,
-    termByAddr,
-    childrenOf,
-    liveFoldersOf,
-    labelOf,
+    liveByAddress,
+    childrenByAddress,
   };
 }
 
-// Compute every terminal affected by finishing `checkedRoots`:
-// - direct: live terminals whose live pane.cwd OR launch terminal.cwd lies in a checked root
-// - children: transitive live children whose parent (or ancestor) is direct
-// - all: direct + children (deduplicated)
-// - rowOf: Map<root, { term, label, isChild }[]> for the confirmation preview
-export function planAffected(snapshot, checkedRoots) {
+// Collect unique terminal folders in the clicked space or tab scope.
+// Fails closed if the clicked space or tab no longer exists.
+export function collectScopeFolders(snap) {
+  if (!snap?.targetSpace) {
+    return { ok: false, error: "This space is no longer open.", folders: [], activeFolder: "" };
+  }
+  if (snap.tabId && !snap.targetTab) {
+    return { ok: false, error: "This tab is no longer open.", folders: [], activeFolder: "" };
+  }
+  const out = [];
+  const seen = new Set();
+  const add = (dir) => { if (dir && !seen.has(dir)) { seen.add(dir); out.push(dir); } };
+
+  let activeFolder = "";
+  if (snap.tabId) {
+    for (const p of snap.panes) {
+      if (p.tab === snap.tabId && p.terminal && p.cwd) {
+        if (!activeFolder) activeFolder = p.cwd;
+        add(p.cwd);
+      }
+    }
+  } else {
+    const ordered = tabOrderedPanes(snap.targetSpace, snap.panes);
+    const activeTab = (snap.targetSpace.tabs ?? []).find((t) => t.active);
+    if (activeTab) {
+      const hit = ordered.find((p) => p.tab === activeTab.id && p.terminal && p.cwd);
+      if (hit) activeFolder = hit.cwd;
+    }
+    for (const p of ordered) {
+      if (p.terminal && p.cwd) {
+        if (!activeFolder) activeFolder = p.cwd;
+        add(p.cwd);
+      }
+    }
+    add(snap.targetSpace.folder);
+  }
+  return { ok: true, folders: out, activeFolder };
+}
+
+function liveFoldersOf(snap, t) {
+  const dirs = [];
+  const pane = snap.paneByTerminal.get(t.address);
+  if (pane?.cwd) dirs.push(pane.cwd);
+  if (t.cwd && !dirs.includes(t.cwd)) dirs.push(t.cwd);
+  return dirs;
+}
+
+function matchesRoot(machine, dir, root, knownRoots) {
+  if (!dir || !root) return false;
+  if (knownRoots && knownRoots.length > 0) {
+    return ownerRoot(machine, dir, knownRoots) === root;
+  }
+  return inside(dir, root);
+}
+
+// Human-readable terminal description for the confirmation preview.
+export function describeTerminal(snap, t, userHome = "") {
+  const pane = snap.paneByTerminal.get(t.address);
+  const name = t.name || t.program?.name || (Array.isArray(t.argv) ? base(t.argv[0]) : "") || t.address;
+  const hostPrefix = snap.machine ? `${snap.machine} · ` : "";
+  if (pane) {
+    const where = pane.tabName && pane.tabName !== pane.spaceName
+      ? `${pane.spaceName} / ${pane.tabName}`
+      : pane.spaceName;
+    return `${hostPrefix}${name} (${t.address}) · ${where}`;
+  }
+  const parent = t.parent ? snap.liveByAddress.get(t.parent) : null;
+  const where = parent
+    ? `background child of ${parent.name || parent.address}`
+    : (t.cwd ? tilde(t.cwd, userHome) : "background");
+  return `${hostPrefix}${name} (${t.address}) · ${where}`;
+}
+
+// Plan live terminals affected by finishing ONE workspace root on `snap.machine`.
+// - `direct`: live terminals on this machine whose live pane cwd or launch cwd is
+//   owned by `root`. Finish sends `terminal.kill` to each and waits for all of
+//   them to exit before `jj workspace remove`.
+// - `dependentChildren`: live descendant terminals outside `root` that Herdr's
+//   `terminal.kill` walk does not spare (no pane and no `herdr.space` label).
+//   Disclosed transparently in the confirmation preview, never waited on as a
+//   blocker because Core intentionally keeps `--outlive-parent` children alive.
+export function planAffected(snap, root, { knownRoots = null, userHome = "" } = {}) {
+  if (!snap || !root) return { direct: [], dependentChildren: [], mustExit: [] };
+
   const direct = [];
   const directSet = new Set();
-  const rowOf = new Map(checkedRoots.map((r) => [r, []]));
-  const rowSeen = new Map(checkedRoots.map((r) => [r, new Set()]));
-  const directRoots = new Map();
-
-  const addToRow = (root, item) => {
-    const seen = rowSeen.get(root);
-    if (!seen || seen.has(item.term.address)) return;
-    seen.add(item.term.address);
-    rowOf.get(root).push(item);
-  };
-
-  for (const t of snapshot.liveTerminals) {
-    const dirs = snapshot.liveFoldersOf(t);
-    const matchedRoots = checkedRoots.filter((root) => dirs.some((d) => inside(d, root)));
-    if (!matchedRoots.length) continue;
-    direct.push(t);
-    directSet.add(t.address);
-    directRoots.set(t.address, matchedRoots);
-    const label = snapshot.labelOf(t, null);
-    for (const root of matchedRoots) addToRow(root, { term: t, label, isChild: false });
+  for (const t of snap.liveTerminals) {
+    const dirs = liveFoldersOf(snap, t);
+    if (dirs.some((d) => matchesRoot(snap.machine, d, root, knownRoots))) {
+      directSet.add(t.address);
+      direct.push({
+        address: t.address,
+        label: describeTerminal(snap, t, userHome),
+        inPane: snap.paneByTerminal.has(t.address),
+      });
+    }
   }
 
-  const children = [];
+  const dependentChildren = [];
   const visited = new Set(directSet);
-  const queue = direct.map((t) => ({ term: t, roots: directRoots.get(t.address) ?? [] }));
-  while (queue.length) {
-    const { term: parent, roots } = queue.shift();
-    for (const child of snapshot.childrenOf.get(parent.address) ?? []) {
+  const queue = [...directSet];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    for (const child of snap.childrenByAddress.get(cur) ?? []) {
       if (visited.has(child.address)) continue;
       visited.add(child.address);
-      children.push(child);
-      const label = snapshot.labelOf(child, parent);
-      for (const root of roots) addToRow(root, { term: child, label, isChild: true });
-      queue.push({ term: child, roots });
+      // Match Herdr's documented terminal.kill branch-sparing rule:
+      // stop walking any branch whose child has a pane or a herdr.space label.
+      if (snap.paneByTerminal.has(child.address) || child.labels?.["herdr.space"]) continue;
+      dependentChildren.push({
+        address: child.address,
+        label: describeTerminal(snap, child, userHome),
+      });
+      queue.push(child.address);
     }
   }
 
-  const all = [...direct, ...children];
   return {
     direct,
-    children,
-    all,
-    addresses: new Set(all.map((t) => t.address)),
-    rowOf,
+    dependentChildren,
+    mustExit: direct,
   };
 }
 
-// Any terminal present in `live.all` that was not in the user-confirmed set.
-export function detectDrift(live, confirmed) {
-  if (!confirmed) return live.all;
-  return live.all.filter((t) => !confirmed.has(t.address));
+// Return direct terminals not present in the user's acknowledged address set.
+export function detectDrift(acknowledged, currentDirect) {
+  const ack = acknowledged instanceof Set ? acknowledged : new Set(acknowledged ?? []);
+  return (currentDirect ?? []).filter((t) => !ack.has(t.address));
 }
 
-// Refuse if any checked workspace root strictly contains another known workspace.
-// `allKnown` accepts either strings (paths) or `{ name, path }` records.
-export function findNestedWorkspace(checkedRows, allKnown) {
-  for (const row of checkedRows) {
-    for (const item of allKnown) {
-      const inner = typeof item === "string" ? item : item?.path;
-      const innerName = typeof item === "string" ? "" : item?.name ?? "";
-      if (inner && inner !== row.root && inside(inner, row.root)) {
-        return { outer: row, inner, innerName };
-      }
-    }
+// Refuse finishing `root` when another known workspace lives inside it.
+export function findNestedWorkspace(root, otherRoots) {
+  if (!root) return null;
+  for (const other of otherRoots ?? []) {
+    if (!other || other === root) continue;
+    if (inside(other, root)) return { outer: root, inner: other };
   }
   return null;
 }
 
-// Plan space/pane closing after all affected terminals (direct + children) end.
-// Closes the target space only when every pane inside it belongs to an ended
-// terminal (never closing non-terminal mod panes or unaffected terminals).
-export function planCleanup(snapshot, allAffectedAddresses) {
-  const space = snapshot.targetSpace;
-  const tabIds = new Set((space?.tabs ?? []).map((c) => c.id));
-  const spacePanes = space ? snapshot.panes.filter((p) => tabIds.has(p.tab)) : [];
-  const closeSpace = Boolean(space) && spacePanes.every((p) => p.terminal && allAffectedAddresses.has(p.terminal));
-  const closePanes = [];
-  for (const p of snapshot.panes) {
-    if (!p.terminal || !allAffectedAddresses.has(p.terminal)) continue;
-    if (closeSpace && tabIds.has(p.tab)) continue;
-    closePanes.push(p.pane);
-  }
-  return { closeSpace, spaceId: space?.id ?? null, closePanes };
-}
+// Post-removal UI cleanup for the target space on `snap.machine`.
+// Requires a non-empty pane list before closing the space (never vacuous `every([])`).
+export function planCleanup(snap, root, knownRoots = null) {
+  if (!snap?.targetSpace || !root) return { closeSpace: false, closePanes: [] };
+  const spacePanes = tabOrderedPanes(snap.targetSpace, snap.panes);
+  if (spacePanes.length === 0) return { closeSpace: false, closePanes: [] };
 
-// Collect unique terminal pane folders in scope (clicked tab or whole space),
-// and identify which folders belong to the pre-checked tab (clicked tab or active tab).
-export function collectScopeFolders(space, allPanes, tabId) {
-  if (!space) return { folders: [], checkFolders: new Set() };
-  const tabs = space.tabs ?? [];
-  const targetTabId = tabId ?? tabs.find((c) => c.active)?.id ?? tabs[0]?.id ?? null;
-  const scopeTabIds = tabId ? new Set([tabId]) : new Set(tabs.map((c) => c.id));
-  const folders = [];
-  const seen = new Set();
-  const checkFolders = new Set();
-  const orderedTabs = tabId ? tabs.filter((c) => c.id === tabId) : tabs;
-  for (const c of orderedTabs) {
-    for (const p of allPanes) {
-      if (p.tab !== c.id || !p.terminal || !p.cwd) continue;
-      if (!seen.has(p.cwd)) {
-        seen.add(p.cwd);
-        folders.push(p.cwd);
-      }
-      if (c.id === targetTabId) checkFolders.add(p.cwd);
+  const affected = [];
+  for (const p of spacePanes) {
+    if (p.cwd && matchesRoot(snap.machine, p.cwd, root, knownRoots)) {
+      affected.push(p.pane);
     }
   }
-  // Fallback if tabId wasn't found in space.tabs (defensive).
-  if (tabId && !orderedTabs.length) {
-    for (const p of allPanes) {
-      if (!scopeTabIds.has(p.tab) || !p.terminal || !p.cwd) continue;
-      if (!seen.has(p.cwd)) {
-        seen.add(p.cwd);
-        folders.push(p.cwd);
-      }
-      checkFolders.add(p.cwd);
-    }
+  if (affected.length === 0) return { closeSpace: false, closePanes: [] };
+  if (affected.length === spacePanes.length) {
+    return { closeSpace: true, closePanes: [] };
   }
-  return { folders, checkFolders };
+  return { closeSpace: false, closePanes: affected };
 }

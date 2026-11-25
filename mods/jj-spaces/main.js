@@ -12,7 +12,7 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile } from "herdr";
-import { identity, readStatus, visible } from "./jj.js";
+import { identity, readStatus, visible, spacePlace, base } from "./jj.js";
 
 const IO = { exec, readTextFile };
 // Where file watches cannot reach (another machine, a refused watch), visible
@@ -31,23 +31,16 @@ function find(node, id) {
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
-// Where a space is now: its first terminal's live folder, else where it was made.
-// `ps`: panes(), read once by the caller (each read copies every pane).
-function place(s, ps) {
-  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
-  return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
-}
 const rowHeight = ({ tree }) => (tree ? 28 : 30);
 const RAIL_CELL = 32;
 const railCell = (el) => h_flex().flex_none().justify_center().child(el);
-const where = (s, ps) => JSON.stringify([s.machine ?? null, place(s, ps)]);
+const where = (s, ps) => JSON.stringify([s.machine ?? null, spacePlace(s, ps)]);
 // The first terminal of the tab a space shows, whose checkout its jj status line gives.
 function shownWhere(s, ps) {
   const tab = (s.tabs ?? []).find((c) => c.active)?.id;
   const cwd = ps.find((p) => p.tab === tab && p.cwd)?.cwd;
   return cwd ? JSON.stringify([s.machine ?? null, cwd]) : where(s, ps);
 }
-const base = (path) => path.replace(/\/+$/, "").split("/").pop();
 // Changes made outside Herdr (an editor's save, a commit in another app): looked
 // for this often, in repos the list shows, while the window is in front.
 const FALLBACK = 60000;

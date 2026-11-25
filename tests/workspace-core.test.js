@@ -1,261 +1,373 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
+  parseSettings,
   tilde,
   untilde,
   worktreesBase,
   resolveWorktreePath,
-  validateLink,
-  tabLabel,
+  normalizeLink,
+  planCreate,
+  buildLinkScript,
+  DISK_SCAN,
   parseDiskScan,
   resolveDiskCandidates,
-  parseProps,
-  slug,
-  rowKey,
-  whereOpen,
-  upsertRepo,
-  sortRepos,
-  parseQuery,
-  shouldAutoCompleteSlash,
-  buildItems,
-  initialIndex,
-  resolveSelection,
-  computeGhost,
-  placement,
+  emptyModel,
+  reduce,
+  sortedRepos,
+  resolveSlashChip,
+  matchingIdleDiskRepos,
+  indexOpenCheckouts,
+  destination,
+  placementFor,
+  project,
+  locKey,
+  ownerRoot,
 } from '../mods/jj-workspace/core.js';
 
-test('tilde, untilde, worktreesBase, resolveWorktreePath, and validateLink enforce boundaries and safe homes', () => {
-  // tilde requires a path-segment boundary
-  assert.equal(tilde('/home/u/repo', '/home/u'), '~/repo');
-  assert.equal(tilde('/home/u', '/home/u'), '~');
-  assert.equal(tilde('/home/user2/repo', '/home/u'), '/home/user2/repo');
-  assert.equal(tilde('/home/u/repo', '/home/u/'), '~/repo');
-
-  // untilde never strips ~ into filesystem root `/` when userHome is empty
-  assert.equal(untilde('~/.herdr/worktrees/a/b', '/home/u/'), '/home/u/.herdr/worktrees/a/b');
-  assert.equal(untilde('~/.herdr/worktrees/a/b', ''), '~/.herdr/worktrees/a/b');
-  assert.equal(untilde('~', ''), '~');
-
-  // worktreesBase returns empty when home is unknown for a tilde template
-  assert.equal(worktreesBase('~/.herdr/worktrees/{repo}/{name}', '/home/u'), '/home/u/.herdr/worktrees');
-  assert.equal(worktreesBase('~/.herdr/worktrees/{repo}/{name}', ''), '');
-  assert.equal(worktreesBase('/srv/wt/{repo}/{name}', ''), '/srv/wt');
-
-  // resolveWorktreePath flags unresolved tilde cleanly
-  assert.deepEqual(
-    resolveWorktreePath({ template: '~/.herdr/worktrees/{repo}/{name}', repoMain: '/r/app', repoName: 'app', wsName: 'feat', home: '' }),
-    { path: '~/.herdr/worktrees/app/feat', unresolvedTilde: true },
+test('segment-bounded tilde/untilde and worktreesBase', () => {
+  assert.equal(tilde('/Users/alice', '/Users/alice'), '~');
+  assert.equal(tilde('/Users/alice/code', '/Users/alice'), '~/code');
+  assert.equal(tilde('/Users/alice2/code', '/Users/alice'), '/Users/alice2/code');
+  assert.equal(untilde('~/code', '/Users/alice'), '/Users/alice/code');
+  assert.equal(untilde('~alice/code', '/Users/alice'), '~alice/code');
+  assert.equal(worktreesBase('~/.herdr/worktrees/{repo}/{name}', '/Users/alice'), '/Users/alice/.herdr/worktrees');
+  assert.equal(
+    resolveWorktreePath('~/.herdr/worktrees/{repo}/{name}', '/Users/alice/code/randori', 'feat/auth', '/Users/alice'),
+    '/Users/alice/.herdr/worktrees/randori/feat-auth',
   );
-  assert.deepEqual(
-    resolveWorktreePath({ template: '~/.herdr/worktrees/{repo}/{name}', repoMain: '/r/app', repoName: 'app', wsName: 'feat', home: '/home/u' }),
-    { path: '/home/u/.herdr/worktrees/app/feat', unresolvedTilde: false },
-  );
-  assert.deepEqual(
-    resolveWorktreePath({ template: '../wt/{name}', repoMain: '/r/app', repoName: 'app', wsName: 'feat', home: '' }),
-    { path: '/r/wt/feat', unresolvedTilde: false },
-  );
-
-  // validateLink rejects absolute, tilde, empty, and traversal paths
-  assert.equal(validateLink('.envrc'), true);
-  assert.equal(validateLink('config/mise.local.toml'), true);
-  assert.equal(validateLink('/etc/passwd'), false);
-  assert.equal(validateLink('~/secret'), false);
-  assert.equal(validateLink('../escape'), false);
-  assert.equal(validateLink('a/../b'), false);
-  assert.equal(validateLink(''), false);
-
-  // tabLabel names main checkouts after repo name and linked checkouts after workspace name
-  assert.equal(tabLabel({ name: 'randori' }, 'default', true), 'randori');
-  assert.equal(tabLabel({ name: 'randori' }, 'fix-bug', false), 'fix-bug');
 });
 
-test('parseDiskScan requires strict 3-field tab records, drops GNU stat junk lines, and resolves relative .jj/repo pointers', () => {
-  const stdout = [
-    '  File: "/home/bits/dd/app/.jj/repo/op_heads/heads"',
-    '    ID: 12345 Namelen: 255     Type: ext2/ext3',
-    'Block size: 4096       Fundamental block size: 4096',
-    '1700000100\t/home/bits/dd/app\t',
-    '1700000200\t/home/bits/wt/app/w1\t/home/bits/dd/app/.jj/repo',
-    '1700000250\t/home/bits/dd/rel-wt\t../../app/.jj/repo',
-    'not-a-number\t/home/bits/bad\t',
-    '1700000300\t/home/bits/only-two-fields',
-  ].join('\n');
-  const parsed = parseDiskScan(stdout);
-  assert.equal(parsed.size, 3);
-  const candidates = resolveDiskCandidates(parsed, [], 'retriever');
-  assert.deepEqual([...candidates.entries()], [
-    ['/home/bits/dd/app', 1700000250],
-  ]);
+test('parseSettings and normalizeLink validate at the boundary', () => {
+  const s = parseSettings({ openIn: 'tab', links: [' mise.toml ', '/abs', '../up', 'sub/file.txt', 'dir/'], miseTrust: false, repos: ['~/code/*', ''] });
+  assert.equal(s.openIn, 'tab');
+  assert.equal(s.miseTrust, false);
+  assert.deepEqual(s.repos, ['~/code/*']);
+
+  const plan = planCreate({ repo: { main: '/r/app' }, name: 'fix', settings: s, home: '/home/u' });
+  assert.deepEqual(plan.links.map((l) => l.rel), ['mise.toml', 'sub/file.txt']);
+  assert.equal(plan.links[0].isMise, true);
+  assert.equal(plan.links[1].isMise, false);
+
+  assert.equal(normalizeLink(''), null);
+  assert.equal(normalizeLink('/etc/passwd'), null);
+  assert.equal(normalizeLink('a/../b'), null);
+  assert.equal(normalizeLink('dir/'), null);
+  assert.deepEqual(normalizeLink('  .mise.toml '), { rel: '.mise.toml', isMise: true });
 });
 
-test('slug preserves normal names and hashes symbol-only names instead of returning empty', () => {
-  assert.equal(slug('feat/auth'), 'feat-auth');
-  assert.equal(slug(''), '');
-  const bang = slug('!!!');
-  assert.match(bang, /^ws-[0-9a-f]{6}$/);
-  assert.equal(slug('!!!'), bang);
-  assert.notEqual(slug('!!!'), slug('???'));
-  assert.match(slug('..'), /^ws-[0-9a-f]{6}$/);
+test('buildLinkScript creates symlinks in one sh invocation and skips missing/existing silently', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'randori-links-'));
+  try {
+    const main = path.join(tmp, 'main');
+    const dest = path.join(tmp, 'wt');
+    await fs.mkdir(path.join(main, 'nested'), { recursive: true });
+    await fs.mkdir(dest, { recursive: true });
+    await fs.writeFile(path.join(main, 'AGENTS.local.md'), 'hello');
+    await fs.writeFile(path.join(main, 'nested/cfg.txt'), 'cfg');
+    await fs.writeFile(path.join(dest, 'existing.txt'), 'keep');
+    await fs.writeFile(path.join(main, 'existing.txt'), 'main-ver');
+
+    const plan = planCreate({
+      repo: { main },
+      name: 'wt',
+      settings: parseSettings({
+        directory: dest,
+        links: ['AGENTS.local.md', 'nested/cfg.txt', 'missing.txt', 'existing.txt'],
+        miseTrust: false,
+      }),
+      home: tmp,
+    });
+    const { script, args } = buildLinkScript({ ...plan, dest });
+    execFileSync('sh', ['-c', script, 'sh', ...args], { encoding: 'utf8' });
+
+    assert.equal(await fs.readlink(path.join(dest, 'AGENTS.local.md')), path.join(main, 'AGENTS.local.md'));
+    assert.equal(await fs.readlink(path.join(dest, 'nested/cfg.txt')), path.join(main, 'nested/cfg.txt'));
+    assert.equal(await fs.readFile(path.join(dest, 'existing.txt'), 'utf8'), 'keep');
+    await assert.rejects(() => fs.lstat(path.join(dest, 'missing.txt')));
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
-test('rowKey separates create rows from workspaces literally named +new', () => {
-  assert.notEqual(rowKey('create', '\0/r/main'), rowKey('ws', '\0/r/main', '+new'));
+test('DISK_SCAN handles depth-1 and depth-2 worktrees, linked pointer mtime, strict globs, and exits 0', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'randori-scan-'));
+  try {
+    const code = path.join(tmp, 'code');
+    const wtBase = path.join(tmp, 'wt');
+    const plain = path.join(tmp, 'plain-dir');
+    const dot = path.join(tmp, '.dotfiles');
+    // Main repo under code/*
+    await fs.mkdir(path.join(code, 'alpha/.jj/repo/op_heads/heads'), { recursive: true });
+    // Plain dir with nested child repo (plain path must NOT descend)
+    await fs.mkdir(path.join(plain, 'nested/.jj/repo/op_heads/heads'), { recursive: true });
+    // Plain path that IS a jj repo
+    await fs.mkdir(path.join(dot, '.jj/repo/op_heads/heads'), { recursive: true });
+    // Depth-1 linked worktree under wtBase: wt/beta-topic -> points to code/beta/.jj/repo
+    await fs.mkdir(path.join(code, 'beta/.jj/repo/op_heads/heads'), { recursive: true });
+    await fs.mkdir(path.join(wtBase, 'beta-topic/.jj'), { recursive: true });
+    await fs.writeFile(path.join(wtBase, 'beta-topic/.jj/repo'), path.join(code, 'beta/.jj/repo'));
+    // Depth-2 linked worktree under wtBase: wt/gamma/fix -> points to code/gamma/.jj/repo
+    await fs.mkdir(path.join(code, 'gamma/.jj/repo/op_heads/heads'), { recursive: true });
+    await fs.mkdir(path.join(wtBase, 'gamma/fix/.jj'), { recursive: true });
+    await fs.writeFile(path.join(wtBase, 'gamma/fix/.jj/repo'), path.join(code, 'gamma/.jj/repo'));
+
+    const stdout = execFileSync(
+      'sh',
+      ['-c', DISK_SCAN, 'sh', wtBase, `${code}/*`, plain, dot, `${tmp}/does-not-exist/*`],
+      { encoding: 'utf8' },
+    );
+    const entries = parseDiskScan(stdout);
+    const mains = resolveDiskCandidates(entries).map((c) => c.main).sort();
+    assert.deepEqual(
+      mains,
+      [dot, path.join(code, 'alpha'), path.join(code, 'beta'), path.join(code, 'gamma')].sort(),
+    );
+    assert.ok(entries.every((e) => e.mtime > 0));
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
-test('whereOpen returns the matched tab even on dedicated spaces so inactive tabs get selected', () => {
+test('destination() covers all 16 combinations of the placement truth table', () => {
+  // !canTab: shift always refuses; Enter switches if open else new space
+  for (const openIn of ['space', 'tab']) {
+    assert.equal(destination({ isOpen: false, canTab: false, shift: false, openIn }), 'space');
+    assert.equal(destination({ isOpen: true, canTab: false, shift: false, openIn }), 'switch');
+    assert.equal(destination({ isOpen: false, canTab: false, shift: true, openIn }), 'refuse-tab');
+    assert.equal(destination({ isOpen: true, canTab: false, shift: true, openIn }), 'refuse-tab');
+  }
+  // canTab + openIn: "space"
+  assert.equal(destination({ isOpen: false, canTab: true, shift: false, openIn: 'space' }), 'space');
+  assert.equal(destination({ isOpen: true, canTab: true, shift: false, openIn: 'space' }), 'switch');
+  assert.equal(destination({ isOpen: false, canTab: true, shift: true, openIn: 'space' }), 'tab');
+  assert.equal(destination({ isOpen: true, canTab: true, shift: true, openIn: 'space' }), 'tab');
+  // canTab + openIn: "tab"
+  assert.equal(destination({ isOpen: false, canTab: true, shift: false, openIn: 'tab' }), 'tab');
+  assert.equal(destination({ isOpen: true, canTab: true, shift: false, openIn: 'tab' }), 'switch');
+  assert.equal(destination({ isOpen: false, canTab: true, shift: true, openIn: 'tab' }), 'space');
+  assert.equal(destination({ isOpen: true, canTab: true, shift: true, openIn: 'tab' }), 'space');
+});
+
+test('indexOpenCheckouts uses tab order, ownerRoot nested protection, and dedicated-space preference', () => {
   const spaces = [
-    { id: 's1', machine: null, folder: '/r/w1', tabs: [{ id: 'k1', active: false }, { id: 'k2', active: true }] },
+    { id: 's-mixed', name: 'Mixed', machine: null, folder: '/r/app', tabs: [{ id: 't1' }, { id: 't2' }] },
+    { id: 's-ded', name: 'Dedicated', machine: null, folder: '/r/app/.wt/sub', tabs: [{ id: 't3' }] },
   ];
   const panes = [
-    { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/w1' },
-    { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/other' },
+    { pane: 'p2', tab: 't2', terminal: 'x2', cwd: '/r/app/.wt/sub' },
+    { pane: 'p1', tab: 't1', terminal: 'x1', cwd: '/r/app/src' },
+    { pane: 'p3', tab: 't3', terminal: 'x3', cwd: '/r/app/.wt/sub/pkg' },
   ];
-  const loc = whereOpen(spaces, panes, null, '/r/w1');
-  assert.equal(loc.dedicated, true);
-  assert.equal(loc.space.id, 's1');
-  assert.equal(loc.tab.id, 'k1');
-  assert.equal(loc.tab.active, false);
+  const rootsByMachine = new Map([['', ['/r/app', '/r/app/.wt/sub']]]);
+  const open = indexOpenCheckouts(spaces, panes, rootsByMachine);
+
+  // Nested checkout is attributed to /r/app/.wt/sub (NOT /r/app) and prefers dedicated space s-ded.
+  assert.equal(ownerRoot(null, '/r/app/.wt/sub/pkg', ['/r/app', '/r/app/.wt/sub']), '/r/app/.wt/sub');
+  assert.equal(open.get(locKey(null, '/r/app/.wt/sub'))?.spaceId, 's-ded');
+  assert.equal(open.get(locKey(null, '/r/app'))?.spaceId, 's-mixed');
+  assert.equal(open.get(locKey(null, '/r/app'))?.tabId, 't1');
 });
 
-test('upsertRepo promotes disk -> other -> space with deterministic spaceId and sortRepos prioritizes current machine', () => {
-  const repos = [];
-  const first = upsertRepo(repos, { main: '/home/u/a', checkout: '/home/u/a', on: null, source: 'disk', mtime: 500 });
-  assert.equal(first.added, true);
-  assert.equal(first.repo.state, 'loading');
+test('reduce is immutable and sortedRepos prioritizes space > same-machine other > cross-machine other > disk', () => {
+  const m0 = emptyModel();
+  let m = reduce(m0, { type: 'TargetResolved', spaceId: 's1', machine: 'retriever' });
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/local/disk-old', source: 'disk', mtime: 10 });
+  m = reduce(m, { type: 'RepoFound', on: 'retriever', main: '/rem/disk-new', source: 'disk', mtime: 50 });
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/local/other', source: 'other', order: 0 });
+  m = reduce(m, { type: 'RepoFound', on: 'retriever', main: '/rem/other', source: 'other', order: 2 });
+  m = reduce(m, { type: 'RepoFound', on: 'retriever', main: '/rem/cur', source: 'space', order: 1, spaceId: 's1' });
 
-  // Later-sidebar other space promotes disk -> other
-  upsertRepo(repos, { main: '/home/u/a', checkout: '/home/u/a', on: null, source: 'other', spaceId: 's-late', order: 5 });
-  assert.equal(repos[0].source, 'other');
-  assert.equal(repos[0].spaceId, 's-late');
-
-  // Earlier-sidebar other space resolving second updates BOTH order AND spaceId
-  upsertRepo(repos, { main: '/home/u/a', checkout: '/home/u/a', on: null, source: 'other', spaceId: 's-early', order: 1 });
-  assert.equal(repos[0].order, 1);
-  assert.equal(repos[0].spaceId, 's-early');
-
-  upsertRepo(repos, { main: '/rem/cur', checkout: '/rem/cur', on: 'retriever', source: 'space', spaceId: 's1', order: 0 });
-  upsertRepo(repos, { main: '/rem/other', checkout: '/rem/other', on: 'retriever', source: 'other', spaceId: 's3', order: 5 });
-  upsertRepo(repos, { main: '/rem/disk', checkout: '/rem/disk', on: 'retriever', source: 'disk', mtime: 100 });
-  upsertRepo(repos, { main: '/home/u/disk', checkout: '/home/u/disk', on: null, source: 'disk', mtime: 900 });
-
-  sortRepos(repos, { focusKey: 'retriever\0/rem/cur', curMachine: 'retriever' });
-  assert.deepEqual(repos.map(r => [r.name, r.source, r.on]), [
-    ['cur', 'space', 'retriever'],
-    ['other', 'other', 'retriever'],
-    ['a', 'other', null],
-    ['disk', 'disk', 'retriever'],
-    ['disk', 'disk', null],
-  ]);
-});
-
-test('parseQuery, shouldAutoCompleteSlash, and computeGhost handle exact repo names without hijacking', () => {
-  const repos = [
-    { key: '\0/r/randori-docs', name: 'randori-docs' },
-    { key: '\0/r/randori', name: 'randori' },
-    { key: '\0/r/streams', name: 'streams' },
-  ];
-  assert.deepEqual(parseQuery('streams/  fix-auth  ', repos), {
-    mode: 'scoped', q: 'fix-auth', name: 'fix-auth', scoped: new Set(['\0/r/streams']),
-  });
-  assert.deepEqual(parseQuery('feat/auth', repos), {
-    mode: 'filter', q: 'feat/auth', name: 'feat/auth', scoped: null,
-  });
-
-  // Typing `randori/` when `randori` is an exact loaded repo MUST NOT hijack to `randori-docs/`!
-  assert.equal(
-    shouldAutoCompleteSlash({ prevText: 'randori', nextText: 'randori/', prevCurrent: { repo: repos[0] }, repos }),
-    null,
-  );
-  // Typing `rando/` (prefix, not an exact repo name) DOES complete to `randori-docs/`.
-  assert.equal(
-    shouldAutoCompleteSlash({ prevText: 'rando', nextText: 'rando/', prevCurrent: { repo: repos[0] }, repos }),
-    repos[0],
-  );
-
-  // Ghost prefix vs substring
-  assert.deepEqual(computeGhost({ text: 'str', current: { repo: repos[2] } }), {
-    repo: repos[2], suffix: 'eams/', full: 'streams/', kind: 'prefix',
-  });
-  assert.deepEqual(computeGhost({ text: 'ream', current: { repo: repos[2] } }), {
-    repo: repos[2], suffix: ' \u2192 streams/', full: 'streams/', kind: 'substring',
-  });
-  assert.equal(computeGhost({ text: 'streams/x', current: { repo: repos[2] } }), null);
-});
-
-test('placement handles case-insensitive scoping, openIn, cross-machine fallback, and inactive spaces', () => {
-  const localRepo = { key: '\0/r/Main', name: 'Main', main: '/r/Main', on: null, list: [{ name: 'default', path: '/r/Main', main: true }, { name: 'open-w', path: '/r/open-w', main: false }, { name: 'closed-w', path: '/r/closed-w', main: false }, { name: 'old', path: '', main: false }] };
-  const remoteRepo = { key: 'retriever\0/rem/s', name: 's', main: '/rem/s', on: 'retriever', list: [{ name: 'open-r', path: '/rem/open-r', main: false }, { name: 'closed-r', path: '/rem/closed-r', main: false }] };
-  const baseCtx = {
-    text: '',
-    spaceId: 's1',
-    spaceMachine: null,
-    spaceName: 'local-a',
-    openIn: 'space',
-    spaces: [
-      { id: 's1', name: 'local-a', active: true, machine: null, folder: '/r/Main', tabs: [{ id: 'k1', active: true }] },
-      { id: 's2', name: 'open-w', active: false, machine: null, folder: '/r/open-w', tabs: [{ id: 'k2', active: true }] },
-      { id: 's3', name: 'open-r', active: false, machine: 'retriever', folder: '/rem/open-r', tabs: [{ id: 'k3', active: true }] },
-    ],
-    panes: [
-      { pane: 'p1', tab: 'k1', terminal: 't1', cwd: '/r/Main' },
-      { pane: 'p2', tab: 'k2', terminal: 't2', cwd: '/r/open-w' },
-      { pane: 'p3', tab: 'k3', terminal: 't3', cwd: '/rem/open-r' },
-    ],
-  };
-
-  // Case-insensitive scoped empty create row says "type a name to create"
+  // Original model untouched
+  assert.equal(m0.repos.size, 0);
   assert.deepEqual(
-    placement({ kind: 'create', repo: localRepo, name: '' }, false, { ...baseCtx, text: 'main/' }),
-    { kind: 'none', label: 'type a name to create' },
+    sortedRepos(m).map((r) => `${r.source}:${r.on ?? 'local'}:${r.name}`),
+    [
+      'space:retriever:cur',
+      'other:retriever:other',
+      'other:local:other',
+      'disk:retriever:disk-new',
+      'disk:local:disk-old',
+    ],
   );
-  assert.equal(placement({ kind: 'create', repo: localRepo, name: '' }, false, baseCtx).kind, 'complete');
-
-  // Named create row
-  assert.equal(placement({ kind: 'create', repo: localRepo, name: 'x' }, false, baseCtx).kind, 'space');
-  assert.equal(placement({ kind: 'create', repo: localRepo, name: 'x' }, true, baseCtx).kind, 'tab');
-  assert.equal(placement({ kind: 'create', repo: localRepo, name: 'x' }, false, { ...baseCtx, openIn: 'tab' }).kind, 'tab');
-  assert.equal(placement({ kind: 'create', repo: localRepo, name: 'x' }, true, { ...baseCtx, openIn: 'tab' }).kind, 'space');
-
-  // Closed remote falls back to space on Enter even when openIn='tab'; Shift+Enter refuses under BOTH openIn='space' and openIn='tab'
-  assert.equal(placement({ kind: 'ws', repo: remoteRepo, ws: remoteRepo.list[1] }, false, { ...baseCtx, openIn: 'tab' }).kind, 'space');
-  assert.match(placement({ kind: 'ws', repo: remoteRepo, ws: remoteRepo.list[1] }, true, { ...baseCtx, openIn: 'tab' }).reason, /Press Enter for a new space\./);
-  assert.match(placement({ kind: 'ws', repo: remoteRepo, ws: remoteRepo.list[1] }, true, { ...baseCtx, openIn: 'space' }).reason, /Press Enter for a new space\./);
-
-  // Open remote switches on Enter, refuses Shift+Enter with "Press Enter to switch."
-  assert.equal(placement({ kind: 'ws', repo: remoteRepo, ws: remoteRepo.list[0] }, false, { ...baseCtx, openIn: 'tab' }).kind, 'switch');
-  assert.match(placement({ kind: 'ws', repo: remoteRepo, ws: remoteRepo.list[0] }, true, { ...baseCtx, openIn: 'tab' }).reason, /Press Enter to switch\./);
-
-  // Inactive target space labels tab with space name
-  const inactiveCtx = { ...baseCtx, spaces: [{ ...baseCtx.spaces[0], active: false }, { ...baseCtx.spaces[1], active: true }] };
-  assert.equal(placement({ kind: 'create', repo: localRepo, name: 'x' }, true, inactiveCtx).label, 'new tab in local-a');
+  // Disk repos start idle; open-space repos start loading.
+  assert.equal(m.repos.get(locKey('retriever', '/rem/disk-new')).load.state, 'idle');
+  assert.equal(m.repos.get(locKey('retriever', '/rem/cur')).load.state, 'loading');
 });
 
-test('buildItems, initialIndex, resolveSelection, and parseProps handle repo states and picker props', () => {
-  const repos = [
-    { key: '\0/r/a', name: 'a', main: '/r/a', on: null, source: 'space', state: 'loading', list: [], names: new Set(), error: '' },
-    { key: '\0/r/b', name: 'b', main: '/r/b', on: null, source: 'space', state: 'error', list: [], names: new Set(), error: 'boom' },
-    { key: '\0/r/c', name: 'c', main: '/r/c', on: null, source: 'space', state: 'ready', list: [{ name: '+new', path: '/r/c', main: true }, { name: 'w1', path: '/r/c-w1', main: false }], names: new Set(), error: '' },
+test('project() supports Flat Search, Option 1 disk folding, literal slashes, cross-repo search, and Repo Chip', () => {
+  const settings = parseSettings({ openIn: 'space' });
+  let m = emptyModel();
+  m = reduce(m, { type: 'TargetResolved', spaceId: 's1', machine: null });
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/code/randori', source: 'space', order: 0, spaceId: 's1' });
+  m = reduce(m, { type: 'FocusResolved', key: locKey(null, '/code/randori'), root: '/code/randori' });
+  m = reduce(m, {
+    type: 'RepoLoaded',
+    key: locKey(null, '/code/randori'),
+    list: [
+      { name: 'default', path: '/code/randori', main: true },
+      { name: 'ux-fixes', path: '/wt/randori/ux-fixes', main: false },
+    ],
+  });
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/code/streams', source: 'other', order: 1, spaceId: 's2' });
+  m = reduce(m, {
+    type: 'RepoLoaded',
+    key: locKey(null, '/code/streams'),
+    list: [
+      { name: 'default', path: '/code/streams', main: true },
+      { name: 'cli-by-entity', path: '/wt/streams/cli-by-entity', main: false },
+    ],
+  });
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/home/u/.dotfiles', source: 'disk', mtime: 100 });
+  m = reduce(m, { type: 'TargetLoaded' });
+
+  const spaces = [{ id: 's1', name: 'Randori', machine: null, folder: '/code/randori', tabs: [{ id: 't1' }] }];
+  const panes = [{ pane: 'p1', tab: 't1', terminal: 'x1', cwd: '/code/randori' }];
+
+  // 1. Empty query folds disk repo into disk-hint (Option 1) and emits no selectable repo rows.
+  const emptyVm = project({ model: m, query: '', spaces, panes, settings });
+  assert.ok(emptyVm.items.some((it) => it.kind === 'disk-hint' && it.count === 1));
+  assert.ok(!emptyVm.items.some((it) => it.kind === 'repo'));
+  assert.equal(emptyVm.picks[0].kind, 'ws');
+  assert.equal(emptyVm.picks[0].ws.name, 'default');
+
+  // 2. Typing "dot" reveals matching idle disk repo for lazy load + New workspace in .dotfiles…
+  assert.deepEqual(matchingIdleDiskRepos(m, 'dot').map((r) => r.name), ['.dotfiles']);
+  const dotVm = project({ model: m, query: 'dot', spaces, panes, settings });
+  assert.ok(dotVm.items.some((it) => it.kind === 'header' && it.repo.name === '.dotfiles'));
+  assert.equal(dotVm.picks[0].kind, 'create');
+  assert.equal(dotVm.picks[0].name, '');
+  assert.equal(dotVm.picks[0].repo.name, '.dotfiles');
+  assert.equal(dotVm.primary.action, 'scope');
+
+  // 3. Unconditional `/` rule while unscoped:
+  //    - bare `/` locks the highlighted row's repo (`randori` on empty, or `streams` if arrowed there)
+  //    - `strea` selects `+ New workspace in streams…` FIRST, and `strea/` locks `streams`
+  //    - pasted `/feat/auth` locks `randori` with rest `"feat/auth"`
+  //    - pasted `streams/fix` locks `streams` with rest `"fix"`
+  const streaVm = project({ model: m, query: 'strea', spaces, panes, settings });
+  assert.equal(streaVm.picks[0].kind, 'create');
+  assert.equal(streaVm.picks[0].name, '');
+  assert.equal(streaVm.picks[0].repo.name, 'streams');
+  assert.equal(streaVm.picks[1].kind, 'ws');
+  assert.equal(streaVm.picks[1].ws.name, 'default');
+
+  const allRepos = sortedRepos(m);
+  const randori = allRepos.find((r) => r.name === 'randori');
+  const streams = allRepos.find((r) => r.name === 'streams');
+  assert.deepEqual(
+    resolveSlashChip('', '/', emptyVm.current, randori, allRepos),
+    { repo: randori, rest: '' },
+  );
+  assert.deepEqual(
+    resolveSlashChip('', '/', { repo: streams }, randori, allRepos),
+    { repo: streams, rest: '' },
+  );
+  assert.deepEqual(
+    resolveSlashChip('strea', 'strea/', streaVm.picks[0], randori, allRepos),
+    { repo: streams, rest: '' },
+  );
+  assert.deepEqual(
+    resolveSlashChip('', '/feat/auth', emptyVm.current, randori, allRepos),
+    { repo: randori, rest: 'feat/auth' },
+  );
+  assert.deepEqual(
+    resolveSlashChip('', 'streams/fix', emptyVm.current, randori, allRepos),
+    { repo: streams, rest: 'fix' },
+  );
+  // Arrowing to the 2nd duplicate repo before typing `/` locks THAT repo unambiguously.
+  const dup = [
+    { name: 'api', on: null },
+    { name: 'api', on: 'retriever' },
   ];
-  const rows = buildItems({ repos, text: '', loadingBg: true });
-  assert.ok(rows.some(r => r.kind === 'repo-loading' && r.repo.name === 'a'));
-  assert.ok(rows.some(r => r.kind === 'repo-error' && r.repo.name === 'b'));
-  const picks = rows.filter(r => r.kind === 'ws' || r.kind === 'create');
-  assert.equal(initialIndex(picks, { focusKey: '\0/r/c', focusRoot: '/r/c' }), 1); // lands on w1 (other workspace)
-  assert.equal(resolveSelection(picks, { selectedKey: picks[2].key, text: '', focusKey: '\0/r/c', focusRoot: '/r/c' }), 2);
-  assert.deepEqual(parseProps({ space: 's1', folder: '/r/a', overlay: 'o2', argv: ['zsh'] }), {
-    overlay: 'o2', spaceId: 's1', folder: '/r/a', machine: null, argv: ['zsh'],
+  assert.equal(resolveSlashChip('ap', 'ap/', { repo: dup[1] }, dup[0], dup)?.repo.on, 'retriever');
+
+  // 4. Cross-repo workspace search: typing "cli-by" finds streams/cli-by-entity directly.
+  const crossVm = project({ model: m, query: 'cli-by', spaces, panes, settings });
+  assert.equal(crossVm.picks[0].kind, 'ws');
+  assert.equal(crossVm.picks[0].repo.name, 'streams');
+  assert.equal(crossVm.picks[0].ws.name, 'cli-by-entity');
+
+  // 5. Scoped Repo Chip mode: filters only streams, and literal slashes work cleanly inside a chip.
+  const scopedVm = project({
+    model: m,
+    query: 'feat/auth',
+    scopedRepoKey: locKey(null, '/code/streams'),
+    spaces,
+    panes,
+    settings,
+  });
+  assert.equal(scopedVm.scopedRepo.name, 'streams');
+  assert.equal(scopedVm.picks.length, 1);
+  assert.equal(scopedVm.picks[0].kind, 'create');
+  assert.equal(scopedVm.picks[0].repo.name, 'streams');
+  assert.equal(scopedVm.picks[0].name, 'feat/auth');
+});
+
+test('project() falls back to showing disk repos on empty query when no open-space repos exist', () => {
+  const settings = parseSettings({});
+  let m = emptyModel();
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/home/u/.dotfiles', source: 'disk', mtime: 100 });
+  m = reduce(m, { type: 'TargetLoaded' });
+
+  const vm = project({ model: m, query: '', spaces: [], panes: [], settings });
+  assert.ok(!vm.items.some((it) => it.kind === 'disk-hint'));
+  assert.ok(vm.items.some((it) => it.kind === 'header' && it.repo.name === '.dotfiles'));
+  assert.equal(vm.picks[0].kind, 'create');
+  assert.equal(vm.picks[0].name, '');
+  assert.equal(vm.picks[0].repo.name, '.dotfiles');
+});
+
+test('selection stability: late background discovery never hijacks implicit or pinned selection', () => {
+  const settings = parseSettings({});
+  let m = emptyModel();
+  m = reduce(m, { type: 'TargetResolved', spaceId: 's1', machine: null });
+  m = reduce(m, { type: 'RepoFound', on: null, main: '/code/randori', source: 'space', order: 0, spaceId: 's1' });
+  m = reduce(m, { type: 'FocusResolved', key: locKey(null, '/code/randori'), root: '/code/randori' });
+  m = reduce(m, {
+    type: 'RepoLoaded',
+    key: locKey(null, '/code/randori'),
+    list: [{ name: 'default', path: '/code/randori', main: true }],
+  });
+  m = reduce(m, { type: 'TargetLoaded' });
+
+  const spaces = [{ id: 's1', name: 'Randori', machine: null, folder: '/code/randori', tabs: [{ id: 't1' }] }];
+  const panes = [{ pane: 'p1', tab: 't1', terminal: 'x1', cwd: '/code/randori' }];
+
+  // User types "fix": implicit selection locks onto Create "fix" in randori.
+  const before = project({ model: m, query: 'fix', spaces, panes, settings });
+  const implicitSel = { mode: 'implicit', key: before.picks[0].key };
+  assert.equal(before.picks[0].kind, 'create');
+
+  // Background discovery arrives with a repo named "fix" AND another repo with workspace "fix"!
+  let m2 = reduce(m, { type: 'RepoFound', on: null, main: '/code/fix', source: 'other', order: 1, spaceId: 's2' });
+  m2 = reduce(m2, {
+    type: 'RepoLoaded',
+    key: locKey(null, '/code/fix'),
+    list: [
+      { name: 'default', path: '/code/fix', main: true },
+      { name: 'fix', path: '/wt/fix/fix', main: false },
+    ],
   });
 
-  // Disk-only repos stay folded behind a disk-hint while empty if space/other repos exist,
-  // appear immediately once searching, and show while empty when no space/other repos exist.
-  const diskRepo = { key: '\0/d/extra', name: 'extra', main: '/d/extra', on: null, source: 'disk', state: 'ready', list: [{ name: 'default', path: '/d/extra', main: true }], names: new Set(), error: '' };
-  const emptyWithDisk = buildItems({ repos: [repos[2], diskRepo], text: '', loadingBg: false });
-  assert.equal(emptyWithDisk.some(i => i.repo?.key === diskRepo.key), false);
-  assert.deepEqual(emptyWithDisk.find(i => i.kind === 'disk-hint'), { kind: 'disk-hint', key: 'disk-hint', count: 1 });
-  const searchedWithDisk = buildItems({ repos: [repos[2], diskRepo], text: 'ext', loadingBg: false });
-  assert.equal(searchedWithDisk.some(i => i.kind === 'header' && i.repo.key === diskRepo.key), true);
-  assert.equal(searchedWithDisk.some(i => i.kind === 'disk-hint'), false);
-  const diskOnlyEmpty = buildItems({ repos: [diskRepo], text: '', loadingBg: false });
-  assert.equal(diskOnlyEmpty.some(i => i.kind === 'header' && i.repo.key === diskRepo.key), true);
-  assert.equal(diskOnlyEmpty.some(i => i.kind === 'disk-hint'), false);
+  const after = project({ model: m2, query: 'fix', selection: implicitSel, spaces, panes, settings });
+  // Even though "fix" repo and "fix" workspace sorted above Create, current stays locked on Create!
+  assert.equal(after.current.key, implicitSel.key);
+  assert.equal(after.current.kind, 'create');
+});
+
+test('placementFor refuses tab creation when target space no longer exists', () => {
+  const item = { kind: 'create', key: 'c1', repo: { on: null, main: '/r' }, name: 'x' };
+  const p = placementFor(item, {
+    openIndex: new Map(),
+    targetSpaceExists: false,
+    targetMachine: null,
+    openIn: 'tab',
+    shift: true,
+  });
+  assert.equal(p.action, 'refuse-tab');
 });

@@ -3,117 +3,232 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, spaces, panes, knownAgents, run, openOverlay, closeOverlay, props, window, keys, shared, setShared, exec, readTextFile } from "herdr";
-import { identity } from "./jj.js";
+import {
+  theme,
+  spaces,
+  panes,
+  focused,
+  knownAgents,
+  run,
+  openOverlay,
+  closeOverlay,
+  props,
+  window,
+  keys,
+  shared,
+  setShared,
+  exec,
+  readTextFile,
+  checking,
+} from "herdr";
+import { identity, spaceFolders, focusFolder } from "./jj.js";
 
 // The last agents each machine reported, shown at once while knownAgents() checks again.
 const KNOWN = "new-menu.agents";
 
-// Unique folders in a space: pane folders in tab order, then space.folder.
-function folders(s, all = panes()) {
-  if (!s) return [];
-  const out = [];
-  const seen = new Set();
-  const add = (dir) => { if (dir && !seen.has(dir)) { seen.add(dir); out.push(dir); } };
-  for (const c of s.tabs ?? []) {
-    for (const p of all) if (p.tab === c.id && p.cwd) add(p.cwd);
-  }
-  add(s.folder);
-  return out;
-}
-
 function shortcut(name) {
-  const k = keys().find(b => b.section === "global" && b.action === name);
+  const k = keys().find((b) => b.section === "global" && b.action === name);
   if (!k?.keys.trim()) return "";
   const mac = window()?.platform === "macos";
   const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
   const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
-  return k.keys.trim().split(/\s+/).map(stroke => {
-    const parts = stroke.split("-");
-    let key = parts.pop();
-    if (key === "") { key = "-"; parts.pop(); }
-    const held = new Set(parts.map(m => alias[m.toLowerCase()] ?? m.toLowerCase()));
-    if (/^[A-Z]$/.test(key)) held.add("shift");
-    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
-    return [...Object.keys(names).filter(m => held.has(m)).map(m => names[m]), label].join(mac ? "" : "+");
-  }).join(" ");
+  return k.keys
+    .trim()
+    .split(/\s+/)
+    .map((stroke) => {
+      const parts = stroke.split("-");
+      let key = parts.pop();
+      if (key === "") {
+        key = "-";
+        parts.pop();
+      }
+      const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+      if (/^[A-Z]$/.test(key)) held.add("shift");
+      const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+      return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+    })
+    .join(" ");
 }
 
 export default class NewMenu extends View {
   init(_props, cx) {
-    const space = spaces().find(s => s.active);
+    this.cfg = props() ?? {};
+    this.closed = false;
+    const space = spaces().find((s) => s.active);
     const machine = space?.machine;
     const where = machine ?? "";
     this.agents = shared(KNOWN)?.[where] ?? [];
+    this.failed = false;
     this.handle = cx.focus_handle();
     this.handle.focus();
+
     const allPanes = panes();
-    const focusedDir = allPanes.find(p => p.focused)?.cwd || null;
+    const focusedDir = space ? focusFolder(space, allPanes, focused()) : "";
     this.folder = focusedDir;
-    const dirs = [...new Set([...(focusedDir ? [focusedDir] : []), ...folders(space, allPanes)])];
+    const dirs = space ? [...new Set([...(focusedDir ? [focusedDir] : []), ...spaceFolders(space, allPanes)])] : [];
     this.checkout = dirs.length ? undefined : { jj: false };
-    if (dirs.length) cx.spawn(async cx => {
-      const results = await Promise.all(dirs.map(async dir => ({ dir, id: await identity(dir, machine, { exec, readTextFile }) })));
-      let jjDir = null;
-      let focusedErr = false;
-      for (const { dir, id } of results) {
-        if (id.error) {
-          console.log(`jj-new-menu: ${dir}: ${id.message}`);
-          if (dir === focusedDir) focusedErr = true;
+
+    if (checking()) return;
+
+    if (dirs.length) {
+      cx.spawn(async (cx) => {
+        const results = await Promise.all(
+          dirs.map(async (dir) => ({ dir, id: await identity(dir, machine, { exec, readTextFile }) })),
+        );
+        if (this.closed) return;
+        let jjDir = null;
+        let anyError = false;
+        for (const { dir, id } of results) {
+          if (id.error) {
+            anyError = true;
+            console.log(`jj-new-menu: ${dir}: ${id.message}`);
+          }
+          if (id.jj && (!jjDir || dir === focusedDir)) jjDir = dir;
         }
-        if (id.jj && (!jjDir || dir === focusedDir)) jjDir = dir;
-      }
-      if (jjDir) {
-        this.folder = jjDir;
-        this.checkout = { jj: true };
-      } else {
-        this.folder = focusedDir;
-        this.checkout = { jj: focusedErr };
-      }
-      cx.notify();
-    });
-    cx.spawn(async cx => {
+        if (jjDir) {
+          this.folder = jjDir;
+          this.checkout = { jj: true };
+        } else {
+          this.folder = focusedDir;
+          this.checkout = { jj: anyError };
+        }
+        cx.notify();
+      });
+    }
+    cx.spawn(async (cx) => {
       try {
-        this.agents = await knownAgents({ on: machine });
+        const list = await knownAgents({ on: machine });
+        if (this.closed) return;
+        this.agents = list;
         setShared(KNOWN, { ...shared(KNOWN), [where]: this.agents });
+      } catch {
+        if (this.closed) return;
+        this.failed = true;
       }
-      catch { this.failed = true; }
       cx.notify();
     });
   }
+
+  close() {
+    this.closed = true;
+  }
+
+  dismiss() {
+    if (this.closed) return;
+    if (this.cfg.overlay) closeOverlay(this.cfg.overlay);
+  }
+
   row(id, icon, name, action, hint = "", enabled = true) {
     const t = theme();
-    return h_flex().id(id).h(31).px(9).gap(10).rounded(7).items_center().flex_none()
-      .text_color(enabled ? t.foreground : t.dim).when(enabled, el => el.hover(s => s.bg(t.selected)))
-      .on_click(() => { if (enabled) { closeOverlay(props().overlay); action(); } })
-      .child(icon).child(div().flex_1().child(name)).child(div().text_size(11).text_color(t.dim).child(hint));
+    return h_flex()
+      .id(id)
+      .h(31)
+      .px(9)
+      .gap(10)
+      .rounded(7)
+      .items_center()
+      .flex_none()
+      .text_color(enabled ? t.foreground : t.dim)
+      .when(enabled, (el) => el.hover((s) => s.bg(t.selected)))
+      .on_click(() => {
+        if (enabled) {
+          this.dismiss();
+          action();
+        }
+      })
+      .child(icon)
+      .child(div().flex_1().child(name))
+      .child(div().text_size(11).text_color(t.dim).child(hint));
   }
+
   render() {
     const t = theme();
-    const space = spaces().find(s => s.active);
-    const installed = this.agents.filter(a => a.installed);
-    const choices = this.failed ? installed : [...installed, ...this.agents.filter(a => !a.installed).slice(0, 2)];
-    const known = this.checkout !== undefined, jj = Boolean(this.checkout?.jj);
-    return v_flex().min_h(0).w_full().h(Math.min(491, (jj ? 136 : 167) + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
-      .id("new-menu").track_focus(this.handle)
+    const space = spaces().find((s) => s.active);
+    const installed = this.agents.filter((a) => a.installed);
+    const choices = this.failed ? installed : [...installed, ...this.agents.filter((a) => !a.installed).slice(0, 2)];
+    const known = this.checkout !== undefined;
+    const jj = Boolean(this.checkout?.jj);
+    return v_flex()
+      .min_h(0)
+      .w_full()
+      .h(Math.min(491, (jj ? 136 : 167) + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31))
+      .bg(t.popover)
+      .p(5)
+      .text_size(12.8)
+      .id("new-menu")
+      .track_focus(this.handle)
       .on_key_down((e) => {
         if (e.modifiers.control || e.modifiers.platform || e.modifiers.alt) return;
         const agent = /^[1-9]$/.test(e.key) ? installed[Number(e.key) - 1] : null;
         if (!agent) return;
-        closeOverlay(props().overlay);
+        this.dismiss();
         run("tab.new", { name: agent.name, space: space?.id, argv: agent.run });
       })
       .child(this.row("terminal", svg("icons/shell.svg").size(14), "Terminal", () => run("tab.new", { space: space?.id }), shortcut("tab.new")))
       .child(div().px(9).pt(8).pb(4).text_size(11).text_color(t.dim).child("Start an agent"))
-      .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar()
-        .children(choices.map((a, i) => this.row(a.key, a.tint ? svg(a.icon).size(14).text_color(t.foreground) : image(a.icon).size(14), a.name,
-          () => run("tab.new", { name: a.name, space: space?.id, argv: a.run }), a.installed ? (i < 9 ? String(i + 1) : "") : "not installed", a.installed)))
-        .when(this.failed || this.agents.length === 0, el => el.child(div().px(9).py(6).text_color(t.dim).child(this.failed ? "Could not check installed agents" : "Checking installed agents…"))))
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .overflow_y_scrollbar()
+          .children(
+            choices.map((a, i) =>
+              this.row(
+                a.key,
+                a.tint ? svg(a.icon).size(14).text_color(t.foreground) : image(a.icon).size(14),
+                a.name,
+                () => run("tab.new", { name: a.name, space: space?.id, argv: a.run }),
+                a.installed ? (i < 9 ? String(i + 1) : "") : "not installed",
+                a.installed,
+              ),
+            ),
+          )
+          .when(this.failed || this.agents.length === 0, (el) =>
+            el.child(
+              div()
+                .px(9)
+                .py(6)
+                .text_color(t.dim)
+                .child(this.failed ? "Could not check installed agents" : "Checking installed agents…"),
+            ),
+          ),
+      )
       .child(div().h(1).mx(4).my(5).bg(t.border))
       .child(this.row("space", div().w(14).child("+"), "New space", () => run("space.new"), shortcut("space.new")))
-      .when(jj, el => el.child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "jj workspace\u2026", () => openOverlay({ mod: "jj-workspace", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder } }), shortcut("mod.open:jj-workspace"), Boolean(space) && known)))
-      .when(!jj, el => el
-        .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "New worktree\u2026", () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: this.folder, action: "new" } }), "", Boolean(space) && known))
-        .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), "Open worktree\u2026", () => openOverlay({ mod: "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }), "", Boolean(space) && known)));
+      .when(jj, (el) =>
+        el.child(
+          this.row(
+            "worktree",
+            svg("mods/workspace-chrome/branch.svg").size(14),
+            "jj workspace\u2026",
+            () => openOverlay({ mod: "jj-workspace", kind: "dialog", width: 560, height: 480, props: { space: space?.id } }),
+            shortcut("mod.open:jj-workspace"),
+            Boolean(space) && known,
+          ),
+        ),
+      )
+      .when(!jj, (el) =>
+        el
+          .child(
+            this.row(
+              "worktree",
+              svg("mods/workspace-chrome/branch.svg").size(14),
+              "New worktree\u2026",
+              () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: this.folder, action: "new" } }),
+              "",
+              Boolean(space) && known,
+            ),
+          )
+          .child(
+            this.row(
+              "worktree-open",
+              svg("mods/workspace-chrome/branch.svg").size(14),
+              "Open worktree\u2026",
+              () => openOverlay({ mod: "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: this.folder, action: "open" } }),
+              "",
+              Boolean(space) && known,
+            ),
+          ),
+      );
   }
 }

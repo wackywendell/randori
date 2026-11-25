@@ -1,7 +1,8 @@
 {
   "name": "jj-finish",
-  "description": "Finish linked jj workspaces with explicit terminal confirmation",
+  "description": "Finish a linked jj workspace with explicit terminal confirmation",
   "place": "none",
   "title": "Finish jj workspace",
+  "overlay": { "kind": "window", "width": 520, "height": 360 },
   "version": "1.0.0"
 }

@@ -1,586 +1,772 @@
-// Pure functional core for jj-workspace: path/slug/template helpers, disk scan
-// script and strict parser, repo dedup/promotion/ordering, query parsing,
-// filter-first list construction, selection resolution, ghost/slash completion,
-// and tagged placement decisions. Zero Herdr/GPUI globals.
+// Pure state model, reducer, projection, disk-scan parser, and creation planner
+// for `jj-workspace`. Zero Herdr runtime imports; no input mutation.
 
-import { joinPath } from "./jj.js";
+import {
+  joinPath,
+  machineOf,
+  sameMachine,
+  locKey,
+  base,
+  inside,
+  tilde,
+  ownerRoot,
+  tabOrderedPanes,
+} from "./jj.js";
 
-export const DEFAULTS = {
-  directory: "~/.herdr/worktrees/{repo}/{name}",
-  links: [],
-  miseTrust: true,
-  repos: [],
-  openIn: "space",
+export {
+  joinPath,
+  machineOf,
+  sameMachine,
+  locKey,
+  base,
+  inside,
+  tilde,
+  ownerRoot,
+  tabOrderedPanes,
 };
 
-export const SOURCE_RANK = { space: 0, other: 1, disk: 2 };
+export const DEFAULT_DIRECTORY = "~/.herdr/worktrees/{repo}/{name}";
+const SOURCE_RANK = { space: 0, other: 1, disk: 2 };
 
-export function base(path) {
-  if (!path) return "";
-  return path.replace(/\/+$/, "").split("/").pop() || "";
+// Parse jj-spaces layout props once at the boundary into a typed settings object.
+export function parseSettings(raw) {
+  const obj = raw && typeof raw === "object" ? raw : {};
+  return {
+    openIn: obj.openIn === "tab" ? "tab" : "space",
+    links: Array.isArray(obj.links) ? obj.links.filter((x) => typeof x === "string") : [],
+    miseTrust: obj.miseTrust !== false,
+    repos: Array.isArray(obj.repos) ? obj.repos.filter((x) => typeof x === "string" && x.trim()) : [],
+    directory: typeof obj.directory === "string" && obj.directory.trim() ? obj.directory.trim() : DEFAULT_DIRECTORY,
+  };
 }
 
-export function tilde(path, userHome) {
-  if (!path) return "";
-  const h = (userHome ?? "").replace(/\/+$/, "");
-  if (!h) return path;
-  if (path === h) return "~";
-  if (path.startsWith(`${h}/`)) return `~${path.slice(h.length)}`;
-  return path;
+export function untilde(p, userHome) {
+  if (!p) return "";
+  if (!userHome) return p;
+  if (p === "~") return userHome;
+  return p.startsWith("~/") ? `${userHome}${p.slice(1)}` : p;
 }
 
-export function untilde(path, userHome) {
-  if (!path) return "";
-  const h = (userHome ?? "").replace(/\/+$/, "");
-  if (!h) return path;
-  if (path === "~") return h;
-  if (path.startsWith("~/")) return `${h}${path.slice(1)}`;
-  return path;
-}
-
-export function inside(dir, root) {
-  if (!dir || !root) return false;
-  const r = root.replace(/\/+$/, "");
-  return dir === r || dir.startsWith(`${r}/`);
-}
-
-// First alphanumeric character (uppercased) for the repository avatar chip.
-export function repoInitial(name) {
-  const m = String(name ?? "").match(/[A-Za-z0-9]/);
-  return (m ? m[0] : "?").toUpperCase();
-}
-
-// Safe directory slug for a workspace name. If every character is stripped
-// (e.g. "!!!", ".."), fall back to a deterministic hash so the path is never empty.
 export function slug(name) {
-  const raw = String(name ?? "");
-  const clean = raw
-    .replace(/[^a-zA-Z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (clean && clean !== "." && clean !== "..") return clean;
-  if (!raw.trim()) return "";
-  let h = 2166136261;
-  for (let i = 0; i < raw.length; i++) {
-    h ^= raw.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return `ws-${h.toString(16).padStart(6, "0").slice(0, 6)}`;
+  return String(name ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "workspace";
 }
 
-// Single pure path-template resolver shared by row previews and workspace creation.
-export function resolveWorktreePath({ template, repoMain, repoName, wsName, home, rawName = false }) {
-  const tpl = template || DEFAULTS.directory;
-  const raw = tpl
-    .replaceAll("{repo}", repoName || base(repoMain))
-    .replaceAll("{name}", rawName ? wsName : slug(wsName));
-  const expanded = untilde(raw, home);
-  const unresolvedTilde = expanded === "~" || expanded.startsWith("~/");
-  if (unresolvedTilde) return { path: expanded, unresolvedTilde: true };
-  const path = expanded.startsWith("/") ? joinPath("/", expanded) : joinPath(repoMain, expanded);
-  return { path, unresolvedTilde: false };
-}
-
-// Validate a relative `links` entry: reject empty, absolute, tilde, or `..` traversal.
-export function validateLink(rel) {
-  if (typeof rel !== "string") return false;
-  const s = rel.trim();
-  if (!s || s.startsWith("/") || s.startsWith("~")) return false;
-  const parts = s.split("/");
-  return parts.every((p) => p !== "" && p !== "." && p !== "..");
-}
-
-// A linked file is trusted with `mise trust` if its basename is a mise config.
-export function miseFile(rel) {
-  const n = rel.split("/").pop() ?? "";
-  return /^(?:mise(?:\.[^/]+)?\.toml|\.mise(?:\.[^/]+)?\.toml)$/.test(n);
-}
-
-// Tab name when opening a checkout as a tab: repo name for main checkout,
-// workspace name for linked workspaces.
-export function tabLabel(repo, wsName, isMain = false) {
-  return isMain || wsName === "default" ? repo.name : wsName;
-}
-
-export function repoKey(on, main) {
-  return `${on ?? ""}\0${main}`;
-}
-
-export function probeKey(on, dir) {
-  return `${on ?? ""}\0${dir}`;
-}
-
-// Prefix row keys by kind so a workspace literally named `+new` cannot collide
-// with the repo's create row.
-export function rowKey(kind, rKey, wsName = "") {
-  return kind === "create" ? `create\0${rKey}` : `ws\0${rKey}\0${wsName}`;
-}
-
-// Base folder for the worktrees path template (everything before the first
-// `{...}` segment). Returns "" if the template has no usable prefix or home is missing.
 export function worktreesBase(template, userHome) {
-  const raw = untilde(template || DEFAULTS.directory, userHome);
-  if (!raw || raw.startsWith("~")) return "";
-  const idx = raw.indexOf("{");
-  const head = idx >= 0 ? raw.slice(0, idx) : raw;
-  const dir = idx >= 0 ? head.replace(/\/[^/]*$/, "") : head.replace(/\/+$/, "");
-  return dir.replace(/\/+$/, "");
+  const raw = template || DEFAULT_DIRECTORY;
+  const cut = raw.indexOf("{");
+  const prefix = (cut >= 0 ? raw.slice(0, cut) : raw).replace(/\/+$/, "");
+  return untilde(prefix, userHome);
 }
 
-// POSIX shell scan of worktrees base (depth 2: <base>/<repo>/<ws>) and
-// configured `repos` patterns. Every pattern in `repos` is expanded strictly
-// (exact paths like `~/.dotfiles` match only that path; `*` / `*/*` globs expand
-// via POSIX pathname expansion with `IFS=""` to preserve spaces in paths).
-//
-// Emits strictly 3 tab-separated fields per jj checkout: `<mtime>\t<dir>\t<ptr>`
-// where `<ptr>` is `.jj/repo` content for linked workspaces (empty for mains).
-//
-// Portability: tries GNU `stat -c %Y` BEFORE BSD `stat -f %m`. On GNU
-// coreutils, `stat -f %m` prints a 5-line filesystem status report to stdout
-// before exiting non-zero, whereas BSD `stat -c` outputs nothing on stderr/stdout
-// when `-c` is unsupported and cleanly falls through to `stat -f %m`.
+export function resolveWorktreePath(template, repoMain, name, userHome) {
+  const raw = (template || DEFAULT_DIRECTORY)
+    .replaceAll("{repo}", base(repoMain))
+    .replaceAll("{name}", slug(name));
+  const expanded = untilde(raw, userHome);
+  return expanded.startsWith("/") ? joinPath("/", expanded) : joinPath(repoMain, expanded);
+}
+
+export function miseFile(rel) {
+  const b = base(rel);
+  return b === "mise.toml" || b === ".mise.toml" || b === "mise.local.toml" || b === ".mise.local.toml";
+}
+
+// Parse and normalize a configured link path. Returns `{ rel, isMise }` or null if invalid.
+export function normalizeLink(raw) {
+  if (typeof raw !== "string") return null;
+  const rel = raw.trim();
+  if (!rel || rel.startsWith("/") || rel.endsWith("/")) return null;
+  const parts = rel.split("/");
+  if (parts.some((p) => !p || p === "." || p === "..")) return null;
+  return { rel, isMise: miseFile(rel) };
+}
+
+// Pure plan for creating a new workspace, its symlinks, and optional mise trust.
+export function planCreate({ repo, name, settings, home }) {
+  const trimmed = String(name ?? "").trim();
+  const dest = resolveWorktreePath(settings.directory, repo.main, trimmed, home);
+  const parent = joinPath(dest, "..");
+  const seen = new Set();
+  const links = [];
+  for (const raw of settings.links ?? []) {
+    const parsed = normalizeLink(raw);
+    if (!parsed || seen.has(parsed.rel)) continue;
+    seen.add(parsed.rel);
+    links.push({
+      rel: parsed.rel,
+      src: joinPath(repo.main, parsed.rel),
+      dst: joinPath(dest, parsed.rel),
+      isMise: parsed.isMise,
+    });
+  }
+  return {
+    name: trimmed,
+    dest,
+    parent,
+    links,
+    miseTrust: Boolean(settings.miseTrust),
+  };
+}
+
+// Build a single POSIX `sh -c` invocation for all links + optional `mise trust`.
+// Expected skips (missing source in main, or already present in dest) succeed
+// silently; real mkdir/ln/mise failures exit non-zero with a clear message.
+export function buildLinkScript(plan) {
+  const args = [plan.dest, plan.miseTrust ? "1" : "0"];
+  for (const l of plan.links) {
+    args.push(l.src, l.dst, l.isMise ? "1" : "0");
+  }
+  const script = `
+dest="$1"; shift
+want_mise="$1"; shift
+linked_mise=0
+while [ "$#" -ge 3 ]; do
+  src="$1"; dst="$2"; is_mise="$3"; shift 3
+  if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+    continue
+  fi
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    continue
+  fi
+  parent=$(dirname "$dst")
+  mkdir -p "$parent" || exit 1
+  ln -s "$src" "$dst" || exit 1
+  if [ "$is_mise" = "1" ]; then linked_mise=1; fi
+done
+if [ "$want_mise" = "1" ]; then
+  if [ "$linked_mise" = "1" ] || [ -e "$dest/mise.toml" ] || [ -e "$dest/.mise.toml" ] || [ -e "$dest/mise.local.toml" ] || [ -e "$dest/.mise.local.toml" ]; then
+    if command -v mise >/dev/null 2>&1; then
+      (cd "$dest" && mise trust) || exit 1
+    fi
+  fi
+fi
+exit 0
+`;
+  return { script, args };
+}
+
+// Shell script to discover jj repositories on a machine from configured glob
+// patterns + worktrees base (depth 1 and depth 2). Output lines:
+//   <checkoutPath>\t<repoPointerOrEmpty>\t<mtimeUnixSec>
 export const DISK_SCAN = `
+base="$1"; shift
+mtime_of() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf 0
+}
 emit() {
   d="$1"
-  [ -d "$d/.jj" ] || return
-  h="$d/.jj/repo/op_heads/heads"
-  [ -e "$h" ] || h="$d/.jj"
-  m=$(stat -c %Y "$h" 2>/dev/null || stat -f %m "$h" 2>/dev/null || echo 0)
+  [ -d "$d/.jj" ] || return 0
   p=""
-  [ -f "$d/.jj/repo" ] && IFS= read -r p < "$d/.jj/repo" 2>/dev/null
-  printf '%s\\t%s\\t%s\\n' "$m" "$d" "$p"
+  target="$d/.jj/repo/op_heads/heads"
+  if [ -f "$d/.jj/repo" ]; then
+    p=$(cat "$d/.jj/repo" 2>/dev/null | tr -d '\\r\\n')
+    case "$p" in
+      /*) rp="$p" ;;
+      *) rp="$d/.jj/$p" ;;
+    esac
+    target="$rp/op_heads/heads"
+  fi
+  [ -e "$target" ] || target="$d/.jj"
+  m=$(mtime_of "$target")
+  printf '%s\\t%s\\t%s\\n' "$d" "$p" "$m"
 }
-base="$1"
-shift
-if [ -n "$base" ] && [ -d "$base" ]; then
-  for r in "$base"/*; do
-    [ -d "$r" ] || continue
-    for w in "$r"/*; do
-      [ -d "$w" ] || continue
-      emit "$w"
-    done
-  done
-fi
-IFS=""
 for pat in "$@"; do
   case "$pat" in
-    "~") pat="$HOME" ;;
-    "~/"*) pat="$HOME/\${pat#~/}" ;;
+    *~*)
+      case "$pat" in
+        "~") pat="$HOME" ;;
+        "~/"*) pat="$HOME/\${pat#~/}" ;;
+      esac
+      ;;
   esac
-  while [ "\${pat%/}" != "$pat" ] && [ "$pat" != "/" ]; do pat="\${pat%/}"; done
-  [ -n "$pat" ] || continue
   case "$pat" in
-    *'*'*|*'?'*|*'['*)
+    *\\**|*\\?*|*\\[*)
       for d in $pat; do
-        [ -d "$d" ] && emit "$d"
+        [ -d "$d/.jj" ] && emit "$d"
       done
       ;;
     *)
-      [ -d "$pat" ] && emit "$pat"
+      [ -d "$pat/.jj" ] && emit "$pat"
       ;;
   esac
 done
+if [ -n "$base" ] && [ -d "$base" ]; then
+  for r in "$base"/*; do
+    [ -d "$r" ] || continue
+    if [ -d "$r/.jj" ]; then
+      emit "$r"
+      continue
+    fi
+    for w in "$r"/*; do
+      [ -d "$w/.jj" ] && emit "$w"
+    done
+  done
+fi
 exit 0
 `;
 
-// Parse DISK_SCAN stdout strictly: require 3 tab-separated fields with numeric
-// mtime and non-empty dir. Stray stdout lines are dropped rather than treated
-// as paths. Returns Map<dir, { mtime, ptr }>.
 export function parseDiskScan(stdout) {
-  const byDir = new Map();
+  const out = [];
   for (const line of String(stdout ?? "").split("\n")) {
     if (!line) continue;
     const parts = line.split("\t");
     if (parts.length !== 3) continue;
-    const mtime = Number(parts[0]);
-    const dir = parts[1];
-    const ptr = parts[2].trim();
-    if (!Number.isFinite(mtime) || !dir) continue;
-    const prev = byDir.get(dir);
-    if (!prev || mtime > prev.mtime) byDir.set(dir, { mtime, ptr });
+    const [dir, pointer, rawMtime] = parts;
+    if (!dir) continue;
+    const mtime = Number(rawMtime) || 0;
+    out.push({ dir, pointer: pointer || "", mtime });
   }
-  return byDir;
-}
-
-// Collapse scanned checkouts into deduplicated main-checkout candidates with
-// max mtime across linked worktrees, filtering out repos already known on `machine`.
-export function resolveDiskCandidates(byDir, existingRepos, machine) {
-  const known = new Set(existingRepos.filter((r) => (r.on ?? null) === (machine ?? null)).map((r) => r.main));
-  const candidates = new Map();
-  for (const [dir, { mtime, ptr }] of byDir) {
-    const main = ptr ? joinPath(joinPath(`${dir}/.jj`, ptr), "../..") : dir;
-    if (known.has(main)) continue;
-    const prev = candidates.get(main);
-    if (prev === undefined || mtime > prev) candidates.set(main, mtime);
-  }
-  return candidates;
-}
-
-// Parse picker overlay props once synchronously in init().
-export function parseProps(raw) {
-  const p = raw ?? {};
-  return {
-    overlay: p.overlay,
-    spaceId: p.space ?? null,
-    folder: p.folder ?? null,
-    machine: p.machine ?? null,
-    argv: p.argv,
-  };
-}
-
-// Where a space is now: its first terminal's live folder, else its launch folder.
-export function place(space, allPanes) {
-  if (!space) return null;
-  const tabs = new Set((space.tabs ?? []).map((c) => c.id));
-  return allPanes.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || space.folder || null;
-}
-
-// Unique folders in a space: pane folders in tab order, then space.folder.
-export function folders(space, allPanes) {
-  if (!space) return [];
-  const out = [];
-  const seen = new Set();
-  const add = (dir) => {
-    if (dir && !seen.has(dir)) {
-      seen.add(dir);
-      out.push(dir);
-    }
-  };
-  for (const c of space.tabs ?? []) {
-    for (const p of allPanes) if (p.tab === c.id && p.cwd) add(p.cwd);
-  }
-  add(space.folder);
   return out;
 }
 
-// Locate an already-open space/tab for `(repoOn, path)`:
-// prefers a dedicated space whose first terminal is inside `path`, carrying the
-// matching tab so switching selects that tab if another tab is currently active;
-// otherwise finds any space/tab containing a terminal inside `path`.
-export function whereOpen(allSpaces, allPanes, repoOn, path) {
-  if (!path) return null;
-  const on = repoOn ?? null;
-  let secondary = null;
-  for (const s of allSpaces) {
-    if ((s.machine ?? null) !== on) continue;
-    const tabs = s.tabs ?? [];
-    const tabById = new Map(tabs.map((c) => [c.id, c]));
-    const firstTerm = allPanes.find((p) => tabById.has(p.tab) && p.cwd);
-    const firstDir = firstTerm?.cwd || s.folder;
-    if (firstDir && inside(firstDir, path)) {
-      const matchedTab = firstTerm ? tabById.get(firstTerm.tab) ?? null : null;
-      return { space: s, tab: matchedTab, dedicated: true };
-    }
-    if (!secondary) {
-      for (const c of tabs) {
-        if (allPanes.some((p) => p.tab === c.id && p.cwd && inside(p.cwd, path))) {
-          secondary = { space: s, tab: c, dedicated: false };
-          break;
-        }
-      }
+// Collapse scanned checkouts (including linked worktrees pointing back to their
+// main checkout) into deduplicated `{ main, mtime }` records.
+export function resolveDiskCandidates(entries) {
+  const byMain = new Map();
+  for (const e of entries ?? []) {
+    const main = e.pointer ? joinPath(joinPath(`${e.dir}/.jj`, e.pointer), "../..") : e.dir;
+    const prev = byMain.get(main);
+    if (!prev || e.mtime > prev.mtime) {
+      byMain.set(main, { main, mtime: e.mtime });
     }
   }
-  return secondary;
+  return [...byMain.values()];
 }
 
-// Single owner for inserting/deduplicating repos. Promotes an existing entry
-// when a higher-priority source settles later (e.g., `disk` -> `other` -> `space`)
-// and updates both `order` and `spaceId` deterministically when an earlier-sidebar
-// `other` space resolves after a later one.
-export function upsertRepo(repos, candidate) {
-  const key = repoKey(candidate.on, candidate.main);
-  const existing = repos.find((r) => r.key === key);
-  if (existing) {
-    if (SOURCE_RANK[candidate.source] < SOURCE_RANK[existing.source]) {
-      existing.source = candidate.source;
-      if (candidate.spaceId !== undefined) existing.spaceId = candidate.spaceId;
-      if (candidate.order !== undefined) existing.order = candidate.order;
-    } else if (
-      candidate.source === existing.source &&
-      candidate.order !== undefined &&
-      candidate.order < existing.order
-    ) {
-      existing.order = candidate.order;
-      if (candidate.spaceId !== undefined) existing.spaceId = candidate.spaceId;
-    }
-    if (candidate.mtime !== undefined && candidate.mtime > existing.mtime) {
-      existing.mtime = candidate.mtime;
-    }
-    return { repo: existing, added: false };
-  }
-  const repo = {
-    key,
-    name: base(candidate.main),
-    main: candidate.main,
-    checkout: candidate.checkout ?? candidate.main,
-    on: candidate.on ?? null,
-    source: candidate.source,
-    spaceId: candidate.spaceId ?? null,
-    order: candidate.order ?? Number.MAX_SAFE_INTEGER,
-    mtime: candidate.mtime ?? 0,
-    state: "loading", // "loading" | "ready" | "error"
-    list: [],
-    names: new Set(),
-    error: "",
+// ---------------- Immutable Model & Reducer ----------------
+
+export function emptyModel() {
+  return {
+    targetSpaceId: null,
+    targetMachine: null,
+    targetLoaded: false,
+    focusKey: null,
+    focusRoot: null,
+    repos: new Map(),
+    homes: new Map(),
+    bgLoading: false,
+    spaceError: null,
   };
-  repos.push(repo);
-  return { repo, added: true };
 }
 
-// Deterministic repo ordering:
-// 1. Source section: current space (0) -> other spaces (1) -> disk repos (2)
-// 2. Within current space: focused repo first, then tab order
-// 3. Within other spaces: current machine first, then sidebar order
-// 4. Within disk repos: current machine first, then newest mtime, then alphabetical
-export function sortRepos(repos, { focusKey, curMachine }) {
-  const cur = curMachine ?? null;
-  repos.sort((a, b) => {
-    const sr = SOURCE_RANK[a.source] - SOURCE_RANK[b.source];
-    if (sr !== 0) return sr;
+export function reduce(model, ev) {
+  switch (ev.type) {
+    case "TargetResolved":
+      return {
+        ...model,
+        targetSpaceId: ev.spaceId ?? null,
+        targetMachine: machineOf(ev.machine),
+        spaceError: ev.spaceError ?? model.spaceError,
+      };
+    case "TargetLoaded":
+      return { ...model, targetLoaded: true };
+    case "FocusResolved":
+      return { ...model, focusKey: ev.key ?? null, focusRoot: ev.root ?? null };
+    case "SpaceError":
+      return { ...model, spaceError: ev.message || null };
+    case "HomeKnown": {
+      const mKey = machineOf(ev.on) ?? "";
+      if (model.homes.get(mKey) === ev.home) return model;
+      const homes = new Map(model.homes);
+      homes.set(mKey, ev.home || "");
+      return { ...model, homes };
+    }
+    case "BgStarted":
+      return model.bgLoading ? model : { ...model, bgLoading: true };
+    case "BgDone":
+      return model.bgLoading ? { ...model, bgLoading: false } : model;
+    case "RepoFound": {
+      const on = machineOf(ev.on);
+      const key = locKey(on, ev.main);
+      const repos = new Map(model.repos);
+      const prev = repos.get(key);
+      if (prev) {
+        const nextSource = SOURCE_RANK[ev.source] < SOURCE_RANK[prev.source] ? ev.source : prev.source;
+        const nextOrder =
+          ev.source === nextSource && typeof ev.order === "number"
+            ? Math.min(prev.order, ev.order)
+            : nextSource === ev.source && typeof ev.order === "number"
+              ? ev.order
+              : prev.order;
+        const nextSpaceId = ev.spaceId && (!prev.spaceId || SOURCE_RANK[ev.source] < SOURCE_RANK[prev.source])
+          ? ev.spaceId
+          : prev.spaceId;
+        const nextMtime = Math.max(prev.mtime || 0, ev.mtime || 0);
+        repos.set(key, {
+          ...prev,
+          source: nextSource,
+          order: nextOrder,
+          spaceId: nextSpaceId,
+          mtime: nextMtime,
+        });
+      } else {
+        repos.set(key, {
+          key,
+          on,
+          main: ev.main,
+          name: base(ev.main),
+          source: ev.source,
+          order: typeof ev.order === "number" ? ev.order : Number.MAX_SAFE_INTEGER,
+          spaceId: ev.spaceId ?? null,
+          mtime: ev.mtime || 0,
+          // Open-space repos load workspaces immediately; disk repos load lazily when searched or scoped.
+          load: ev.source === "disk" ? { state: "idle" } : { state: "loading" },
+        });
+      }
+      return { ...model, repos };
+    }
+    case "RepoLoading": {
+      const prev = model.repos.get(ev.key);
+      if (!prev || prev.load.state === "loading") return model;
+      const repos = new Map(model.repos);
+      repos.set(ev.key, { ...prev, load: { state: "loading" } });
+      return { ...model, repos };
+    }
+    case "RepoLoaded": {
+      const prev = model.repos.get(ev.key);
+      if (!prev) return model;
+      const repos = new Map(model.repos);
+      repos.set(ev.key, { ...prev, load: { state: "ready", list: ev.list } });
+      return { ...model, repos };
+    }
+    case "RepoFailed": {
+      const prev = model.repos.get(ev.key);
+      if (!prev) return model;
+      const repos = new Map(model.repos);
+      repos.set(ev.key, { ...prev, load: { state: "error", message: ev.message || "Could not list workspaces" } });
+      return { ...model, repos };
+    }
+    default:
+      return model;
+  }
+}
+
+export function sortedRepos(model) {
+  const m = model.targetMachine;
+  const focusKey = model.focusKey;
+  return [...model.repos.values()].sort((a, b) => {
+    const sa = SOURCE_RANK[a.source] ?? 9;
+    const sb = SOURCE_RANK[b.source] ?? 9;
+    if (sa !== sb) return sa - sb;
     if (a.source === "space") {
       if (a.key === focusKey && b.key !== focusKey) return -1;
       if (b.key === focusKey && a.key !== focusKey) return 1;
-      return a.order - b.order;
+      return a.order - b.order || a.name.localeCompare(b.name);
     }
-    const am = (a.on ?? null) === cur ? 0 : 1;
-    const bm = (b.on ?? null) === cur ? 0 : 1;
-    if (am !== bm) return am - bm;
-    if (a.source === "other") return a.order - b.order;
-    if (b.mtime !== a.mtime) return b.mtime - a.mtime;
-    return a.name.localeCompare(b.name);
+    const ma = sameMachine(a.on, m) ? 0 : 1;
+    const mb = sameMachine(b.on, m) ? 0 : 1;
+    if (ma !== mb) return ma - mb;
+    if (a.source === "other") {
+      return a.order - b.order || a.name.localeCompare(b.name);
+    }
+    return (b.mtime || 0) - (a.mtime || 0) || a.name.localeCompare(b.name);
   });
 }
 
-// Parse query text into empty, repo-scoped (`repo/name`), or unscoped filter.
-// Only treats `repo/` as scoped when `repo` matches a loaded repo name
-// (case-insensitive), keeping git-style names like `feat/auth` literal.
-export function parseQuery(text, repos) {
-  const raw = String(text ?? "").trim();
-  if (!raw) return { mode: "empty", q: "", name: "", scoped: null };
-  const slash = raw.indexOf("/");
-  if (slash > 0) {
-    const rp = raw.slice(0, slash).trim().toLowerCase();
-    const np = raw.slice(slash + 1).trim();
-    const matched = repos.filter((r) => r.name.toLowerCase() === rp);
-    if (matched.length) {
-      return {
-        mode: "scoped",
-        q: np.toLowerCase(),
-        name: np,
-        scoped: new Set(matched.map((r) => r.key)),
-      };
-    }
+// Unconditional `/` rule while unscoped:
+// - Typing `/` (bare `/` on empty input, or trailing `/` after any prefix such
+//   as `strea/`) locks `prevCurrent.repo` (or `focusedRepo`) into a Repo Chip
+//   and clears the input.
+// - Pasting `/rest` locks `prevCurrent.repo ?? focusedRepo` with `rest`.
+// - Pasting `repo/rest` locks an exact unambiguous `repo` with `rest`.
+// Once a Repo Chip is active, this is not called and `/` is a literal character.
+export function resolveSlashChip(prevQuery, nextQuery, prevCurrent, focusedRepo, repos) {
+  if (typeof nextQuery !== "string") return null;
+  const slash = nextQuery.indexOf("/");
+  if (slash < 0) return null;
+
+  const fallback = prevCurrent?.repo ?? focusedRepo ?? null;
+  const typedTrailingSlash =
+    typeof prevQuery === "string" &&
+    nextQuery.length === prevQuery.length + 1 &&
+    nextQuery.endsWith("/") &&
+    nextQuery.startsWith(prevQuery);
+
+  if (typedTrailingSlash) {
+    return fallback ? { repo: fallback, rest: "" } : null;
   }
-  return { mode: "filter", q: raw.toLowerCase(), name: raw, scoped: null };
+
+  const left = nextQuery.slice(0, slash).trim().toLowerCase();
+  const rest = nextQuery.slice(slash + 1);
+  if (!left) {
+    return fallback ? { repo: fallback, rest } : null;
+  }
+  const exact = [];
+  for (const r of repos ?? []) {
+    if (r.name.toLowerCase() === left) exact.push(r);
+  }
+  if (exact.length === 1) return { repo: exact[0], rest };
+  return fallback ? { repo: fallback, rest } : null;
 }
 
-// Decide whether typing `/` after `prevText` should auto-complete to `<repo>/`.
-// Skips completion if `rp` already exact-matches ANY loaded repo name (so
-// typing `randori/` is never hijacked by `randori-docs/`).
-export function shouldAutoCompleteSlash({ prevText, nextText, prevCurrent, repos }) {
-  if (!nextText.endsWith("/") || nextText.length !== prevText.length + 1) return null;
-  if (prevText.includes("/")) return null;
-  const rp = prevText.trim().toLowerCase();
-  if (!rp || !prevCurrent?.repo) return null;
-  if (repos.some((r) => r.name.toLowerCase() === rp)) return null;
-  if (!prevCurrent.repo.name.toLowerCase().includes(rp)) return null;
-  return prevCurrent.repo;
-}
-
-// Build flat render items (dividers, headers, loading/error lines, workspaces,
-// and inline create rows) for the unified filter-first list.
-export function buildItems({ repos, text, loadingBg }) {
-  const pq = parseQuery(text, repos);
+// Idle disk repositories matching the current search query (to load lazily).
+export function matchingIdleDiskRepos(model, query) {
+  const q = String(query ?? "").trim().toLowerCase();
+  if (!q) return [];
   const out = [];
-
-  const pushSection = (target, section, r, matches, createName, showCreate, createFirst = false) => {
-    const createEntry = showCreate ? { kind: "create", key: rowKey("create", r.key), repo: r, name: createName } : null;
-    target.push({ kind: "header", key: `hdr\0${r.key}`, repo: r, section });
-    if (r.state === "error") {
-      target.push({ kind: "repo-error", key: `err\0${r.key}`, repo: r });
-      return;
-    }
-    if (r.state === "loading") {
-      target.push({ kind: "repo-loading", key: `load\0${r.key}`, repo: r });
-      return;
-    }
-    if (createFirst && createEntry) target.push(createEntry);
-    for (const w of matches) target.push({ kind: "ws", key: rowKey("ws", r.key, w.name), repo: r, ws: w });
-    if (!createFirst && createEntry) target.push(createEntry);
-  };
-
-  if (pq.mode === "empty") {
-    const hasOpen = repos.some((r) => r.source !== "disk");
-    let seenOther = false;
-    let seenDisk = false;
-    let hiddenDisk = 0;
-    for (const r of repos) {
-      if (r.source === "disk" && hasOpen) {
-        hiddenDisk++;
-        continue;
-      }
-      if (r.source === "other" && !seenOther) {
-        seenOther = true;
-        if (out.length) out.push({ kind: "divider", key: "div\0other", label: "Other spaces" });
-      }
-      if (r.source === "disk" && !seenDisk) {
-        seenDisk = true;
-        if (out.length) out.push({ kind: "divider", key: "div\0disk", label: "Repositories" });
-      }
-      pushSection(out, r.source, r, r.list, "", r.state === "ready");
-    }
-    if (hiddenDisk > 0) out.push({ kind: "disk-hint", key: "disk-hint", count: hiddenDisk });
-    if (loadingBg) out.push({ kind: "looking", key: "looking" });
-    return out;
-  }
-
-  if (pq.mode === "scoped") {
-    for (const r of repos) {
-      if (!pq.scoped.has(r.key)) continue;
-      const matches = pq.q ? r.list.filter((w) => w.name.toLowerCase().includes(pq.q)) : r.list;
-      const exact = Boolean(pq.name && r.list.some((w) => w.name === pq.name));
-      pushSection(out, r.source, r, matches, pq.name, r.state === "ready" && !exact, !pq.q);
-    }
-    return out;
-  }
-
-  // Unscoped filter: matching repos first (repo-name match with no workspace
-  // match floats the repo's workspaces below an empty `New workspace` row so
-  // `/` or `→` completion keeps rows stable); non-matching ready repos appear
-  // under `Create elsewhere` so a typed name can be created in any loaded repo.
-  const matched = [];
-  const createElsewhere = [];
-  for (const r of repos) {
-    const repoMatch = r.name.toLowerCase().includes(pq.q);
-    const wsMatches = r.list.filter((w) => w.name.toLowerCase().includes(pq.q));
-    if (repoMatch || wsMatches.length) {
-      const ws = repoMatch && !wsMatches.length ? r.list : wsMatches;
-      const createName = repoMatch && !wsMatches.length ? "" : pq.name;
-      const showCreate = r.state === "ready" && (!createName || !r.list.some((w) => w.name === createName));
-      pushSection(matched, r.source, r, ws, createName, showCreate, repoMatch && !wsMatches.length);
-    } else if (r.state === "ready" && !r.list.some((w) => w.name === pq.name)) {
-      pushSection(createElsewhere, r.source, r, [], pq.name, true);
+  for (const r of sortedRepos(model)) {
+    if (r.source === "disk" && r.load.state === "idle" && r.name.toLowerCase().includes(q)) {
+      out.push(r);
     }
   }
-  out.push(...matched);
-  if (createElsewhere.length) {
-    if (matched.length) out.push({ kind: "divider", key: "div\0elsewhere", label: "Create elsewhere" });
-    out.push(...createElsewhere);
-  }
-  if (loadingBg) out.push({ kind: "looking", key: "looking" });
   return out;
 }
 
-// Default pick index when nothing is pinned and input is empty: stay within
-// the current space (first other workspace in focused repo, else focused repo's
-// create row, else another workspace/create in this space).
-export function initialIndex(picks, { focusKey, focusRoot }) {
-  if (!picks.length) return 0;
-  const isOtherWs = (e) => e.kind === "ws" && Boolean(e.ws.path) && (!focusRoot || e.ws.path !== focusRoot);
-  if (focusKey) {
-    const i = picks.findIndex((e) => e.repo?.key === focusKey && isOtherWs(e));
-    if (i >= 0) return i;
-    const c = picks.findIndex((e) => e.kind === "create" && e.repo?.key === focusKey);
-    if (c >= 0) return c;
-  }
-  const spaceOther = picks.findIndex((e) => e.repo?.source === "space" && isOtherWs(e));
-  if (spaceOther >= 0) return spaceOther;
-  const spaceCreate = picks.findIndex((e) => e.repo?.source === "space" && e.kind === "create");
-  if (spaceCreate >= 0) return spaceCreate;
-  const anyOther = picks.findIndex(isOtherWs);
-  return anyOther >= 0 ? anyOther : 0;
-}
+// ---------------- Open-Checkout Index & Placement Truth Table ----------------
 
-export function resolveSelection(picks, { selectedKey, text, focusKey, focusRoot }) {
-  if (!picks.length) return -1;
-  if (selectedKey !== null) {
-    const i = picks.findIndex((e) => e.key === selectedKey);
-    if (i >= 0) return i;
-  }
-  return String(text ?? "").trim() ? 0 : initialIndex(picks, { focusKey, focusRoot });
-}
+// Pre-index which checkouts are open in which spaces/tabs, once per render.
+// Uses tab-ordered panes + longest-prefix `ownerRoot` so nested checkouts never
+// alias their parent checkout, and prefers dedicated single-checkout spaces.
+export function indexOpenCheckouts(allSpaces, allPanes, knownRootsByMachine) {
+  const out = new Map();
+  for (const s of allSpaces ?? []) {
+    const on = machineOf(s?.machine);
+    const roots = knownRootsByMachine.get(on ?? "") ?? [];
+    if (roots.length === 0) continue;
 
-// Inline ghost completion suffix when the typed unscoped query matches the
-// currently highlighted repository's name.
-export function computeGhost({ text, current }) {
-  const raw = String(text ?? "");
-  const q = raw.trim().toLowerCase();
-  if (!q || raw.includes("/") || !current?.repo) return null;
-  const name = current.repo.name;
-  const low = name.toLowerCase();
-  if (!low.includes(q)) return null;
-  if (low.startsWith(q)) {
-    return { repo: current.repo, suffix: `${name.slice(q.length)}/`, full: `${name}/`, kind: "prefix" };
-  }
-  return { repo: current.repo, suffix: ` \u2192 ${name}/`, full: `${name}/`, kind: "substring" };
-}
-
-// Single source of truth for Enter / Shift+Enter / click placement AND footer
-// hint text. Returns a tagged action object:
-//   { kind: "complete", repo, label }
-//   { kind: "switch", repo, ws, loc, label }
-//   { kind: "tab", repo, ws?, name, create, label }
-//   { kind: "space", repo, ws?, name, create, label }
-//   { kind: "refuse", reason }
-//   { kind: "none", label }
-export function placement(entry, shift, ctx) {
-  if (!entry) return { kind: "none", label: "" };
-  const r = entry.repo;
-  const targetSpace = ctx.spaces.find((s) => s.id === ctx.spaceId);
-  const canTab = Boolean(ctx.spaceId && (r.on ?? null) === (ctx.spaceMachine ?? null));
-  const inactiveSpace = Boolean(targetSpace && !targetSpace.active);
-  const tabHint = inactiveSpace && ctx.spaceName ? `new tab in ${ctx.spaceName}` : "new tab";
-  const defaultTab = ctx.openIn === "tab";
-
-  if (entry.kind === "create") {
-    if (!entry.name) {
-      if (ctx.text.trim().toLowerCase() !== `${r.name.toLowerCase()}/`) {
-        return { kind: "complete", repo: r, label: `choose ${r.name}/` };
-      }
-      return { kind: "none", label: "type a name to create" };
+    const ordered = tabOrderedPanes(s, allPanes);
+    const matchedOwners = [];
+    for (const p of ordered) {
+      if (!p.cwd) continue;
+      const own = ownerRoot(on, p.cwd, roots);
+      if (own) matchedOwners.push({ root: own, tabId: p.tab });
     }
-    if (!canTab) {
-      if (shift) {
-        const where = r.on || "local";
-        return {
-          kind: "refuse",
-          reason: `Tabs in this space cannot open a workspace on ${where}. Press Enter for a new space.`,
-        };
-      }
-      return { kind: "space", repo: r, name: entry.name, create: true, label: "new space" };
+    if (matchedOwners.length === 0 && s.folder) {
+      const own = ownerRoot(on, s.folder, roots);
+      if (own) matchedOwners.push({ root: own, tabId: s.tabs?.[0]?.id ?? null });
     }
-    const wantTab = shift ? !defaultTab : defaultTab;
-    return wantTab
-      ? { kind: "tab", repo: r, name: entry.name, create: true, label: tabHint }
-      : { kind: "space", repo: r, name: entry.name, create: true, label: "new space" };
+    if (matchedOwners.length === 0) continue;
+
+    const uniqueRoots = new Set(matchedOwners.map((m) => m.root));
+    const singleCheckoutSpace = uniqueRoots.size === 1;
+    const seenInSpace = new Set();
+    for (const { root, tabId } of matchedOwners) {
+      if (seenInSpace.has(root)) continue;
+      seenInSpace.add(root);
+      const k = locKey(on, root);
+      const candidate = {
+        spaceId: s.id,
+        spaceName: s.name || base(s.folder) || s.id,
+        tabId,
+        dedicated: singleCheckoutSpace,
+      };
+      const prev = out.get(k);
+      if (!prev || (!prev.dedicated && candidate.dedicated)) {
+        out.set(k, candidate);
+      }
+    }
   }
+  return out;
+}
 
-  // Existing workspace row.
-  const ws = entry.ws;
-  if (!ws.path) return { kind: "none", label: "unavailable" };
-  const loc = whereOpen(ctx.spaces, ctx.panes, r.on, ws.path);
+// Exhaustively testable placement truth table.
+export function destination({ isOpen, canTab, shift, openIn }) {
+  if (!canTab) {
+    if (shift) return "refuse-tab";
+    return isOpen ? "switch" : "space";
+  }
+  if (openIn === "tab") {
+    if (shift) return "space";
+    return isOpen ? "switch" : "tab";
+  }
+  if (shift) return "tab";
+  return isOpen ? "switch" : "space";
+}
 
-  if (loc) {
-    if (!shift) return { kind: "switch", repo: r, ws, loc, label: "switch" };
-    if (canTab) return { kind: "tab", repo: r, ws, name: tabLabel(r, ws.name, ws.main), create: false, label: tabHint };
-    const where = r.on || "local";
+export function placementFor(item, { openIndex, targetSpaceExists, targetMachine, openIn, shift }) {
+  if (!item) return null;
+  if (item.kind === "create" && !item.name) {
     return {
-      kind: "refuse",
-      reason: `Tabs in this space cannot open a workspace on ${where}. Press Enter to switch.`,
+      action: "scope",
+      open: null,
+      label: shift ? "" : "new in repo",
+      refuseReason: "",
     };
   }
+  const on = item.repo.on;
+  const canTab = Boolean(targetSpaceExists && sameMachine(on, targetMachine));
+  const open = item.kind === "ws" && item.ws.path ? openIndex.get(locKey(on, item.ws.path)) ?? null : null;
+  const action = destination({ isOpen: Boolean(open), canTab, shift: Boolean(shift), openIn });
 
-  if (!canTab) {
-    if (shift) {
-      const where = r.on || "local";
-      return {
-        kind: "refuse",
-        reason: `Tabs in this space cannot open a workspace on ${where}. Press Enter for a new space.`,
-      };
-    }
-    return { kind: "space", repo: r, ws, name: ws.name, create: false, label: "new space" };
+  if (action === "refuse-tab") {
+    return {
+      action,
+      open,
+      label: "new space only",
+      refuseReason: targetSpaceExists
+        ? `Cannot open a tab for ${on || "local"} inside a ${targetMachine || "local"} space.`
+        : "No open space to add a tab to.",
+    };
   }
-  const wantTab = shift ? !defaultTab : defaultTab;
-  return wantTab
-    ? { kind: "tab", repo: r, ws, name: tabLabel(r, ws.name, ws.main), create: false, label: tabHint }
-    : { kind: "space", repo: r, ws, name: ws.name, create: false, label: "new space" };
+  if (action === "switch") {
+    return { action, open, label: "switch", refuseReason: "" };
+  }
+  if (action === "tab") {
+    return { action, open, label: item.kind === "create" ? "create in tab" : "open in tab", refuseReason: "" };
+  }
+  return { action, open, label: item.kind === "create" ? "create in space" : "open in space", refuseReason: "" };
+}
+
+// ---------------- Pure Projection (`project -> vm`) ----------------
+
+function matchRank(haystack, needle) {
+  const h = haystack.toLowerCase();
+  if (h === needle) return 0;
+  if (h.startsWith(needle)) return 1;
+  if (h.includes(needle)) return 2;
+  return -1;
+}
+
+function hasExactWorkspace(repo, raw) {
+  if (repo?.load?.state !== "ready") return false;
+  const q = raw.toLowerCase();
+  return repo.load.list.some((w) => w.name.toLowerCase() === q);
+}
+
+function resolveSelection(picks, selection, focusKey, focusRoot) {
+  if (picks.length === 0) return null;
+  const mode = selection?.mode ?? "auto";
+  if ((mode === "pinned" || mode === "implicit") && selection.key) {
+    const exact = picks.find((p) => p.key === selection.key);
+    if (exact) return exact;
+    return picks[0];
+  }
+  if (focusKey && focusRoot) {
+    const focusedWs = picks.find((p) => p.kind === "ws" && p.repo.key === focusKey && p.ws.path === focusRoot);
+    if (focusedWs) return focusedWs;
+  }
+  const firstWs = picks.find((p) => p.kind === "ws");
+  return firstWs || picks[0];
+}
+
+function sortRepoWorkspaces(repo, focusKey, focusRoot) {
+  return [...repo.load.list].sort((a, b) => {
+    const fa = repo.key === focusKey && a.path === focusRoot ? 0 : 1;
+    const fb = repo.key === focusKey && b.path === focusRoot ? 0 : 1;
+    return fa - fb || Number(b.main) - Number(a.main) || a.name.localeCompare(b.name);
+  });
+}
+
+// Build the complete display and action view model from immutable inputs.
+// Only two selectable row kinds exist: `ws` (existing workspace) and `create`
+// (named create or empty-name "New workspace in <repo>…" which locks the chip).
+export function project({ model, query = "", scopedRepoKey = null, selection = { mode: "auto" }, spaces = [], panes = [], settings }) {
+  const raw = String(query ?? "").trim();
+  const q = raw.toLowerCase();
+  const repos = sortedRepos(model);
+  const scopedRepo = scopedRepoKey ? model.repos.get(scopedRepoKey) ?? null : null;
+
+  const knownRootsByMachine = new Map();
+  const addRoot = (on, root) => {
+    if (!root) return;
+    const mKey = machineOf(on) ?? "";
+    let list = knownRootsByMachine.get(mKey);
+    if (!list) { list = []; knownRootsByMachine.set(mKey, list); }
+    list.push(root);
+  };
+  for (const r of repos) {
+    addRoot(r.on, r.main);
+    if (r.load.state === "ready") {
+      for (const w of r.load.list) if (w.path && w.path !== r.main) addRoot(r.on, w.path);
+    }
+  }
+
+  const openIndex = indexOpenCheckouts(spaces, panes, knownRootsByMachine);
+  const targetSpaceExists = Boolean(model.targetSpaceId && spaces.some((s) => s.id === model.targetSpaceId));
+  const focusedRepo =
+    (model.focusKey && model.repos.get(model.focusKey)) ||
+    repos.find((r) => r.source === "space") ||
+    null;
+
+  const items = [];
+
+  const pushRepoWorkspaces = (r, { showRepo = false, includeNewRow = false, newFirst = false } = {}) => {
+    const newRow = includeNewRow ? { kind: "create", key: `new:${r.key}`, repo: r, name: "" } : null;
+    if (newRow && newFirst) items.push(newRow);
+    if (r.load.state === "loading" || r.load.state === "idle") {
+      items.push({ kind: "loading", key: `loading:${r.key}`, label: `Loading ${r.name}…` });
+    } else if (r.load.state === "error") {
+      items.push({ kind: "error", key: `err:${r.key}`, message: r.load.message });
+    } else {
+      for (const w of sortRepoWorkspaces(r, model.focusKey, model.focusRoot)) {
+        const open = w.path ? openIndex.get(locKey(r.on, w.path)) ?? null : null;
+        items.push({
+          kind: "ws",
+          key: `ws:${r.key}:${w.name}`,
+          repo: r,
+          ws: w,
+          open,
+          showRepo,
+        });
+      }
+    }
+    if (newRow && !newFirst) items.push(newRow);
+  };
+
+  if (scopedRepo) {
+    // ---- Scoped Repo Chip mode ----
+    if (scopedRepo.load.state === "loading" || scopedRepo.load.state === "idle") {
+      items.push({ kind: "loading", key: `loading:${scopedRepo.key}`, label: `Loading ${scopedRepo.name}…` });
+    } else if (scopedRepo.load.state === "error") {
+      items.push({ kind: "error", key: `err:${scopedRepo.key}`, message: scopedRepo.load.message });
+    } else {
+      const wsRows = [];
+      for (const w of scopedRepo.load.list) {
+        if (!q) {
+          const isCurrent = scopedRepo.key === model.focusKey && w.path === model.focusRoot;
+          wsRows.push({ w, rank: isCurrent ? 0 : w.main ? 1 : 2 });
+        } else {
+          const rank = matchRank(w.name, q);
+          if (rank >= 0) wsRows.push({ w, rank });
+        }
+      }
+      wsRows.sort((a, b) => a.rank - b.rank || Number(b.w.main) - Number(a.w.main) || a.w.name.localeCompare(b.w.name));
+      for (const { w } of wsRows) {
+        const open = w.path ? openIndex.get(locKey(scopedRepo.on, w.path)) ?? null : null;
+        items.push({
+          kind: "ws",
+          key: `ws:${scopedRepo.key}:${w.name}`,
+          repo: scopedRepo,
+          ws: w,
+          open,
+          showRepo: false,
+        });
+      }
+      if (raw && !hasExactWorkspace(scopedRepo, raw)) {
+        items.push({
+          kind: "create",
+          key: `create:${scopedRepo.key}:${raw}`,
+          repo: scopedRepo,
+          name: raw,
+        });
+      }
+    }
+  } else if (!q) {
+    // ---- Flat Search mode, empty query ----
+    // Plain non-selectable repo headers + compact workspace rows underneath.
+    const spaceRepos = repos.filter((r) => r.source === "space");
+    const otherRepos = repos.filter((r) => r.source === "other");
+    const diskRepos = repos.filter((r) => r.source === "disk");
+
+    for (const r of spaceRepos) {
+      items.push({ kind: "header", key: `hdr:${r.key}`, repo: r });
+      pushRepoWorkspaces(r);
+    }
+
+    if (otherRepos.length > 0) {
+      if (items.length > 0) items.push({ kind: "divider", key: "div:other", label: "Other spaces" });
+      for (const r of otherRepos) {
+        items.push({ kind: "header", key: `hdr:${r.key}`, repo: r });
+        pushRepoWorkspaces(r);
+      }
+    }
+
+    if (diskRepos.length > 0) {
+      if (spaceRepos.length > 0 || otherRepos.length > 0) {
+        items.push({ kind: "disk-hint", key: "disk-hint", count: diskRepos.length });
+      } else {
+        for (const r of diskRepos) {
+          items.push({ kind: "header", key: `hdr:${r.key}`, repo: r });
+          if (r.load.state === "ready") {
+            pushRepoWorkspaces(r, { includeNewRow: true });
+          } else {
+            items.push({ kind: "create", key: `new:${r.key}`, repo: r, name: "" });
+          }
+        }
+      }
+    }
+  } else {
+    // ---- Flat Search mode, non-empty query ----
+    const matchedRepos = [];
+    const matchedRepoKeys = new Set();
+    const wsMatches = [];
+
+    for (let i = 0; i < repos.length; i++) {
+      const r = repos[i];
+      const rRank = matchRank(r.name, q);
+      if (rRank >= 0) {
+        matchedRepos.push({ repo: r, rank: rRank, idx: i });
+        matchedRepoKeys.add(r.key);
+      }
+      if (r.load.state === "ready") {
+        for (const w of r.load.list) {
+          const wRank = matchRank(w.name, q);
+          if (wRank >= 0) {
+            const focusedBonus = r.key === focusedRepo?.key ? 0 : 1;
+            wsMatches.push({ repo: r, ws: w, rank: wRank, focusedBonus, idx: i });
+          }
+        }
+      }
+    }
+
+    matchedRepos.sort((a, b) => a.rank - b.rank || a.idx - b.idx);
+    wsMatches.sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        a.focusedBonus - b.focusedBonus ||
+        a.idx - b.idx ||
+        Number(b.ws.main) - Number(a.ws.main) ||
+        a.ws.name.localeCompare(b.ws.name),
+    );
+
+    // 1. Repositories whose name matched `q` come first: dim header + "+ New workspace in <repo>…" FIRST + their workspaces.
+    for (const { repo: r } of matchedRepos) {
+      items.push({ kind: "header", key: `hdr:${r.key}`, repo: r });
+      pushRepoWorkspaces(r, { showRepo: false, includeNewRow: true, newFirst: true });
+    }
+
+    // 2. Direct workspace name matches across other loaded repos.
+    for (const m of wsMatches) {
+      if (matchedRepoKeys.has(m.repo.key)) continue;
+      const open = m.ws.path ? openIndex.get(locKey(m.repo.on, m.ws.path)) ?? null : null;
+      items.push({
+        kind: "ws",
+        key: `ws:${m.repo.key}:${m.ws.name}`,
+        repo: m.repo,
+        ws: m.ws,
+        open,
+        showRepo: true,
+      });
+    }
+
+    // 3. Direct Create "<raw>" in focused repo (row 0 when nothing else matched, e.g. "fix" or "feat/auth").
+    if (focusedRepo && focusedRepo.load.state === "ready" && !hasExactWorkspace(focusedRepo, raw)) {
+      items.push({
+        kind: "create",
+        key: `create:${focusedRepo.key}:${raw}`,
+        repo: focusedRepo,
+        name: raw,
+      });
+    }
+  }
+
+  const picks = items.filter((it) => it.kind === "ws" || it.kind === "create");
+  const current = resolveSelection(picks, selection, model.focusKey, model.focusRoot);
+  const ctx = {
+    openIndex,
+    targetSpaceExists,
+    targetMachine: model.targetMachine,
+    openIn: settings.openIn,
+  };
+  const primary = current ? placementFor(current, { ...ctx, shift: false }) : null;
+  const secondary = current ? placementFor(current, { ...ctx, shift: true }) : null;
+
+  return {
+    query: raw,
+    scopedRepo,
+    focusedRepo,
+    items,
+    picks,
+    current,
+    primary,
+    secondary,
+    openIndex,
+    targetSpaceExists,
+    loading: !model.targetLoaded,
+    bgLoading: model.bgLoading,
+    spaceError: model.spaceError,
+  };
 }

@@ -4,13 +4,18 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 // Herdr mods import only from their own folder, so each jj mod keeps a copy
-// of the shared section of mods/jj-spaces/jj.js. Copies must not drift.
-const shared = text => text.match(/\/\/ shared:start\n[\s\S]*\/\/ shared:end\n/)?.[0];
-const source = shared(await fs.readFile('mods/jj-spaces/jj.js', 'utf8'));
+// of the shared section of mods/jj-spaces/jj.js, and workspace-lifecycle mods
+// share a second workspaces block. Copies must not drift.
+const block = (tag, text) => text.match(new RegExp(`// ${tag}:start\\n[\\s\\S]*// ${tag}:end\\n`))?.[0];
+const source = block('shared', await fs.readFile('mods/jj-spaces/jj.js', 'utf8'));
+const wsSource = block('workspaces', await fs.readFile('mods/jj-workspace/jj.js', 'utf8'));
 for (const name of await fs.readdir('mods')) {
   const file = path.join('mods', name, 'jj.js');
   const copy = await fs.readFile(file, 'utf8').catch(() => null);
-  if (copy !== null && shared(copy) !== source) throw new Error(`${file}: the shared section differs from mods/jj-spaces/jj.js`);
+  if (copy !== null && block('shared', copy) !== source) throw new Error(`${file}: the shared section differs from mods/jj-spaces/jj.js`);
+  if (copy !== null && block('workspaces', copy) !== undefined && block('workspaces', copy) !== wsSource) {
+    throw new Error(`${file}: the workspaces section differs from mods/jj-workspace/jj.js`);
+  }
 }
 
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'herdr-jj-check-'));

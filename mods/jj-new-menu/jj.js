@@ -66,4 +66,80 @@ export function visible(root, mod) {
   const shown = walk(root, true);
   return shown || !found;
 }
+
+// Normalize a Herdr machine name: null for the local machine, non-empty string for remote.
+export function machineOf(on) {
+  return typeof on === "string" && on ? on : null;
+}
+
+export function sameMachine(a, b) {
+  return machineOf(a) === machineOf(b);
+}
+
+export function base(p) {
+  if (!p) return "";
+  const clean = p.replace(/\/+$/, "");
+  if (!clean) return "/";
+  return clean.slice(clean.lastIndexOf("/") + 1) || clean;
+}
+
+// Panes belonging to `space`, ordered strictly by `space.tabs` order.
+export function tabOrderedPanes(space, allPanes) {
+  if (!space) return [];
+  const byTab = new Map();
+  for (const p of allPanes ?? []) {
+    if (!p?.tab) continue;
+    let list = byTab.get(p.tab);
+    if (!list) { list = []; byTab.set(p.tab, list); }
+    list.push(p);
+  }
+  const out = [];
+  for (const tab of space.tabs ?? []) {
+    const list = byTab.get(tab.id);
+    if (list) out.push(...list);
+  }
+  return out;
+}
+
+// Unique non-empty folders in a space: pane folders in tab order, then `space.folder`.
+export function spaceFolders(space, allPanes) {
+  if (!space) return [];
+  const out = [];
+  const seen = new Set();
+  const add = (dir) => { if (dir && !seen.has(dir)) { seen.add(dir); out.push(dir); } };
+  for (const p of tabOrderedPanes(space, allPanes)) add(p.cwd);
+  add(space.folder);
+  return out;
+}
+
+// Primary folder of a space: first pane folder in tab order, else `space.folder`.
+export function spacePlace(space, allPanes) {
+  for (const p of tabOrderedPanes(space, allPanes)) if (p.cwd) return p.cwd;
+  return space?.folder || "";
+}
+
+// Focused folder for a space, shared by every entry point (keybinding, space menu, + menu).
+export function focusFolder(space, allPanes, focus) {
+  if (!space) return "";
+  const ordered = tabOrderedPanes(space, allPanes);
+  const tabIds = new Set((space.tabs ?? []).map((t) => t.id));
+  if (focus && focus.space === space.id) {
+    if (focus.pane) {
+      const hit = ordered.find((p) => p.pane === focus.pane && p.cwd);
+      if (hit) return hit.cwd;
+    }
+    if (focus.cwd) return focus.cwd;
+    if (focus.tab && tabIds.has(focus.tab)) {
+      const hit = ordered.find((p) => p.tab === focus.tab && p.cwd);
+      if (hit) return hit.cwd;
+    }
+  }
+  const activeTab = (space.tabs ?? []).find((t) => t.active);
+  if (activeTab) {
+    const hit = ordered.find((p) => p.tab === activeTab.id && p.cwd);
+    if (hit) return hit.cwd;
+  }
+  const focusedPane = ordered.find((p) => p.focused && p.cwd);
+  return focusedPane?.cwd || spacePlace(space, allPanes);
+}
 // shared:end

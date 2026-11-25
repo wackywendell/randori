@@ -1,5 +1,9 @@
 import { readFileSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import vm from 'node:vm';
+
+const COLOR_METHODS = new Set(['bg', 'text_color', 'border_color']);
+const HEX_COLOR = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 
 export function element() {
   const node = { _children: [], calls: {}, handlers: {} };
@@ -13,8 +17,12 @@ export function element() {
       else if (key.startsWith('on_')) {
         target.handlers[key] = args.at(-1);
         if (typeof args[0] === 'string') target.handlers[`${key}:${args[0]}`] = args.at(-1);
+      } else {
+        if (COLOR_METHODS.has(key) && args[0] !== undefined && args[0] !== null && (typeof args[0] !== 'string' || !HEX_COLOR.test(args[0]))) {
+          throw new Error(`${JSON.stringify(args[0])} is not a color value for ${key}()`);
+        }
+        target.calls[key] = args;
       }
-      else target.calls[key] = args;
       return proxy;
     };
   } });
@@ -86,69 +94,150 @@ function compileMod(name) {
   return lines.join('\n');
 }
 
-// Loads a mod into a sandbox with fake Herdr globals. `data` sets the state
-// (spaces, panes, props, layout, ...) and replaces exec, readTextFile or
-// watchFolder. Set `reactive: true` to re-render automatically on `cx.notify()`.
-// `props()` returns `undefined` inside `cx.spawn` continuations, matching Herdr.
+const spawnContext = new AsyncLocalStorage();
+
+// Loads a mod into a sandbox with faithful fake Herdr globals:
+// - `props()` returns `undefined` across ALL `await` continuations in `cx.spawn`
+//   (via AsyncLocalStorage), matching real Herdr.
+// - `render()` throws if `cx.notify()`, `cx.focus_handle()`, or `InputState.new()`
+//   are called during rendering.
+// - `closeOverlay(ownId)` (or `harness.closeHost()`) invokes `view.close?.()`,
+//   cancels pending timers/tasks, and throws on subsequent `cx` mutations.
+// - `cx.stop_propagation()` sets `harness.lastStopped` so tests can verify
+//   whether Escape or pointer events were stopped.
 export function load(name, data = {}) {
-  const state = { agents: [], terminals: [], spaces: [], panes: [], machines: [], props: {}, focused: { space: 's1' }, active: true, now: 0,
-    layout: { children: [] }, home: '/home/u', ...data };
+  const state = {
+    agents: [], terminals: [], spaces: [], panes: [], machines: [], props: {},
+    focused: { space: 's1' }, active: true, now: 0,
+    layout: { children: [] }, home: '/home/u', ...data,
+  };
   const shared = new Map(Object.entries(data.shared ?? {}));
   const storage = new Map();
   const actions = [], tasks = [], timers = [], notifications = [], overlays = [], logs = [], inputs = [], watches = [], errors = [];
   const task = entry => { entry.cancelled = false; entry.cancel = () => { entry.cancelled = true; }; return entry; };
   const clipboard = [];
-  let inSpawn = false;
   let notifyCount = 0;
+  let inRender = false;
+  let closed = false;
+  let lastStopped = false;
   let view = null;
+
+  const ensureOpen = (op) => {
+    if (closed) throw new Error(`Stale context: ${op} called after view closed`);
+  };
+
+  const renderSafe = () => {
+    if (closed) throw new Error('Stale context: render called after view closed');
+    inRender = true;
+    try {
+      return view.render(cx);
+    } finally {
+      inRender = false;
+    }
+  };
+
+  const teardown = () => {
+    if (closed) return;
+    closed = true;
+    for (const t of timers) t.cancel();
+    for (const t of tasks) t.cancel();
+    view?.close?.(cx);
+  };
+
   const cx = {
     notify() {
+      ensureOpen('cx.notify');
+      if (inRender) throw new Error('GPUI violation: cx.notify() called during render()');
       notifyCount++;
-      if (data.reactive && view) view.render(cx);
+      if (data.reactive && view) renderSafe();
     },
-    stop_propagation() {},
+    stop_propagation() { lastStopped = true; },
     write_to_clipboard: text => clipboard.push(text),
-    focus_handle: () => ({ focus() {} }),
-    spawn(body, opts) { const t = task({ body, opts }); tasks.push(t); return t; },
+    focus_handle: () => {
+      if (inRender) throw new Error('GPUI violation: cx.focus_handle() called during render()');
+      return { focus() {} };
+    },
+    spawn(body, opts) {
+      ensureOpen('cx.spawn');
+      const t = task({ body, opts });
+      tasks.push(t);
+      return t;
+    },
     timer: {
-      after(ms, body) { const t = task({ at: state.now + ms, body }); timers.push(t); return t; },
-      every(ms, body) { const t = task({ every: ms, next: state.now + ms, body }); timers.push(t); return t; },
+      after(ms, body) {
+        ensureOpen('cx.timer.after');
+        const t = task({ at: state.now + ms, body });
+        timers.push(t);
+        return t;
+      },
+      every(ms, body) {
+        ensureOpen('cx.timer.every');
+        const t = task({ every: ms, next: state.now + ms, body });
+        timers.push(t);
+        return t;
+      },
     },
   };
+
   const src = compileMod(name);
   const Mod = vm.runInNewContext(src, {
     View: class {}, div: element, v_flex: element, h_flex: element, svg: element, image: element,
     InputState: { new: ({ value = '' } = {}) => {
+      if (inRender) throw new Error('GPUI violation: InputState.new() called during render()');
       const on = {};
       let sel = { start: value.length, end: value.length };
-      const input = { value: () => value, set_value(next) { value = next; sel = { start: next.length, end: next.length }; on.change?.({}, cx); },
-        selected_range: () => sel, set_selected_range(next) { sel = next; }, on(event, body) { on[event] = body; }, focus() {},
-        emit(event, next, payload = {}) { if (next !== undefined) { value = next; sel = { start: next.length, end: next.length }; } on[event]?.(payload, cx); } };
+      const input = {
+        value: () => value,
+        set_value(next) { value = next; sel = { start: next.length, end: next.length }; on.change?.({}, cx); },
+        selected_range: () => sel,
+        set_selected_range(next) { sel = next; },
+        on(event, body) { on[event] = body; },
+        focus() {},
+        emit(event, next, payload = {}) {
+          if (next !== undefined) { value = next; sel = { start: next.length, end: next.length }; }
+          on[event]?.(payload, cx);
+        },
+      };
       inputs.push(input);
       return input;
     } },
     TextareaState: { new: ({ value = '' } = {}) => {
+      if (inRender) throw new Error('GPUI violation: TextareaState.new() called during render()');
       const on = {};
-      const area = { value: () => value, set_value(next) { value = next; }, set_auto_grow() {}, on(event, body) { on[event] = body; }, focus() { area.focused = true; },
-        emit(event, next, payload = {}) { if (next !== undefined) value = next; on[event]?.(payload, cx); } };
+      const area = {
+        value: () => value,
+        set_value(next) { value = next; },
+        set_auto_grow() {},
+        on(event, body) { on[event] = body; },
+        focus() { area.focused = true; },
+        emit(event, next, payload = {}) { if (next !== undefined) value = next; on[event]?.(payload, cx); },
+      };
       inputs.push(area);
       return area;
     } },
     Textarea: { new: element }, Popover: { new: id => element().id(id) },
-    Input: { new: element }, ScrollHandle: { new: () => { const scrolled = []; return { scrolled, scroll_to_item(i) { scrolled.push(i); } }; } }, Scrollbar: { vertical: element }, Checkbox: { new: id => element().id(id) },
-    // Every row of a virtual list, as if all were on screen.
+    Input: { new: element },
+    ScrollHandle: { new: () => { const scrolled = []; return { scrolled, scroll_to_item(i) { scrolled.push(i); } }; } },
+    Scrollbar: { vertical: element },
+    Checkbox: { new: id => element().id(id) },
     v_virtual_list: (id, count, height, key, rows) => element().id(id).children(rows({ start: 0, end: count })),
     agents: () => state.agents, terminals: () => state.terminals, spaces: () => state.spaces,
     panes: () => state.panes, machines: () => state.machines,
-    props: () => (inSpawn ? undefined : state.props),
+    props: () => (spawnContext.getStore()?.inSpawn ? undefined : state.props),
     checking: () => Boolean(data.checking),
     focused: () => state.focused, layout: () => state.layout, window: () => ({ active: state.active, platform: 'macos' }),
     keys: () => state.keys ?? [], settings: () => ({ zoom: 1 }), theme: () => new Proxy({}, { get: () => '#8899aa' }),
     home: () => state.home, appHome: () => `${state.home}/.config/herdr-app`,
     shared: key => shared.get(key), setShared: (key, value) => shared.set(key, value), setAgentOrder() {},
     run: (name, args) => actions.push({ name, args }),
-    openOverlay: args => overlays.push(args), closeOverlay: id => overlays.push({ close: id }),
-    notify: value => notifications.push(value), knownAgents: async () => [], pickFolder: data.pickFolder ?? (async () => null),
+    openOverlay: args => overlays.push(args),
+    closeOverlay: id => {
+      overlays.push({ close: id });
+      if (id && state.props?.overlay && id === state.props.overlay) teardown();
+    },
+    notify: value => notifications.push(value),
+    knownAgents: async () => [],
+    pickFolder: data.pickFolder ?? (async () => null),
     nextCommand: () => new Promise(() => {}),
     watchFolder: data.watchFolder ?? (path => new Promise((resolve, reject) => watches.push({ path, resolve, reject }))),
     exec: data.exec ?? (() => { throw new Error('Unexpected exec'); }),
@@ -160,37 +249,42 @@ export function load(name, data = {}) {
   });
   view = new Mod();
   view.init({}, cx);
-  const runInSpawn = fn => {
-    inSpawn = true;
-    try { return fn(); } finally { inSpawn = false; }
-  };
+
   const harness = {
     state, view, cx, shared, clipboard, actions, tasks, timers, notifications, overlays, logs, inputs, watches,
     get notifyCount() { return notifyCount; },
-    render: () => view.render(cx),
-    // Starts every spawned task and lets them run until they wait on
-    // something that is not ready (a watch, a pending exec).
+    get closed() { return closed; },
+    get lastStopped() { return lastStopped; },
+    render: () => renderSafe(),
+    closeHost: () => teardown(),
+    keyDown(rootNode, key, modifiers = {}) {
+      lastStopped = false;
+      rootNode.handlers.on_key_down?.({ key, modifiers }, cx);
+      // Simulate Herdr's window-level Escape dismissal on dialogs when propagation is not stopped.
+      if (key === 'escape' && !lastStopped && state.props?.overlay) teardown();
+      return lastStopped;
+    },
     async drain() {
       for (let round = 0; round < 20; round++) {
         for (const t of tasks) if (!t.started && !t.cancelled) {
           t.started = true;
-          Promise.resolve().then(() => runInSpawn(() => t.body(cx))).catch(e => errors.push(e));
+          Promise.resolve()
+            .then(() => spawnContext.run({ inSpawn: true }, () => t.body(cx)))
+            .catch(e => errors.push(e));
         }
         await new Promise(r => setImmediate(r));
       }
       if (errors.length) throw errors.shift();
     },
-    // Moves the clock and runs the timers that come due.
     async advance(ms) {
       state.now += ms;
       for (const t of timers) {
         if (t.cancelled) continue;
-        if (t.every) while (t.next <= state.now) { t.next += t.every; t.body(cx); }
+        if (t.every) while (t.next <= state.now && !t.cancelled) { t.next += t.every; t.body(cx); }
         else if (t.at <= state.now) { t.cancel(); t.body(cx); }
       }
       await harness.drain();
     },
-    // Resolves the watches on `path` once.
     async fire(path) {
       const due = watches.filter(w => w.path === path);
       watches.splice(0, watches.length, ...watches.filter(w => w.path !== path));

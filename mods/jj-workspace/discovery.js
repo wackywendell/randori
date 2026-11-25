@@ -1,294 +1,237 @@
-// Herdr IO and background repository discovery for jj-workspace.
-// Owns initial target-space probing, other-space probing, disk scanning,
-// remote home caching, and per-repo workspace/bookmark loading with
-// cancellation checks after every await.
+// Effect runner for `jj-workspace`: probes spaces, runs disk discovery, loads
+// workspace lists on demand, and resolves remote $HOME. Owns no model state —
+// emits immutable reducer events via `dispatch(ev)`.
 
-import { exec, readTextFile, home, spaces, panes, layout, focused } from "herdr";
-import { identity } from "./jj.js";
+import { spaces, panes, focused, layout, home, exec, readTextFile } from "herdr";
 import {
-  DEFAULTS,
+  identity,
+  workspaces,
+  machineOf,
+  sameMachine,
+  locKey,
+  spaceFolders,
+  focusFolder,
+} from "./jj.js";
+import {
+  parseSettings,
+  worktreesBase,
   DISK_SCAN,
-  untilde,
   parseDiskScan,
   resolveDiskCandidates,
-  worktreesBase,
-  place,
-  folders,
-  probeKey,
-  upsertRepo,
-  sortRepos,
 } from "./core.js";
 
-export const IO = { exec, readTextFile };
-export const ok = (r) => r && r.code === 0;
-export const jj = (cwd, on, args, timeout = 30_000) => exec("jj", args, { cwd, on, timeout });
-
-export function readSettings(root = layout()) {
-  const find = (node) => {
-    if (!node || typeof node !== "object") return null;
-    if (node.content?.mod === "jj-spaces") return node.content.props ?? {};
-    for (const c of node.children ?? []) {
-      const hit = find(c);
-      if (hit) return hit;
-    }
-    return null;
-  };
-  return { ...DEFAULTS, ...(find(root) ?? {}) };
-}
-
-export function resolveTargetSpace(cfg, allSpaces = spaces(), f = focused()) {
-  if (cfg.spaceId) return allSpaces.find((s) => s.id === cfg.spaceId) ?? null;
-  if (f?.space) {
-    const hit = allSpaces.find((s) => s.id === f.space);
+function findModProps(node, modName) {
+  if (!node || typeof node !== "object") return null;
+  if (node.content?.mod === modName) return node.content.props ?? {};
+  for (const c of node.children ?? []) {
+    const hit = findModProps(c, modName);
     if (hit) return hit;
   }
-  return allSpaces.find((s) => s.focused) ?? allSpaces.find((s) => s.active) ?? allSpaces[0] ?? null;
+  return null;
 }
 
-export function resolveFocusFolder(cfg, space, allPanes = panes(), f = focused()) {
-  if (cfg.folder) return cfg.folder;
-  if (!space) return null;
-  const tabs = new Set((space.tabs ?? []).map((c) => c.id));
-  if (f?.pane) {
-    const hit = allPanes.find((p) => p.pane === f.pane && tabs.has(p.tab) && p.cwd);
-    if (hit) return hit.cwd;
-  }
-  if (f?.tab && tabs.has(f.tab)) {
-    const hit = allPanes.find((p) => p.tab === f.tab && p.cwd);
-    if (hit) return hit.cwd;
-  }
-  const activeTab = (space.tabs ?? []).find((c) => c.active);
-  if (activeTab) {
-    const hit = allPanes.find((p) => p.tab === activeTab.id && p.cwd);
-    if (hit) return hit.cwd;
-  }
-  const fp = allPanes.find((p) => tabs.has(p.tab) && p.focused && p.cwd);
-  return fp?.cwd || place(space, allPanes);
+export function readLayoutSettings() {
+  return parseSettings(findModProps(layout(), "jj-spaces"));
 }
 
-// `jj workspace list`: [{ name, path, main }]. Uses `root` (jj 0.38+) with fallback.
-export async function workspaces(main, on) {
-  let r = await jj(main, on, ["--ignore-working-copy", "workspace", "list", "-T", 'json({"name" => name, "root" => root}) ++ "\\n"'], 10_000);
-  if (!ok(r) && /No such method|doesn't have a method|Method `root`|unknown keyword|root/i.test(r.stderr)) {
-    r = await jj(main, on, ["--ignore-working-copy", "workspace", "list", "-T", 'json({"name" => name, "root" => ""}) ++ "\\n"'], 10_000);
+// Create-time local bookmark lookup. Fails loudly on jj error so creation never
+// silently starts from the wrong revision.
+export async function hasLocalBookmark(main, on, name) {
+  const m = machineOf(on);
+  const r = await exec(
+    "jj",
+    ["--ignore-working-copy", "bookmark", "list", "-T", 'if(!remote, name ++ "\\n")'],
+    { cwd: main, on: m, timeout: 10_000 },
+  );
+  if (r.code !== 0) {
+    throw new Error(r.stderr.trim() || `jj bookmark list exited ${r.code}`);
   }
-  if (!ok(r)) throw new Error(r.stderr.trim() || `jj workspace list exited ${r.code}`);
-  const out = [];
   for (const line of r.stdout.split("\n")) {
-    if (!line.trim()) continue;
-    const w = JSON.parse(line);
-    const p = w.root || (w.name === "default" ? main : "");
-    out.push({ name: w.name, path: p, main: p === main });
+    if (line.trim() === name) return true;
   }
-  out.sort((a, b) => (b.main ? 1 : 0) - (a.main ? 1 : 0) || a.name.localeCompare(b.name));
-  return out;
-}
-
-export async function bookmarks(main, on) {
-  const r = await jj(main, on, ["--ignore-working-copy", "bookmark", "list", "-T", 'if(!remote, name ++ "\\n")'], 10_000);
-  if (!ok(r)) return new Set();
-  return new Set(r.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
+  return false;
 }
 
 export class RepoDiscovery {
-  constructor({ isClosed, onUpdate, onSpaceError }) {
+  constructor({ isClosed, dispatch }) {
     this.isClosed = isClosed;
-    this.onUpdate = onUpdate;
-    this.onSpaceError = onSpaceError;
-    this.repos = [];
-    this.probed = new Set();
-    this.homes = new Map();
-    this.focusKey = null;
-    this.focusRoot = null;
-    this.spaceMachine = null;
-    this.loadingBg = false;
+    this.dispatch = dispatch;
+    this.homePromises = new Map();
+    this.loadedKeys = new Set();
+    this.loadingKeys = new Set();
   }
 
-  async homeOf(machine) {
-    if (!machine) return home() || "";
-    if (this.homes.has(machine)) return this.homes.get(machine);
-    try {
-      const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { cwd: "/", on: machine, timeout: 10_000 });
-      const val = ok(r) ? r.stdout.trim() : "";
-      if (val) this.homes.set(machine, val);
-      return val;
-    } catch (e) {
-      console.log(`jj-workspace: remote home on ${machine}: ${e?.message ?? e}`);
-      return "";
-    }
+  emit(ev) {
+    if (!this.isClosed()) this.dispatch(ev);
   }
 
-  sort() {
-    sortRepos(this.repos, { focusKey: this.focusKey, curMachine: this.spaceMachine });
-  }
-
-  addRepo(candidate) {
-    const { repo, added } = upsertRepo(this.repos, candidate);
-    this.sort();
-    return { repo, added };
-  }
-
-  async loadRepo(r) {
-    if (this.isClosed()) return;
-    try {
-      const [list, names] = await Promise.all([workspaces(r.main, r.on), bookmarks(r.main, r.on)]);
-      if (this.isClosed()) return;
-      r.list = list;
-      r.names = names;
-      r.error = "";
-      r.state = "ready";
-    } catch (e) {
-      if (this.isClosed()) return;
-      r.error = e?.message ?? String(e);
-      r.state = "error";
-      console.log(`jj-workspace: ${r.name}: ${r.error}`);
-    }
-    this.onUpdate();
-  }
-
-  async probe(pairs, source, focusDir = null) {
-    const fresh = [];
-    for (const item of pairs) {
-      const pk = probeKey(item.on, item.folder);
-      if (this.probed.has(pk)) continue;
-      this.probed.add(pk);
-      fresh.push(item);
-    }
-    if (!fresh.length) return;
-    const loaders = [];
-    await Promise.allSettled(
-      fresh.map(async ({ folder, on, spaceId, order }) => {
-        if (this.isClosed()) return;
-        const id = await identity(folder, on, IO);
-        if (this.isClosed()) return;
-        if (id.error) {
-          console.log(`jj-workspace: ${folder}: ${id.message}`);
-          if (source === "space") this.onSpaceError(id.message);
-          return;
-        }
-        if (!id.jj) return;
-        const { repo, added } = this.addRepo({
-          main: id.main,
-          checkout: id.root,
-          on,
-          source,
-          spaceId,
-          order,
-        });
-        // Match the focused folder strictly (not `inside`) so an outer checkout
-        // in another tab never overwrites a nested inner focused checkout.
-        if (source === "space" && focusDir && folder === focusDir) {
-          this.focusKey = repo.key;
-          this.focusRoot = id.root;
-          this.sort();
-        }
-        if (added) loaders.push(this.loadRepo(repo));
-        this.onUpdate();
-      }),
-    );
-    await Promise.allSettled(loaders);
-  }
-
-  async scanDisk(machine, template, reposCfg) {
-    if (this.isClosed()) return;
-    const h = await this.homeOf(machine);
-    if (this.isClosed()) return;
-    const baseDir = worktreesBase(template, h);
-    const patterns = Array.isArray(reposCfg)
-      ? reposCfg
-          .filter((p) => typeof p === "string" && p.trim())
-          .map((p) => untilde(p.trim(), h).replace(/\/+$/, ""))
-          .filter(Boolean)
-      : [];
-    if (!baseDir && !patterns.length) return;
-
-    let res;
-    try {
-      res = await exec("sh", ["-c", DISK_SCAN, "sh", baseDir, ...patterns], {
-        cwd: h || "/",
-        on: machine,
-        timeout: 15_000,
-      });
-    } catch (e) {
-      console.log(`jj-workspace: disk scan${machine ? ` on ${machine}` : ""}: ${e?.message ?? e}`);
-      return;
-    }
-    if (this.isClosed()) return;
-    if (!ok(res)) {
-      console.log(`jj-workspace: disk scan${machine ? ` on ${machine}` : ""} exited ${res?.code}: ${res?.stderr?.trim() ?? ""}`);
-      return;
-    }
-
-    const byDir = parseDiskScan(res.stdout);
-    const candidates = resolveDiskCandidates(byDir, this.repos, machine);
-    const loaders = [];
-    await Promise.allSettled(
-      [...candidates.entries()].map(async ([dir, mtime]) => {
-        if (this.isClosed()) return;
-        const pk = probeKey(machine, dir);
-        if (this.probed.has(pk)) return;
-        this.probed.add(pk);
-        const id = await identity(dir, machine, IO);
-        if (this.isClosed()) return;
-        if (id.error) {
-          console.log(`jj-workspace: ${dir}: ${id.message}`);
-          return;
-        }
-        if (!id.jj) return;
-        const { repo, added } = this.addRepo({
-          main: id.main,
-          checkout: id.main,
-          on: machine,
-          source: "disk",
-          mtime,
-        });
-        if (added) loaders.push(this.loadRepo(repo));
-        this.onUpdate();
-      }),
-    );
-    await Promise.allSettled(loaders);
-  }
-
-  async loadInitial(space, focusDir) {
-    this.spaceMachine = space?.machine ?? null;
-    const allPanes = panes();
-    const pairs = [];
-    const seen = new Set();
-    const add = (folder) => {
-      if (folder && !seen.has(folder)) {
-        seen.add(folder);
-        pairs.push({ folder, on: this.spaceMachine, spaceId: space?.id ?? null, order: pairs.length });
-      }
-    };
-    add(focusDir);
-    for (const dir of folders(space, allPanes)) add(dir);
-    await this.probe(pairs, "space", focusDir);
-  }
-
-  async loadBackground(space) {
-    if (this.isClosed()) return;
-    this.loadingBg = true;
-    this.onUpdate();
-    try {
-      const allSpaces = spaces();
-      const allPanes = panes();
-      const others = [];
-      let order = 0;
-      for (const s of allSpaces) {
-        if (space && s.id === space.id) continue;
-        for (const dir of folders(s, allPanes)) {
-          others.push({ folder: dir, on: s.machine ?? null, spaceId: s.id, order: order++ });
+  async ensureHome(on) {
+    const m = machineOf(on);
+    const k = m ?? "";
+    if (this.homePromises.has(k)) return this.homePromises.get(k);
+    const p = (async () => {
+      let dir = "";
+      if (!m) {
+        dir = home() || "";
+      } else {
+        try {
+          const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: m, timeout: 5_000 });
+          if (r.code === 0) dir = r.stdout.trim();
+        } catch (e) {
+          console.log(`jj-workspace: home(${m}): ${e?.message ?? e}`);
         }
       }
-      const settings = readSettings();
-      const scanMachines = this.spaceMachine ? [this.spaceMachine, null] : [null];
-      await Promise.allSettled([
-        this.probe(others, "other"),
-        ...scanMachines.map((m) => this.scanDisk(m, settings.directory, settings.repos)),
-      ]);
+      this.emit({ type: "HomeKnown", on: m, home: dir });
+      return dir;
+    })();
+    this.homePromises.set(k, p);
+    return p;
+  }
+
+  async ensureRepoLoaded(repo) {
+    if (!repo) return;
+    if (this.loadedKeys.has(repo.key) || this.loadingKeys.has(repo.key)) return;
+    this.loadingKeys.add(repo.key);
+    this.emit({ type: "RepoLoading", key: repo.key });
+    try {
+      const list = await workspaces(repo.main, repo.on, { exec, readTextFile }, { synthesizeDefault: true });
+      if (this.isClosed()) return;
+      this.loadedKeys.add(repo.key);
+      this.emit({ type: "RepoLoaded", key: repo.key, list });
+    } catch (e) {
+      if (this.isClosed()) return;
+      this.emit({ type: "RepoFailed", key: repo.key, message: e?.message || String(e) });
     } finally {
-      this.loadingBg = false;
-      if (!this.isClosed()) this.onUpdate();
+      this.loadingKeys.delete(repo.key);
     }
+  }
+
+  async probeSpace(space, allPanes, source, focusDir = "") {
+    const on = machineOf(space.machine);
+    const dirs = spaceFolders(space, allPanes);
+    if (focusDir && !dirs.includes(focusDir)) dirs.unshift(focusDir);
+    if (dirs.length === 0) return { repos: [], firstError: "" };
+
+    void this.ensureHome(on);
+    const io = { exec, readTextFile };
+    const settled = await Promise.allSettled(
+      dirs.map(async (dir) => ({ dir, id: await identity(dir, on, io) })),
+    );
+    if (this.isClosed()) return { repos: [], firstError: "" };
+
+    let firstError = "";
+    const found = new Map();
+    for (const res of settled) {
+      if (res.status !== "fulfilled") {
+        if (!firstError) firstError = res.reason?.message || String(res.reason);
+        continue;
+      }
+      const { dir, id } = res.value;
+      if (id.error && !firstError) firstError = id.message;
+      if (!id.jj) continue;
+      const key = locKey(on, id.main);
+      if (!found.has(key)) {
+        found.set(key, { key, on, main: id.main });
+        this.emit({
+          type: "RepoFound",
+          on,
+          main: id.main,
+          source,
+          order: space.index ?? Number.MAX_SAFE_INTEGER,
+          spaceId: space.id,
+          mtime: 0,
+        });
+      }
+      if (source === "space" && focusDir && dir === focusDir) {
+        this.emit({ type: "FocusResolved", key, root: id.root });
+      }
+    }
+    return { repos: [...found.values()], firstError };
+  }
+
+  async scanDisk(on, settings) {
+    const m = machineOf(on);
+    const userHome = await this.ensureHome(m);
+    if (this.isClosed()) return;
+    const baseDir = worktreesBase(settings.directory, userHome);
+    const patterns = settings.repos ?? [];
+    if (!baseDir && patterns.length === 0) return;
+
+    try {
+      const r = await exec("sh", ["-c", DISK_SCAN, "sh", baseDir || "", ...patterns], {
+        on: m,
+        timeout: 10_000,
+      });
+      if (this.isClosed()) return;
+      if (r.code !== 0) {
+        console.log(`jj-workspace: scanDisk(${m ?? "local"}) exited ${r.code}: ${r.stderr.trim()}`);
+        return;
+      }
+      const candidates = resolveDiskCandidates(parseDiskScan(r.stdout));
+      for (const c of candidates) {
+        // Disk repos stay idle until the user selects/scopes into them.
+        this.emit({
+          type: "RepoFound",
+          on: m,
+          main: c.main,
+          source: "disk",
+          order: Number.MAX_SAFE_INTEGER,
+          spaceId: null,
+          mtime: c.mtime,
+        });
+      }
+    } catch (e) {
+      console.log(`jj-workspace: scanDisk(${m ?? "local"}): ${e?.message ?? e}`);
+    }
+  }
+
+  async start(cfg, settings) {
+    const allSpaces = spaces();
+    const allPanes = panes();
+    const focus = focused();
+
+    // Explicit spaceId fails closed if missing; otherwise use active space.
+    const targetSpace = cfg.spaceId
+      ? allSpaces.find((s) => s.id === cfg.spaceId) ?? null
+      : allSpaces.find((s) => s.active) ?? allSpaces[0] ?? null;
+
+    const targetMachine = machineOf(targetSpace?.machine);
+    this.emit({
+      type: "TargetResolved",
+      spaceId: targetSpace?.id ?? null,
+      machine: targetMachine,
+      spaceError: cfg.spaceId && !targetSpace ? "That space is no longer open." : null,
+    });
+    void this.ensureHome(targetMachine);
+
+    // 1. Target space (fast path — completes before TargetLoaded).
+    if (targetSpace) {
+      const focusDir = cfg.folder || focusFolder(targetSpace, allPanes, focus);
+      const { repos, firstError } = await this.probeSpace(targetSpace, allPanes, "space", focusDir);
+      if (this.isClosed()) return;
+      if (repos.length === 0 && firstError) {
+        this.emit({ type: "SpaceError", message: firstError });
+      }
+      await Promise.allSettled(repos.map((r) => this.ensureRepoLoaded(r)));
+      if (this.isClosed()) return;
+    }
+    this.emit({ type: "TargetLoaded" });
+
+    // 2. Background: other open spaces (load workspaces for cross-repo search)
+    //    + disk scan (repo names only, zero upfront disk jj workspace calls).
+    this.emit({ type: "BgStarted" });
+    const otherSpaces = allSpaces.filter((s) => s.id !== targetSpace?.id);
+    const diskMachines = [targetMachine];
+    if (!sameMachine(targetMachine, null)) diskMachines.push(null);
+
+    await Promise.allSettled([
+      ...otherSpaces.map(async (s) => {
+        const { repos } = await this.probeSpace(s, allPanes, "other");
+        if (this.isClosed()) return;
+        await Promise.allSettled(repos.map((r) => this.ensureRepoLoaded(r)));
+      }),
+      ...diskMachines.map((m) => this.scanDisk(m, settings)),
+    ]);
+    this.emit({ type: "BgDone" });
   }
 }

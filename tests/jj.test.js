@@ -109,9 +109,16 @@ test('visible follows hidden blocks and inactive stack children', () => {
   assert.equal(visible({ children: [] }, 'm'), true);
 });
 
-test('every jj mod keeps an identical copy of the shared section', () => {
-  const shared = name => readSync(new URL(`../mods/${name}/jj.js`, import.meta.url), 'utf8').match(/\/\/ shared:start\n[\s\S]*\/\/ shared:end\n/)?.[0];
-  for (const name of ['jj-workspace', 'jj-finish', 'jj-menu', 'jj-new-menu', 'jj-changes']) assert.equal(shared(name), shared('jj-spaces'), name);
+test('every jj mod keeps an identical copy of the shared section, and workspace mods share the workspaces block', () => {
+  const block = (tag, name) => readSync(new URL(`../mods/${name}/jj.js`, import.meta.url), 'utf8').match(new RegExp(`// ${tag}:start\\n[\\s\\S]*// ${tag}:end\\n`))?.[0];
+  for (const name of ['jj-workspace', 'jj-finish', 'jj-menu', 'jj-new-menu', 'jj-changes']) {
+    assert.equal(block('shared', name), block('shared', 'jj-spaces'), name);
+  }
+  assert.ok(block('workspaces', 'jj-workspace'));
+  assert.equal(block('workspaces', 'jj-finish'), block('workspaces', 'jj-workspace'));
+  for (const name of ['jj-spaces', 'jj-menu', 'jj-new-menu', 'jj-changes']) {
+    assert.equal(block('workspaces', name), undefined, `${name} should not carry unused workspaces block`);
+  }
 });
 
 test('readStack lists @ and then trunk() as the base when @ sits on it', async t => {

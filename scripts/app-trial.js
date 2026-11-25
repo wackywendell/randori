@@ -75,6 +75,7 @@ export default class TrialLauncher extends View {
   render() { return div(); }
 }`,
     'trial-new': `import Workspace from './workspace.js';
+import { planCreate } from './core.js';
 import { appHome, readTextFile, writeTextFile } from 'herdr';
 export default class TrialNew extends Workspace {
   init(p, cx) {
@@ -82,15 +83,19 @@ export default class TrialNew extends Workspace {
     cx.spawn(async (cx) => {
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
       while (!this.ready) await new Promise((done) => cx.timer.after(100, done));
-      this.text = r.name;
-      const repo = this.current()?.repo;
-      await writeTextFile(appHome() + '/new-plan.json', JSON.stringify(repo ? { path: this.planned(repo) } : { error: this.error }), null);
-      if (repo) await this.work(repo, cx);
-      if (this.error) await writeTextFile(appHome() + '/new-error.txt', this.error, null);
+      this.input.set_value(r.name);
+      this.vm = this.computeVm(r.name, { mode: 'auto' });
+      const item = this.vm.current;
+      const userHome = item?.repo ? (this.model.homes.get(item.repo.on ?? '') ?? '') : '';
+      const path = item?.repo ? planCreate({ repo: item.repo, name: r.name, settings: this.settings, home: userHome }).dest : null;
+      await writeTextFile(appHome() + '/new-plan.json', JSON.stringify(path ? { path } : { error: this.actionError || this.model.spaceError }), null);
+      if (item) this.activate(false, cx);
+      while (this.busy) await new Promise((done) => cx.timer.after(100, done));
+      if (this.actionError) await writeTextFile(appHome() + '/new-error.txt', this.actionError, null);
     });
   }
 }`,
-    // jj-finish with the requested names checked and Enter pressed.
+    // jj-finish with the requested workspace selected and Enter pressed.
     // It records spaces, panes and terminals every 100 ms while it works,
     // and presses Enter again when finish-again.json counts higher.
     'trial-finish': `import Finish from './finish.js';
@@ -103,10 +108,7 @@ export default class TrialFinish extends Finish {
     cx.spawn(async (cx) => {
       while (!this.ready) await new Promise((done) => cx.timer.after(100, done));
       const r = JSON.parse(await readTextFile(appHome() + '/request.json'));
-      if (r.check) {
-        for (const w of this.rows) w.checked = r.check.includes(w.name);
-        this.syncConfirmed();
-      }
+      if (r.check?.length) this.selectByName(r.check[0], cx);
       cx.notify();
       await this.save('opened');
       cx.timer.every(100, () => { if (this.busy) this.mark(); });
@@ -138,7 +140,7 @@ export default class TrialFinish extends Finish {
     });
   }
   save(label) {
-    const state = { label, error: this.error ?? '', runs: this.runs, rows: this.rows.map((w) => ({ name: w.name, root: w.root, checked: w.checked, removed: w.removed, error: w.error })), timeline: this.timeline };
+    const state = { label, phase: this.phase, error: this.error ?? '', runs: this.runs, selected: this.currentRow()?.name ?? null, rows: this.rows.map((w) => ({ name: w.name, root: w.root })), timeline: this.timeline };
     const text = JSON.stringify(state);
     this.chain = (this.chain ?? Promise.resolve()).then(async () => { await writeTextFile(appHome() + '/finish-state.json', text, this.written ?? null); this.written = text; });
     return this.chain;
